@@ -89,6 +89,46 @@ export class TransitionDeniedError extends Error {
   }
 }
 
+/** entity 与事件类型家族不符（如 entity:'task' 配 RunStarted）—— 拒绝写入，不静默落库。 */
+export class EventEntityMismatchError extends Error {
+  readonly entity: 'task' | 'run';
+  readonly type: string;
+  constructor(entity: 'task' | 'run', type: string) {
+    super(
+      `事件类型 ${type} 不属于 ${entity} 状态迁移事件家族：` +
+        `task 用 TaskLifecycleChanged，run 用 Run* 状态事件（spec §4）`,
+    );
+    this.name = 'EventEntityMismatchError';
+    this.entity = entity;
+    this.type = type;
+  }
+}
+
+/** payload.from/to 与顶层 from/to 矛盾 —— 拒绝写入（否则 guard 判 A 迁移、落库写 B 迁移）。 */
+export class TransitionPayloadMismatchError extends Error {
+  readonly field: 'from' | 'to';
+  readonly top_level: string;
+  readonly payload_value: unknown;
+  constructor(field: 'from' | 'to', top_level: string, payload_value: unknown) {
+    super(
+      `payload.${field} 与顶层 ${field} 矛盾：顶层=${JSON.stringify(top_level)}，` +
+        `payload=${JSON.stringify(payload_value)}（spec §4 要求两处一致）`,
+    );
+    this.name = 'TransitionPayloadMismatchError';
+    this.field = field;
+    this.top_level = top_level;
+    this.payload_value = payload_value;
+  }
+}
+
+/** payload 形状无法承载 from/to（非 plain object）—— 拒绝写入。 */
+export class TransitionPayloadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TransitionPayloadError';
+  }
+}
+
 // ---------------------------------------------------------------------------
 // payload 规范化与哈希（具名导出，测试独立重算整条链）
 // ---------------------------------------------------------------------------
@@ -286,6 +326,62 @@ export type AppendStateTransitionInput = Parameters<EventStore['append']>[0] & {
   to: string;
   facts?: GuardFacts;
 };
+
+/**
+ * 状态迁移事件家族（spec §4）：
+ * - Task 生命周期迁移的唯一事件是 TaskLifecycleChanged（payload 带 from/to）；
+ * - Run 的状态变迁分散为 Run* 事件，不含其它 Task 事件。
+ * 用显式集合而非前缀匹配：TaskWaitStateChanged 也以 Task 开头，但它不走生命周期矩阵。
+ */
+const TASK_TRANSITION_EVENT_TYPES: readonly EventType[] = ['TaskLifecycleChanged'];
+const RUN_TRANSITION_EVENT_TYPES: readonly EventType[] = [
+  'RunCreated',
+  'RunQueued',
+  'RunLeased',
+  'RunStarted',
+  'RunSucceeded',
+  'RunFailed',
+  'RunCanceled',
+  'RunTimedOut',
+  'RunIndeterminate',
+  'RunReconciled',
+];
+
+function assertTransitionEventType(entity: 'task' | 'run', type: string): void {
+  const family = entity === 'task' ? TASK_TRANSITION_EVENT_TYPES : RUN_TRANSITION_EVENT_TYPES;
+  if (!family.includes(type as EventType)) {
+    throw new EventEntityMismatchError(entity, type);
+  }
+}
+
+/**
+ * spec §4：payload 必须带 from/to，且与 guard 判定的顶层 from/to 一致。
+ * - 缺失 → 用顶层值补齐（调用方只需写一份，落库形状仍然合规）；
+ * - 存在但不一致 → TransitionPayloadMismatchError（不允许静默写出矛盾事件）。
+ */
+function mergeTransitionPayload(
+  payload: unknown,
+  from: string,
+  to: string,
+): Record<string, unknown> {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new TransitionPayloadError(
+      `状态迁移事件的 payload 必须是对象（收到 ${payload === null ? 'null' : typeof payload}），才能承载 from/to`,
+    );
+  }
+  const record = payload as Record<string, unknown>;
+  const merged: Record<string, unknown> = { ...record };
+  for (const field of ['from', 'to'] as const) {
+    const expected = field === 'from' ? from : to;
+    const actual = record[field];
+    if (actual === undefined) {
+      merged[field] = expected;
+    } else if (actual !== expected) {
+      throw new TransitionPayloadMismatchError(field, expected, actual);
+    }
+  }
+  return merged;
+}
 
 export interface ChainVerification {
   ok: boolean;
@@ -543,8 +639,12 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
   async function appendStateTransition(
     input: AppendStateTransitionInput,
   ): Promise<{ event: EventEnvelope; guard: GuardResult }> {
+    const entity = input.entity ?? 'task';
+    // ① 事件类型必须属于该实体的迁移事件家族（spec §4）
+    assertTransitionEventType(entity, input.type);
+
     const guard = guardTransition({
-      entity: input.entity ?? 'task',
+      entity,
       from: input.from,
       to: input.to,
       event_type: input.type,
@@ -554,6 +654,9 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     // 校验不通过：不进入事务、不写任何行
     if (!guard.allowed) throw new TransitionDeniedError(guard);
 
+    // ② payload.from/to 缺失则补齐、矛盾则拒绝；guard 判定与落库内容必须同源
+    const payload = mergeTransitionPayload(input.payload, input.from, input.to);
+
     const event = await append({
       stream_id: input.stream_id,
       type: input.type,
@@ -562,7 +665,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       causation_id: input.causation_id,
       correlation_id: input.correlation_id,
       idempotency_key: input.idempotency_key,
-      payload: input.payload,
+      payload,
     });
 
     return { event, guard };

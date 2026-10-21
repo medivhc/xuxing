@@ -4,9 +4,12 @@ import type { EventEnvelope, EventType } from '../src/kernel/events.js';
 import type { EventStore } from '../src/kernel/event-store.js';
 import {
   CanonicalizationError,
+  EventEntityMismatchError,
   GENESIS_HASH,
   IdempotencyKeyConflictError,
   TransitionDeniedError,
+  TransitionPayloadError,
+  TransitionPayloadMismatchError,
   UnknownEventTypeError,
   canonicalJson,
   computeEventHash,
@@ -360,7 +363,7 @@ describe('校验器嵌在写路径：非法迁移不产生事件（接线审计�
 
     await expect(
       store.appendStateTransition({
-        ...input({ payload: { task_id: 'task-1', from: 'accepted', to: 'canceled' } }),
+        ...input({ type: 'TaskLifecycleChanged', payload: { task_id: 'task-1', from: 'accepted', to: 'canceled' } }),
         from: 'accepted',
         to: 'canceled',
       }),
@@ -377,7 +380,7 @@ describe('校验器嵌在写路径：非法迁移不产生事件（接线审计�
     const before = await countEvents(ctx.pool);
     await expect(
       store.appendStateTransition({
-        ...input({ payload: { task_id: 'task-1', from: 'captured', to: 'defined' } }),
+        ...input({ type: 'TaskLifecycleChanged', payload: { task_id: 'task-1', from: 'captured', to: 'defined' } }),
         from: 'captured',
         to: 'defined',
         facts: { hasTitle: false, assigneeKind: 'human' },
@@ -411,6 +414,78 @@ describe('校验器嵌在写路径：非法迁移不产生事件（接线审计�
     ]);
   });
 
+  it('appendStateTransition 的 payload 缺 from/to → 以顶层补齐落库，replay 可重演（B1-①）', async () => {
+    const { event } = await store.appendStateTransition({
+      ...input({ type: 'TaskLifecycleChanged', payload: { task_id: 'task-1' } }),
+      from: 'awaiting_acceptance',
+      to: 'accepted',
+      facts: { acceptanceVerdict: 'accepted' },
+    });
+
+    // 落库事件必须满足 spec §4：payload 自带 from/to，且与 guard 判定一致
+    expect(event.payload).toEqual({
+      task_id: 'task-1',
+      from: 'awaiting_acceptance',
+      to: 'accepted',
+    });
+
+    // C5 最小重演：仅凭 payload 就能还原这次迁移，且链仍完整
+    const replayed = (await store.replay(0)).find((e) => e.id === event.id);
+    expect(replayed).toBeDefined();
+    expect((replayed?.payload as { from: string; to: string }).from).toBe('awaiting_acceptance');
+    expect((replayed?.payload as { from: string; to: string }).to).toBe('accepted');
+    expect(await store.verifyChain('project-1')).toMatchObject({ ok: true, length: 1 });
+  });
+
+  it('payload 与顶层 from/to 矛盾 → TransitionPayloadMismatchError，零落库（B1-②）', async () => {
+    await expect(
+      store.appendStateTransition({
+        ...input({
+          type: 'TaskLifecycleChanged',
+          payload: { task_id: 'task-1', from: 'awaiting_acceptance', to: 'accepted' },
+        }),
+        from: 'ready',
+        to: 'active',
+      }),
+    ).rejects.toBeInstanceOf(TransitionPayloadMismatchError);
+
+    expect(await countEvents(ctx.pool)).toBe(0);
+  });
+
+  it('entity 与事件类型家族错配 → EventEntityMismatchError，零落库（B1-③）', async () => {
+    await expect(
+      store.appendStateTransition({
+        ...input({ type: 'RunStarted', payload: { run_id: 'run-1' } }),
+        entity: 'task',
+        from: 'ready',
+        to: 'active',
+      }),
+    ).rejects.toBeInstanceOf(EventEntityMismatchError);
+
+    await expect(
+      store.appendStateTransition({
+        ...input({ type: 'TaskLifecycleChanged', payload: { task_id: 'task-1' } }),
+        entity: 'run',
+        from: 'queued',
+        to: 'leased',
+      }),
+    ).rejects.toBeInstanceOf(EventEntityMismatchError);
+
+    expect(await countEvents(ctx.pool)).toBe(0);
+  });
+
+  it('payload 非对象（无法承载 from/to）→ TransitionPayloadError，零落库', async () => {
+    await expect(
+      store.appendStateTransition({
+        ...input({ type: 'TaskLifecycleChanged', payload: null }),
+        from: 'ready',
+        to: 'active',
+      }),
+    ).rejects.toBeInstanceOf(TransitionPayloadError);
+
+    expect(await countEvents(ctx.pool)).toBe(0);
+  });
+
   it('append 对 TaskLifecycleChanged 做格合法性纵深防御（绕过 appendStateTransition 也拦）', async () => {
     const before = await countEvents(ctx.pool);
 
@@ -429,11 +504,4 @@ describe('校验器嵌在写路径：非法迁移不产生事件（接线审计�
     expect(ok.seq).toBe(1);
   });
 
-  it('TaskLifecycleChanged 的 payload 不带 from/to 时不触发格校验（由事件 schema 层负责）', async () => {
-    const envelope: EventEnvelope = await store.append(input({
-      type: 'TaskLifecycleChanged',
-      payload: { task_id: 'task-1' },
-    }));
-    expect(envelope.type).toBe('TaskLifecycleChanged');
-  });
 });
