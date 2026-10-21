@@ -376,11 +376,18 @@ function mergeTransitionPayload(
       `状态迁移事件的 payload 必须是对象（收到 ${payload === null ? 'null' : typeof payload}），才能承载 from/to`,
     );
   }
+  const proto = Object.getPrototypeOf(payload);
+  if (proto !== Object.prototype && proto !== null) {
+    // 与 canonicalJson 的 plain object 契约一致：不能把 Date/Map 等展开成空对象后静默丢内容
+    throw new TransitionPayloadError(
+      `状态迁移事件的 payload 必须是 plain object（收到 ${Object.prototype.toString.call(payload)}），才能承载 from/to`,
+    );
+  }
   const record = payload as Record<string, unknown>;
   const merged: Record<string, unknown> = { ...record };
   for (const field of ['from', 'to'] as const) {
     const expected = field === 'from' ? from : to;
-    const actual = record[field];
+    const actual = Object.hasOwn(record, field) ? record[field] : undefined;
     if (actual === undefined) {
       merged[field] = expected;
     } else if (actual !== expected) {

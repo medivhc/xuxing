@@ -643,6 +643,20 @@ describe('校验器嵌在写路径：非法迁移不产生事件（接线审计�
     expect(await countEvents(ctx.pool)).toBe(0);
   });
 
+  it('payload 非 plain object（Date/Map）→ TransitionPayloadError，不静默丢 payload', async () => {
+    for (const payload of [new Date(FIXED_NOW), new Map([['a', 1]])]) {
+      await expect(
+        store.appendStateTransition({
+          ...input({ type: 'TaskLifecycleChanged', payload }),
+          from: 'ready',
+          to: 'active',
+        }),
+      ).rejects.toBeInstanceOf(TransitionPayloadError);
+    }
+
+    expect(await countEvents(ctx.pool)).toBe(0);
+  });
+
   it('append 对 TaskLifecycleChanged 做格合法性纵深防御（绕过 appendStateTransition 也拦）', async () => {
     const before = await countEvents(ctx.pool);
 
