@@ -15,5 +15,5 @@ D1 云端内核 + 本地执行节点 · D2 内核 TypeScript · D3 K0/K1 不引�
 
 ## 阶段
 
-- **K0 脊柱**（进行中）：Event Store + Task/Run/Feedback/Outcome/Acceptance + PlanChange 校验 + 单个代码 Agent 适配器 + 人类执行者 + Web 四入口最小形态 + 副作用 L0/L1
+- **K0 脊柱**（进行中）：Event Store + Task/Run/Feedback/Outcome/Acceptance + PlanChange 校验 + 单个代码 Agent 适配器 + 人类执行者 + Web 四入口最小形态 + 副作用 L0/L1。领域 spec 已冻结 v1.0（2026-10-21，三轮 contract-review APPROVED，见 `spec/FREEZE-LOG.md`）；脚手架已建（src/kernel 事件目录 53 类型与 spec §4 逐字对应、领域类型、EventStore 接口、G1 测试骨架），下一步 develop 第一批：Event Store 的 PG 实现 + 迁移矩阵校验器。
 - K1 可信 / K2 协作 / K3 积累：见技术方案 §2.12
