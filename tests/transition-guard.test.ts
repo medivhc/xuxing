@@ -116,6 +116,16 @@ const RUN_CASES = expand('§3.2', 'run', RUN_ROWS, RUN_COLS, RUN_FACTS);
 
 const label = (c: MatrixCase) => `${c.spec_ref} ${c.row}→${c.col}`;
 
+const TERMINAL_TASK = new Set(['canceled']);
+const TERMINAL_RUN = new Set(['succeeded', 'failed', 'canceled', 'timed_out']);
+
+// §4.2：三类拒绝可区分——自环 / 终态 / 矩阵 ✗
+function expectedDenyReason(c: MatrixCase) {
+  if (c.row === c.col) return 'not_a_transition';
+  const terminal = c.entity === 'task' ? TERMINAL_TASK : TERMINAL_RUN;
+  return terminal.has(c.row) ? 'terminal_state' : 'illegal_transition';
+}
+
 describe('迁移矩阵 §3.1 Task（7×6=42 格，逐格）', () => {
   it.each(TASK_CASES.map((c) => [label(c), c] as const))('%s', (_name, c) => {
     const result = guardTransition({
@@ -138,8 +148,7 @@ describe('迁移矩阵 §3.1 Task（7×6=42 格，逐格）', () => {
       expect(result.basis.trigger).toBeTruthy();
     } else {
       expect(result.allowed).toBe(false);
-      // §4.2：自环不算迁移（与「矩阵为 ✗」区分）；其余 – 格即非法迁移
-      expect(result.reason).toBe(c.row === c.col ? 'not_a_transition' : 'illegal_transition');
+      expect(result.reason).toBe(expectedDenyReason(c));
     }
   });
 
@@ -170,7 +179,7 @@ describe('迁移矩阵 §3.2 Run（5×8 + 4×8=72 格，逐格）', () => {
       expect(result.basis.trigger).toBeTruthy();
     } else {
       expect(result.allowed).toBe(false);
-      expect(result.reason).toBe(c.row === c.col ? 'not_a_transition' : 'illegal_transition');
+      expect(result.reason).toBe(expectedDenyReason(c));
     }
   });
 
@@ -183,6 +192,7 @@ describe('迁移矩阵 §3.2 Run（5×8 + 4×8=72 格，逐格）', () => {
   it('终态行整体不可迁移（INV-4），reason=terminal_state', () => {
     for (const from of ['succeeded', 'failed', 'canceled', 'timed_out']) {
       for (const to of RUN_COLS) {
+        if (from === to) continue; // 自环不等于「终态再迁移」，单独分类
         const result = guardTransition({
           entity: 'run', from, to, event_type: 'RunQueued', facts: {},
         });
@@ -355,7 +365,8 @@ describe('§4.3 前置条件（正向 + 反向）', () => {
     });
     expect(result.allowed).toBe(false);
     expect(result.reason).toBe('precondition_facts_missing');
-    expect(result.unmet).toEqual(['hasTitle']);
+    // assigneeKind 也缺失，因此「指派 Agent 须结构化契约」同样不可判定
+    expect(result.unmet).toEqual(['hasTitle', 'agentContractStructured']);
   });
 
   it('facts 整体省略同样按缺失处理', () => {
