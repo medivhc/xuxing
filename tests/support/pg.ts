@@ -34,15 +34,6 @@ function docker(args: string[]): string {
   return execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
-function dockerOk(args: string[]): boolean {
-  try {
-    docker(args);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function guidance(cause: unknown): Error {
   const detail = cause instanceof Error ? cause.message : String(cause);
   return new Error(
@@ -59,18 +50,24 @@ function guidance(cause: unknown): Error {
 }
 
 /** 确保容器存在并运行；已设置 XUXING_TEST_PG_URL 时直接返回 external=true。 */
-export function ensurePgContainer(connectionString: string): { external: boolean } {
+export function ensurePgContainer(): { external: boolean } {
   if (process.env.XUXING_TEST_PG_URL) return { external: true };
 
+  let exists = false;
   try {
-    // inspect 成功说明容器已存在（running 或 stopped）
     docker(['inspect', PG_CONTAINER]);
-    const running = docker([
-      'inspect', '-f', '{{.State.Running}}', PG_CONTAINER,
-    ]).trim() === 'true';
-    if (!running) docker(['start', PG_CONTAINER]);
-  } catch (inspectError) {
-    try {
+    exists = true;
+  } catch {
+    exists = false;
+  }
+
+  try {
+    if (exists) {
+      const running = docker([
+        'inspect', '-f', '{{.State.Running}}', PG_CONTAINER,
+      ]).trim() === 'true';
+      if (!running) docker(['start', PG_CONTAINER]);
+    } else {
       docker([
         'run', '-d',
         '--name', PG_CONTAINER,
@@ -80,14 +77,11 @@ export function ensurePgContainer(connectionString: string): { external: boolean
         '--tmpfs', '/var/lib/postgresql/data:rw,size=512m',
         'postgres:16-alpine',
       ]);
-    } catch (runError) {
-      throw guidance(runError);
     }
-    // inspect 失败且 run 成功 = 首次创建；无需处理 inspectError
-    void inspectError;
+  } catch (error) {
+    throw guidance(error);
   }
 
-  void connectionString;
   return { external: false };
 }
 
@@ -121,7 +115,7 @@ function buildPoolConfig(connectionString: string, schema: string) {
 /** 建立一个独立 schema 的测试上下文；调用方必须在 afterAll 调 close()。 */
 export async function createTestPg(): Promise<TestPg> {
   const connectionString = process.env.XUXING_TEST_PG_URL ?? DEFAULT_PG_URL;
-  const { external } = ensurePgContainer(connectionString);
+  const { external } = ensurePgContainer();
   await waitReady(connectionString);
 
   const schema = `xs_test_${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`;
