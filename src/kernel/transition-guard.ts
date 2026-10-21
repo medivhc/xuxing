@@ -62,6 +62,21 @@ export type GuardReason =
 
 export type GuardEffect = 'cancel_active_wait_conditions' | 'reset_wait_state_none';
 
+/**
+ * 缺失 fact 的可执行提示：告诉调用方要补 GuardFacts 的哪个键、期望值是什么。
+ * expected 可直接照抄进日志或调用代码（如 acceptanceVerdict='accepted'）。
+ */
+export interface MissingFactHint {
+  /** 触发该提示的 requirement id（可回溯到 spec 原句）。 */
+  requirement: string;
+  /** 缺失的 GuardFacts 键名。 */
+  fact: string;
+  /** 期望值/可照抄赋值；多选一条件用文案表达。 */
+  expected: string;
+  /** 多选一条件中的其它可选 fact（无则省略）。 */
+  alternatives?: string[];
+}
+
 /** 前置条件 fact：由调用方显式提供；undefined = 缺失（拒绝，不猜）。 */
 export interface GuardFacts {
   // §3.1 captured→defined
@@ -101,8 +116,15 @@ export interface GuardResult {
   allowed: boolean;
   basis: GuardBasis;
   reason?: GuardReason;
-  /** 未满足（或缺失）的前置条件 id；成功时为 []。 */
+  /**
+   * 未满足的前置条件 id（兼容字段）：缺失 fact 与已给但不满足的 requirement 的并集。
+   * 需要区分时用 unmet_requirements（已给但不满足）与 missing_facts（缺 fact）。
+   */
   unmet?: string[];
+  /** 已给 fact 但不满足的 requirement id（无需补 fact，这条路当前走不通）。 */
+  unmet_requirements?: string[];
+  /** 缺失的 fact 及期望值：能直接告诉调用方要传什么（precondition_facts_missing 时非空）。 */
+  missing_facts?: MissingFactHint[];
   /** INV-11：迁入 accepted/canceled 时内核须同事务执行的收尾动作（按序）。 */
   required_effects?: GuardEffect[];
   required_effects_basis?: 'INV-11';
@@ -233,6 +255,126 @@ const REQUIREMENTS: Record<RequirementId, (facts: GuardFacts) => FactState> = {
   // 「对账后人工取消」
   reconciliationConcluded: (f) => flag(f.reconciliationConcluded),
 };
+
+// ---------------------------------------------------------------------------
+// 缺失 fact → 可执行提示（F-a：不能只报 requirement 名）
+// ---------------------------------------------------------------------------
+
+/**
+ * 只列出调用方确实没给的 fact（undefined），并给出期望值。
+ * 已给但值不满足的 requirement 不在这里出现（由 unmet_requirements 表达）。
+ */
+function missingFactHints(requirementId: RequirementId, facts: GuardFacts): MissingFactHint[] {
+  const hints: MissingFactHint[] = [];
+  const add = (fact: string, expected: string, value: unknown): void => {
+    if (value === undefined) hints.push({ requirement: requirementId, fact, expected });
+  };
+
+  switch (requirementId) {
+    case 'hasTitle':
+      add('hasTitle', 'hasTitle=true', facts.hasTitle);
+      break;
+    case 'agentContractStructured':
+      add('assigneeKind', "assigneeKind='human'|'agent'", facts.assigneeKind);
+      if (facts.assigneeKind === 'agent') {
+        add('contractStructured', 'contractStructured=true', facts.contractStructured);
+      }
+      break;
+    case 'acceptanceRejected':
+      add('acceptanceVerdict', "acceptanceVerdict='rejected'", facts.acceptanceVerdict);
+      break;
+    case 'reexecutionNeeded':
+      add(
+        'acceptanceVerdict',
+        "acceptanceVerdict='rejected'|'partially_accepted'",
+        facts.acceptanceVerdict,
+      );
+      if (
+        facts.acceptanceVerdict === 'rejected' ||
+        facts.acceptanceVerdict === 'partially_accepted'
+      ) {
+        add('needsReexecution', 'needsReexecution=true', facts.needsReexecution);
+      }
+      break;
+    case 'acceptanceAccepted':
+      add('acceptanceVerdict', "acceptanceVerdict='accepted'", facts.acceptanceVerdict);
+      break;
+    case 'acceptanceInvalidated':
+      if (
+        facts.acceptanceSuperseded === undefined &&
+        facts.declaresRevalidation === undefined
+      ) {
+        hints.push({
+          requirement: requirementId,
+          fact: 'acceptanceSuperseded',
+          expected: 'acceptanceSuperseded=true 或 declaresRevalidation=true',
+          alternatives: ['declaresRevalidation'],
+        });
+      }
+      break;
+    case 'allRunsTerminal':
+      add('allRunsTerminal', 'allRunsTerminal=true', facts.allRunsTerminal);
+      break;
+    case 'leaseExpiredNotStarted':
+      add('leaseExpired', 'leaseExpired=true', facts.leaseExpired);
+      add('started', 'started=false', facts.started);
+      break;
+    case 'leaseExpiredStartedLowSideEffect':
+      add('leaseExpired', 'leaseExpired=true', facts.leaseExpired);
+      add('started', 'started=true', facts.started);
+      add('sideEffectLevel', "sideEffectLevel='L0'|'L1'", facts.sideEffectLevel);
+      add(
+        'externalSideEffectCalled',
+        'externalSideEffectCalled=false',
+        facts.externalSideEffectCalled,
+      );
+      break;
+    case 'leaseExpiredStartedHighSideEffect':
+      add('leaseExpired', 'leaseExpired=true', facts.leaseExpired);
+      add('started', 'started=true', facts.started);
+      add(
+        'sideEffectLevel',
+        "sideEffectLevel='L2'|'L3' 或 externalSideEffectCalled=true",
+        facts.sideEffectLevel,
+      );
+      add(
+        'externalSideEffectCalled',
+        'externalSideEffectCalled=true',
+        facts.externalSideEffectCalled,
+      );
+      break;
+    case 'timeoutNoSideEffectResidue':
+      add('runTimeoutExceeded', 'runTimeoutExceeded=true', facts.runTimeoutExceeded);
+      add(
+        'sideEffectResidue',
+        "sideEffectResidue='none'",
+        facts.sideEffectResidue,
+      );
+      break;
+    case 'cancelAcknowledged':
+      add('cancelAcknowledged', 'cancelAcknowledged=true', facts.cancelAcknowledged);
+      break;
+    case 'reconciliationCompleted':
+      add('reconciliation', "reconciliation='completed'", facts.reconciliation);
+      break;
+    case 'reconciliationFailed':
+      add(
+        'reconciliation',
+        "reconciliation='not_executed'|'failed'",
+        facts.reconciliation,
+      );
+      break;
+    case 'reconciliationConcluded':
+      add(
+        'reconciliationConcluded',
+        'reconciliationConcluded=true',
+        facts.reconciliationConcluded,
+      );
+      break;
+  }
+
+  return hints;
+}
 
 // ---------------------------------------------------------------------------
 // §3.1 Task 主生命周期矩阵（7 行 × 6 列 = 42 格，逐格显式）
@@ -503,14 +645,18 @@ export function guardTransition(input: GuardTransitionInput): GuardResult {
   const facts = input.facts ?? {};
 
   const unmet: string[] = [];
+  const unmetRequirements: string[] = [];
+  const missingFacts: MissingFactHint[] = [];
   let anyMissing = false;
   for (const requirementId of requires) {
     const state = REQUIREMENTS[requirementId](facts);
     if (state === 'missing') {
       anyMissing = true;
       unmet.push(requirementId);
+      missingFacts.push(...missingFactHints(requirementId, facts));
     } else if (state === 'unmet') {
       unmet.push(requirementId);
+      unmetRequirements.push(requirementId);
     }
   }
 
@@ -520,6 +666,8 @@ export function guardTransition(input: GuardTransitionInput): GuardResult {
       basis: cellCheck.basis,
       reason: anyMissing ? 'precondition_facts_missing' : 'precondition_unmet',
       unmet,
+      unmet_requirements: unmetRequirements,
+      missing_facts: missingFacts,
     };
   }
 
@@ -528,6 +676,8 @@ export function guardTransition(input: GuardTransitionInput): GuardResult {
     allowed: true,
     basis: cellCheck.basis,
     unmet: [],
+    unmet_requirements: [],
+    missing_facts: [],
     required_effects: effects,
     ...(effects.length > 0 ? { required_effects_basis: 'INV-11' as const } : {}),
   };

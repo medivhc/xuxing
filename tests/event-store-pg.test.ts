@@ -476,6 +476,28 @@ describe('校验器嵌在写路径：非法迁移不产生事件（接线审计�
     expect(await countEvents(ctx.pool)).toBe(before);
   });
 
+  it('appendStateTransition 缺 fact → 错误消息带可照抄的 fact 提示（F-a 接线）', async () => {
+    await expect(
+      store.appendStateTransition({
+        ...input({ type: 'TaskLifecycleChanged', payload: { task_id: 'task-1' } }),
+        from: 'awaiting_acceptance',
+        to: 'accepted',
+      }),
+    ).rejects.toSatisfy((error: unknown) => {
+      expect(error).toBeInstanceOf(TransitionDeniedError);
+      const denied = error as TransitionDeniedError;
+      expect(denied.result.missing_facts).toEqual([{
+        requirement: 'acceptanceAccepted',
+        fact: 'acceptanceVerdict',
+        expected: "acceptanceVerdict='accepted'",
+      }]);
+      expect(denied.message).toContain("acceptanceVerdict='accepted'");
+      return true;
+    });
+
+    expect(await countEvents(ctx.pool)).toBe(0);
+  });
+
   it('appendStateTransition 合法迁移 → 行数 +1，payload.from/to 正确，返回 INV-11 收尾动作', async () => {
     await store.append(input({ payload: { task_id: 'task-1' } }));
     const before = await countEvents(ctx.pool);

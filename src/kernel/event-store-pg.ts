@@ -83,9 +83,13 @@ export class StoreInvariantError extends Error {
 export class TransitionDeniedError extends Error {
   readonly result: GuardResult;
   constructor(result: GuardResult) {
+    const missing = result.missing_facts?.length
+      ? ` missing_facts=${result.missing_facts.map((hint) => hint.expected).join(',')}`
+      : '';
     super(
       `状态迁移被拒绝：${result.basis.spec_ref} ${result.basis.row}→${result.basis.col} ` +
-        `reason=${result.reason ?? 'unknown'}${result.unmet?.length ? ` unmet=${result.unmet.join(',')}` : ''}`,
+        `reason=${result.reason ?? 'unknown'}${result.unmet?.length ? ` unmet=${result.unmet.join(',')}` : ''}` +
+        missing,
     );
     this.name = 'TransitionDeniedError';
     this.result = result;

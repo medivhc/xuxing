@@ -367,6 +367,16 @@ describe('§4.3 前置条件（正向 + 反向）', () => {
     expect(result.reason).toBe('precondition_facts_missing');
     // assigneeKind 也缺失，因此「指派 Agent 须结构化契约」同样不可判定
     expect(result.unmet).toEqual(['hasTitle', 'agentContractStructured']);
+    // F-a：缺哪个 fact、期望值是什么，可直接照抄
+    expect(result.missing_facts).toEqual([
+      { requirement: 'hasTitle', fact: 'hasTitle', expected: 'hasTitle=true' },
+      {
+        requirement: 'agentContractStructured',
+        fact: 'assigneeKind',
+        expected: "assigneeKind='human'|'agent'",
+      },
+    ]);
+    expect(result.unmet_requirements).toEqual([]);
   });
 
   it('facts 整体省略同样按缺失处理', () => {
@@ -376,6 +386,75 @@ describe('§4.3 前置条件（正向 + 反向）', () => {
     expect(result.allowed).toBe(false);
     expect(result.reason).toBe('precondition_facts_missing');
     expect(result.unmet).toEqual(['leaseExpiredNotStarted']);
+    expect(result.missing_facts).toEqual([
+      {
+        requirement: 'leaseExpiredNotStarted',
+        fact: 'leaseExpired',
+        expected: 'leaseExpired=true',
+      },
+      { requirement: 'leaseExpiredNotStarted', fact: 'started', expected: 'started=false' },
+    ]);
+  });
+
+  it('缺 fact 提示给出 fact 名 + 期望值（acceptanceVerdict）', () => {
+    const result = guardTransition({
+      entity: 'task', from: 'awaiting_acceptance', to: 'accepted',
+      event_type: 'TaskLifecycleChanged', facts: {},
+    });
+    expect(result.reason).toBe('precondition_facts_missing');
+    expect(result.missing_facts).toEqual([{
+      requirement: 'acceptanceAccepted',
+      fact: 'acceptanceVerdict',
+      expected: "acceptanceVerdict='accepted'",
+    }]);
+    expect(result.unmet_requirements).toEqual([]);
+  });
+
+  it('缺失与「已给但不满足」分开：unmet_requirements 只放已给但不满足的', () => {
+    const result = guardTransition({
+      entity: 'task', from: 'captured', to: 'defined', event_type: 'TaskLifecycleChanged',
+      facts: { hasTitle: false, assigneeKind: 'agent' },
+    });
+    expect(result.reason).toBe('precondition_facts_missing');
+    expect(result.unmet).toEqual(['hasTitle', 'agentContractStructured']);
+    expect(result.unmet_requirements).toEqual(['hasTitle']);
+    expect(result.missing_facts).toEqual([{
+      requirement: 'agentContractStructured',
+      fact: 'contractStructured',
+      expected: 'contractStructured=true',
+    }]);
+  });
+
+  it('facts 全给但不满足 → precondition_unmet，missing_facts 为空', () => {
+    const result = guardTransition({
+      entity: 'task', from: 'awaiting_acceptance', to: 'accepted',
+      event_type: 'TaskLifecycleChanged', facts: { acceptanceVerdict: 'rejected' },
+    });
+    expect(result.reason).toBe('precondition_unmet');
+    expect(result.unmet).toEqual(['acceptanceAccepted']);
+    expect(result.unmet_requirements).toEqual(['acceptanceAccepted']);
+    expect(result.missing_facts).toEqual([]);
+  });
+
+  it('复合条件只列真正缺失的 fact（已给的不重复提示）', () => {
+    const result = guardTransition({
+      entity: 'run', from: 'leased', to: 'indeterminate', event_type: 'RunIndeterminate',
+      facts: { leaseExpired: true, started: true },
+    });
+    expect(result.reason).toBe('precondition_facts_missing');
+    expect(result.unmet_requirements).toEqual([]);
+    expect(result.missing_facts).toEqual([
+      {
+        requirement: 'leaseExpiredStartedHighSideEffect',
+        fact: 'sideEffectLevel',
+        expected: "sideEffectLevel='L2'|'L3' 或 externalSideEffectCalled=true",
+      },
+      {
+        requirement: 'leaseExpiredStartedHighSideEffect',
+        fact: 'externalSideEffectCalled',
+        expected: 'externalSideEffectCalled=true',
+      },
+    ]);
   });
 
   it('accepted→awaiting_acceptance 的另一条通道：declares_revalidation 单独即可放行（S1）', () => {
