@@ -14,11 +14,14 @@
 // - replay 用单条 SELECT（单快照）按 global_seq 重演；global_seq 允许空洞（回滚跳号），
 //   只保证单调。增量 tailing 需要水位保护，按 Q5 留给 batch 2。
 // - occurred_at 由注入时钟提供（store 接口无该参数，见假设 A8）。
-// - 本批只支持单事件 append；INV-11 的收尾动作只以 required_effects 形式返回，
-//   appendBatch 留给 batch 2（Q4）。
+// - 状态迁移写路径（appendStateTransition）：先 guardTransition，再保证 payload.from/to
+//   与顶层一致（缺失补齐、矛盾拒绝），并校验事件类型属于 entity 家族（task/run，spec §4）。
+// - INV-11 的收尾动作可正确兑现：withTransaction(fn) 内 fn 拿到共享同一 client 的 store，
+//   append / appendStateTransition 同事务提交，任一抛错整体回滚。accepted/canceled 可用。
+//   跨事务批量（appendBatch）仍留给 batch 2（Q4）；本批不提供跨事务原子性。
 
 import { createHash } from 'node:crypto';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import { ulid } from 'ulid';
 import type { EventEnvelope, EventType } from './events.js';
 import { EVENT_TYPES } from './events.js';
@@ -389,15 +392,27 @@ export interface ChainVerification {
   length: number;
   broken_at_seq: number | null;
   reason: string | null;
+  /** event_streams 是否有链头行：区分「不存在的 stream」与「健康的空流」。 */
+  stream_exists: boolean;
 }
 
-export interface PgEventStore extends EventStore {
-  /** 校验器嵌在写路径：先 guardTransition，拒绝则抛 TransitionDeniedError 且不进入事务。 */
+/** 事务内的 store 视图：append / appendStateTransition 共享调用方开启的同一 client 与事务。 */
+export interface PgEventStoreTx extends EventStore {
+  /** 校验器嵌在写路径：先 guardTransition，拒绝则抛 TransitionDeniedError 且不写任何行。 */
   appendStateTransition(
     input: AppendStateTransitionInput,
   ): Promise<{ event: EventEnvelope; guard: GuardResult }>;
   /** 读全流、用 payload_canonical 重算链，返回首个断点（不在 append/replay 热路径）。 */
   verifyChain(stream_id: string): Promise<ChainVerification>;
+}
+
+export interface PgEventStore extends PgEventStoreTx {
+  /**
+   * INV-11 的同事务收尾入口：fn 内的 append / appendStateTransition 共享同一 client，
+   * fn 抛错（或 COMMIT 失败）则整体回滚，零事件落库。
+   * accepted/canceled 的 required_effects 必须在本入口内与 lifecycle 迁移一起提交。
+   */
+  withTransaction<T>(fn: (tx: PgEventStoreTx) => Promise<T>): Promise<T>;
 }
 
 const INSERT_EVENT_SQL = `
@@ -407,269 +422,332 @@ const INSERT_EVENT_SQL = `
   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14)
   RETURNING global_seq, recorded_at`;
 
+interface PreparedAppend {
+  input: Parameters<EventStore['append']>[0];
+  payload_canonical: string;
+}
+
+/** 写前校验（与事务无关，两种入口共用）：类型封闭集、payload 可规范化、格级纵深防御。 */
+function prepareAppend(input: Parameters<EventStore['append']>[0]): PreparedAppend {
+  if (!(EVENT_TYPES as readonly string[]).includes(input.type)) {
+    throw new UnknownEventTypeError(String(input.type));
+  }
+
+  const payload_canonical = canonicalJson(input.payload);
+
+  // 纵深防御（plan §5）：TaskLifecycleChanged 的 payload 带 from/to 时复核格合法性。
+  // 这里只查矩阵格，不评估前置条件（前置条件由 appendStateTransition 负责）。
+  if (input.type === 'TaskLifecycleChanged') {
+    const payload = input.payload as { from?: unknown; to?: unknown } | null;
+    if (typeof payload?.from === 'string' && typeof payload?.to === 'string') {
+      const check = isMatrixCellAllowed('task', payload.from, payload.to);
+      if (!check.allowed) throw new TransitionDeniedError(check);
+    }
+  }
+
+  return { input, payload_canonical };
+}
+
+/**
+ * 在已开启的事务内追加一条事件：不 BEGIN / COMMIT / ROLLBACK，连接生命周期由调用方管。
+ * 任何一步失败都让所在事务进入 aborted 状态，由调用方整体回滚。
+ */
+async function appendWithin(
+  client: PoolClient,
+  prepared: PreparedAppend,
+  idFactory: () => string,
+  clock: () => Date,
+): Promise<EventEnvelope> {
+  const { input, payload_canonical } = prepared;
+
+  // 幂等建链头行；genesis last_hash = 64 个 0
+  await client.query(
+    `INSERT INTO event_streams (stream_id, last_seq, last_hash)
+     VALUES ($1, 0, $2)
+     ON CONFLICT (stream_id) DO NOTHING`,
+    [input.stream_id, GENESIS_HASH],
+  );
+
+  // 临界区入口：同 stream 串行，跨 stream 并行
+  const head = await client.query<{ last_seq: string; last_hash: string }>(
+    `SELECT last_seq, last_hash FROM event_streams
+     WHERE stream_id = $1 FOR UPDATE`,
+    [input.stream_id],
+  );
+  if (head.rows.length !== 1) {
+    throw new StoreInvariantError(`event_streams 缺少 stream=${input.stream_id} 的链头行`);
+  }
+  const last_seq = toSafeNumber(head.rows[0].last_seq, 'event_streams.last_seq');
+  const last_hash = head.rows[0].last_hash;
+
+  // 锁内快路径：同 key 已入账 → 返回首次结果（INV-13）
+  if (input.idempotency_key !== null) {
+    const existing = await client.query<EventRow>(
+      `SELECT * FROM events WHERE stream_id = $1 AND idempotency_key = $2`,
+      [input.stream_id, input.idempotency_key],
+    );
+    if (existing.rows.length > 0) {
+      const row = existing.rows[0];
+      if (row.type !== input.type || row.payload_canonical !== payload_canonical) {
+        throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+      }
+      return rowToEnvelope(row);
+    }
+  }
+
+  const seq = last_seq + 1;
+  const hash = computeEventHash(last_hash, payload_canonical, seq);
+  const id = idFactory();
+  const occurred_at = clock().toISOString();
+
+  const inserted = await client.query<{ global_seq: string; recorded_at: Date | string }>(
+    INSERT_EVENT_SQL,
+    [
+      id,
+      input.stream_id,
+      seq,
+      input.type,
+      input.actor_id,
+      input.actor_kind,
+      input.causation_id,
+      input.correlation_id,
+      input.idempotency_key,
+      payload_canonical,
+      payload_canonical,
+      last_hash,
+      hash,
+      occurred_at,
+    ],
+  );
+
+  await client.query(
+    `UPDATE event_streams
+     SET last_seq = $2, last_hash = $3, updated_at = now()
+     WHERE stream_id = $1`,
+    [input.stream_id, seq, hash],
+  );
+
+  return {
+    id,
+    stream_id: input.stream_id,
+    seq,
+    global_seq: toSafeNumber(inserted.rows[0].global_seq, 'events.global_seq'),
+    type: input.type,
+    actor_id: input.actor_id,
+    actor_kind: input.actor_kind,
+    causation_id: input.causation_id,
+    correlation_id: input.correlation_id,
+    idempotency_key: input.idempotency_key,
+    payload: JSON.parse(payload_canonical) as unknown,
+    prev_hash: last_hash,
+    hash,
+    occurred_at,
+    recorded_at: toIso(inserted.rows[0].recorded_at),
+  };
+}
+
 export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}): PgEventStore {
   const clock = options.clock ?? (() => new Date());
   const idFactory = options.idFactory ?? (() => ulid());
 
-  async function append(
-    input: Parameters<EventStore['append']>[0],
-  ): Promise<EventEnvelope> {
-    if (!(EVENT_TYPES as readonly string[]).includes(input.type)) {
-      throw new UnknownEventTypeError(String(input.type));
-    }
+  /**
+   * 构造一个 store 视图。client = null 时每次写各自开事务（pool 路径）；
+   * client 非空时所有读写都走该连接（withTransaction 路径），共享同一事务。
+   */
+  function makeScoped(client: PoolClient | null): PgEventStoreTx {
+    const reader = client ?? pool;
 
-    const payload_canonical = canonicalJson(input.payload);
+    async function append(
+      input: Parameters<EventStore['append']>[0],
+    ): Promise<EventEnvelope> {
+      const prepared = prepareAppend(input);
 
-    // 纵深防御（plan §5）：TaskLifecycleChanged 的 payload 带 from/to 时复核格合法性。
-    // 这里只查矩阵格，不评估前置条件（前置条件由 appendStateTransition 负责）。
-    if (input.type === 'TaskLifecycleChanged') {
-      const payload = input.payload as { from?: unknown; to?: unknown } | null;
-      if (typeof payload?.from === 'string' && typeof payload?.to === 'string') {
-        const check = isMatrixCellAllowed('task', payload.from, payload.to);
-        if (!check.allowed) throw new TransitionDeniedError(check);
-      }
-    }
+      // 事务内：直接复用调用方连接，失败由 withTransaction 整体回滚
+      if (client) return appendWithin(client, prepared, idFactory, clock);
 
-    const client = await pool.connect();
-    let settled = false;
-    try {
-      await client.query('BEGIN');
+      const conn = await pool.connect();
+      try {
+        await conn.query('BEGIN');
+        const event = await appendWithin(conn, prepared, idFactory, clock);
 
-      // 幂等建链头行；genesis last_hash = 64 个 0
-      await client.query(
-        `INSERT INTO event_streams (stream_id, last_seq, last_hash)
-         VALUES ($1, 0, $2)
-         ON CONFLICT (stream_id) DO NOTHING`,
-        [input.stream_id, GENESIS_HASH],
-      );
+        // 快路径命中已存在事件时事务是只读的，COMMIT 同样安全
+        await conn.query('COMMIT');
+        return event;
+      } catch (error) {
+        await conn.query('ROLLBACK').catch(() => undefined);
 
-      // 临界区入口：同 stream 串行，跨 stream 并行
-      const head = await client.query<{ last_seq: string; last_hash: string }>(
-        `SELECT last_seq, last_hash FROM event_streams
-         WHERE stream_id = $1 FOR UPDATE`,
-        [input.stream_id],
-      );
-      if (head.rows.length !== 1) {
-        throw new StoreInvariantError(`event_streams 缺少 stream=${input.stream_id} 的链头行`);
-      }
-      const last_seq = toSafeNumber(head.rows[0].last_seq, 'event_streams.last_seq');
-      const last_hash = head.rows[0].last_hash;
-
-      // 锁内快路径：同 key 已入账 → 返回首次结果（INV-13）
-      if (input.idempotency_key !== null) {
-        const existing = await client.query<EventRow>(
-          `SELECT * FROM events WHERE stream_id = $1 AND idempotency_key = $2`,
-          [input.stream_id, input.idempotency_key],
-        );
-        if (existing.rows.length > 0) {
-          const row = existing.rows[0];
-          await client.query('ROLLBACK');
-          settled = true;
-          if (row.type !== input.type || row.payload_canonical !== payload_canonical) {
-            throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+        // 唯一索引兜底：并发同 key 跨路径（23505），回滚后重查首次行
+        if (
+          isUniqueViolation(error, 'events_stream_idem_uq') &&
+          input.idempotency_key !== null
+        ) {
+          const { rows } = await pool.query<EventRow>(
+            `SELECT * FROM events WHERE stream_id = $1 AND idempotency_key = $2`,
+            [input.stream_id, input.idempotency_key],
+          );
+          if (rows.length === 1) {
+            if (
+              rows[0].type !== input.type ||
+              rows[0].payload_canonical !== prepared.payload_canonical
+            ) {
+              throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+            }
+            return rowToEnvelope(rows[0]);
           }
-          return rowToEnvelope(row);
         }
+
+        // (stream_id, seq) 唯一约束命中 = 行锁逻辑有 bug，大声失败
+        if (isUniqueViolation(error, 'events_stream_seq_uq')) {
+          throw new StoreInvariantError(
+            `seq 分配冲突：stream=${input.stream_id}（行锁逻辑失效，不重试掩盖）`,
+          );
+        }
+
+        throw error;
+      } finally {
+        conn.release();
       }
+    }
 
-      const seq = last_seq + 1;
-      const hash = computeEventHash(last_hash, payload_canonical, seq);
-      const id = idFactory();
-      const occurred_at = clock().toISOString();
+    async function readStream(stream_id: string, from_seq = 1): Promise<EventEnvelope[]> {
+      const { rows } = await reader.query<EventRow>(
+        `SELECT * FROM events
+         WHERE stream_id = $1 AND seq >= $2
+         ORDER BY seq ASC`,
+        [stream_id, from_seq],
+      );
+      return rows.map(rowToEnvelope);
+    }
 
-      const inserted = await client.query<{ global_seq: string; recorded_at: Date | string }>(
-        INSERT_EVENT_SQL,
-        [
-          id,
-          input.stream_id,
-          seq,
-          input.type,
-          input.actor_id,
-          input.actor_kind,
-          input.causation_id,
-          input.correlation_id,
-          input.idempotency_key,
-          payload_canonical,
-          payload_canonical,
-          last_hash,
-          hash,
-          occurred_at,
-        ],
+    async function replay(from_global_seq = 0): Promise<EventEnvelope[]> {
+      // 单条 SELECT = 单快照：避免「先看到 global_seq 10、后看到 9」的交错。
+      // 已知限界（Q5）：提交序可能先于 global_seq 分配序；增量 tailing 需水位保护，batch 2。
+      const { rows } = await reader.query<EventRow>(
+        `SELECT * FROM events
+         WHERE global_seq >= $1
+         ORDER BY global_seq ASC`,
+        [from_global_seq],
+      );
+      return rows.map(rowToEnvelope);
+    }
+
+    async function verifyChain(stream_id: string): Promise<ChainVerification> {
+      const { rows } = await reader.query<{
+        seq: string;
+        prev_hash: string;
+        hash: string;
+        payload_canonical: string;
+      }>(
+        `SELECT seq, prev_hash, hash, payload_canonical FROM events
+         WHERE stream_id = $1 ORDER BY seq ASC`,
+        [stream_id],
       );
 
-      await client.query(
-        `UPDATE event_streams
-         SET last_seq = $2, last_hash = $3, updated_at = now()
-         WHERE stream_id = $1`,
-        [input.stream_id, seq, hash],
-      );
-
-      await client.query('COMMIT');
-      settled = true;
+      let expectedPrev = GENESIS_HASH;
+      let expectedSeq = 1;
+      for (const row of rows) {
+        const seq = toSafeNumber(row.seq, 'events.seq');
+        if (seq !== expectedSeq) {
+          return {
+            ok: false,
+            stream_id,
+            length: rows.length,
+            broken_at_seq: seq,
+            reason: `seq 不连续：期望 ${expectedSeq}，实际 ${seq}`,
+            stream_exists: true,
+          };
+        }
+        if (row.prev_hash !== expectedPrev) {
+          return {
+            ok: false,
+            stream_id,
+            length: rows.length,
+            broken_at_seq: seq,
+            reason: `prev_hash 断链：期望 ${expectedPrev}，实际 ${row.prev_hash}`,
+            stream_exists: true,
+          };
+        }
+        const recomputed = computeEventHash(row.prev_hash, row.payload_canonical, seq);
+        if (recomputed !== row.hash) {
+          return {
+            ok: false,
+            stream_id,
+            length: rows.length,
+            broken_at_seq: seq,
+            reason: `hash 不匹配：重算 ${recomputed}，实际 ${row.hash}`,
+            stream_exists: true,
+          };
+        }
+        expectedPrev = row.hash;
+        expectedSeq = seq + 1;
+      }
 
       return {
-        id,
+        ok: true,
+        stream_id,
+        length: rows.length,
+        broken_at_seq: null,
+        reason: null,
+        stream_exists: true,
+      };
+    }
+
+    async function appendStateTransition(
+      input: AppendStateTransitionInput,
+    ): Promise<{ event: EventEnvelope; guard: GuardResult }> {
+      const entity = input.entity ?? 'task';
+      // ① 事件类型必须属于该实体的迁移事件家族（spec §4）
+      assertTransitionEventType(entity, input.type);
+
+      const guard = guardTransition({
+        entity,
+        from: input.from,
+        to: input.to,
+        event_type: input.type,
+        facts: input.facts,
+      });
+
+      // 校验不通过：不进入事务、不写任何行
+      if (!guard.allowed) throw new TransitionDeniedError(guard);
+
+      // ② payload.from/to 缺失则补齐、矛盾则拒绝；guard 判定与落库内容必须同源
+      const payload = mergeTransitionPayload(input.payload, input.from, input.to);
+
+      const event = await append({
         stream_id: input.stream_id,
-        seq,
-        global_seq: toSafeNumber(inserted.rows[0].global_seq, 'events.global_seq'),
         type: input.type,
         actor_id: input.actor_id,
         actor_kind: input.actor_kind,
         causation_id: input.causation_id,
         correlation_id: input.correlation_id,
         idempotency_key: input.idempotency_key,
-        payload: JSON.parse(payload_canonical) as unknown,
-        prev_hash: last_hash,
-        hash,
-        occurred_at,
-        recorded_at: toIso(inserted.rows[0].recorded_at),
-      };
+        payload,
+      });
+
+      return { event, guard };
+    }
+
+    return { append, readStream, replay, appendStateTransition, verifyChain };
+  }
+
+  const base = makeScoped(null);
+
+  async function withTransaction<T>(
+    fn: (tx: PgEventStoreTx) => Promise<T>,
+  ): Promise<T> {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await fn(makeScoped(client));
+      await client.query('COMMIT');
+      return result;
     } catch (error) {
-      if (!settled) {
-        await client.query('ROLLBACK').catch(() => undefined);
-        settled = true;
-      }
-
-      // 唯一索引兜底：并发同 key 跨路径（23505），回滚后重查首次行
-      if (isUniqueViolation(error, 'events_stream_idem_uq') && input.idempotency_key !== null) {
-        const { rows } = await pool.query<EventRow>(
-          `SELECT * FROM events WHERE stream_id = $1 AND idempotency_key = $2`,
-          [input.stream_id, input.idempotency_key],
-        );
-        if (rows.length === 1) {
-          if (rows[0].type !== input.type || rows[0].payload_canonical !== payload_canonical) {
-            throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
-          }
-          return rowToEnvelope(rows[0]);
-        }
-      }
-
-      // (stream_id, seq) 唯一约束命中 = 行锁逻辑有 bug，大声失败
-      if (isUniqueViolation(error, 'events_stream_seq_uq')) {
-        throw new StoreInvariantError(
-          `seq 分配冲突：stream=${input.stream_id}（行锁逻辑失效，不重试掩盖）`,
-        );
-      }
-
+      await client.query('ROLLBACK').catch(() => undefined);
       throw error;
     } finally {
       client.release();
     }
   }
 
-  async function readStream(stream_id: string, from_seq = 1): Promise<EventEnvelope[]> {
-    const { rows } = await pool.query<EventRow>(
-      `SELECT * FROM events
-       WHERE stream_id = $1 AND seq >= $2
-       ORDER BY seq ASC`,
-      [stream_id, from_seq],
-    );
-    return rows.map(rowToEnvelope);
-  }
-
-  async function replay(from_global_seq = 0): Promise<EventEnvelope[]> {
-    // 单条 SELECT = 单快照：避免「先看到 global_seq 10、后看到 9」的交错。
-    // 已知限界（Q5）：提交序可能先于 global_seq 分配序；增量 tailing 需水位保护，batch 2。
-    const { rows } = await pool.query<EventRow>(
-      `SELECT * FROM events
-       WHERE global_seq >= $1
-       ORDER BY global_seq ASC`,
-      [from_global_seq],
-    );
-    return rows.map(rowToEnvelope);
-  }
-
-  async function verifyChain(stream_id: string): Promise<ChainVerification> {
-    const { rows } = await pool.query<{
-      seq: string;
-      prev_hash: string;
-      hash: string;
-      payload_canonical: string;
-    }>(
-      `SELECT seq, prev_hash, hash, payload_canonical FROM events
-       WHERE stream_id = $1 ORDER BY seq ASC`,
-      [stream_id],
-    );
-
-    let expectedPrev = GENESIS_HASH;
-    let expectedSeq = 1;
-    for (const row of rows) {
-      const seq = toSafeNumber(row.seq, 'events.seq');
-      if (seq !== expectedSeq) {
-        return {
-          ok: false,
-          stream_id,
-          length: rows.length,
-          broken_at_seq: seq,
-          reason: `seq 不连续：期望 ${expectedSeq}，实际 ${seq}`,
-        };
-      }
-      if (row.prev_hash !== expectedPrev) {
-        return {
-          ok: false,
-          stream_id,
-          length: rows.length,
-          broken_at_seq: seq,
-          reason: `prev_hash 断链：期望 ${expectedPrev}，实际 ${row.prev_hash}`,
-        };
-      }
-      const recomputed = computeEventHash(row.prev_hash, row.payload_canonical, seq);
-      if (recomputed !== row.hash) {
-        return {
-          ok: false,
-          stream_id,
-          length: rows.length,
-          broken_at_seq: seq,
-          reason: `hash 不匹配：重算 ${recomputed}，实际 ${row.hash}`,
-        };
-      }
-      expectedPrev = row.hash;
-      expectedSeq = seq + 1;
-    }
-
-    return {
-      ok: true,
-      stream_id,
-      length: rows.length,
-      broken_at_seq: null,
-      reason: null,
-    };
-  }
-
-  async function appendStateTransition(
-    input: AppendStateTransitionInput,
-  ): Promise<{ event: EventEnvelope; guard: GuardResult }> {
-    const entity = input.entity ?? 'task';
-    // ① 事件类型必须属于该实体的迁移事件家族（spec §4）
-    assertTransitionEventType(entity, input.type);
-
-    const guard = guardTransition({
-      entity,
-      from: input.from,
-      to: input.to,
-      event_type: input.type,
-      facts: input.facts,
-    });
-
-    // 校验不通过：不进入事务、不写任何行
-    if (!guard.allowed) throw new TransitionDeniedError(guard);
-
-    // ② payload.from/to 缺失则补齐、矛盾则拒绝；guard 判定与落库内容必须同源
-    const payload = mergeTransitionPayload(input.payload, input.from, input.to);
-
-    const event = await append({
-      stream_id: input.stream_id,
-      type: input.type,
-      actor_id: input.actor_id,
-      actor_kind: input.actor_kind,
-      causation_id: input.causation_id,
-      correlation_id: input.correlation_id,
-      idempotency_key: input.idempotency_key,
-      payload,
-    });
-
-    return { event, guard };
-  }
-
-  return { append, readStream, replay, appendStateTransition, verifyChain };
+  return { ...base, withTransaction };
 }

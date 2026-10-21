@@ -181,6 +181,7 @@ describe('INV-12：哈希链', () => {
       length: 5,
       broken_at_seq: null,
       reason: null,
+      stream_exists: true,
     });
   });
 
@@ -353,6 +354,92 @@ describe('接口一致性（接线第一层证据）', () => {
     expect(kernel.createPgEventStore).toBeTypeOf('function');
     expect(kernel.migrate).toBeTypeOf('function');
     expect(kernel.guardTransition).toBeTypeOf('function');
+  });
+});
+
+describe('INV-11：withTransaction 同事务收尾（B2）', () => {
+  it('一个事务内提交 WaitConditionCanceled + wait_state 变更 + lifecycle 迁移 → 链连续、verifyChain 通过', async () => {
+    const result = await store.withTransaction(async (tx) => {
+      const waitCanceled = await tx.append(input({
+        type: 'WaitConditionCanceled',
+        payload: { wait_condition_id: 'wc-1' },
+      }));
+      const waitState = await tx.append(input({
+        type: 'TaskWaitStateChanged',
+        payload: { task_id: 'task-1', from: 'waiting_on_person', to: 'none' },
+      }));
+      const transition = await tx.appendStateTransition({
+        ...input({ type: 'TaskLifecycleChanged', payload: { task_id: 'task-1' } }),
+        from: 'awaiting_acceptance',
+        to: 'accepted',
+        facts: { acceptanceVerdict: 'accepted' },
+      });
+      // 事务内读取自己的未提交写入：链头与 events 一致
+      const inTxVerification = await tx.verifyChain('project-1');
+      return { waitCanceled, waitState, transition, inTxVerification };
+    });
+
+    expect(result.inTxVerification).toMatchObject({ ok: true, length: 3, stream_exists: true });
+    expect(result.transition.guard.required_effects).toEqual([
+      'cancel_active_wait_conditions',
+      'reset_wait_state_none',
+    ]);
+
+    const events = await store.readStream('project-1');
+    expect(events.map((e) => e.seq)).toEqual([1, 2, 3]);
+    expect(events.map((e) => e.type)).toEqual([
+      'WaitConditionCanceled',
+      'TaskWaitStateChanged',
+      'TaskLifecycleChanged',
+    ]);
+    expect(events[2].payload).toMatchObject({
+      task_id: 'task-1',
+      from: 'awaiting_acceptance',
+      to: 'accepted',
+    });
+    expect(await store.verifyChain('project-1')).toMatchObject({
+      ok: true,
+      length: 3,
+      stream_exists: true,
+      broken_at_seq: null,
+    });
+  });
+
+  it('事务中途抛错 → 整体回滚：零事件、无链头行（不留半提交）', async () => {
+    await expect(
+      store.withTransaction(async (tx) => {
+        await tx.append(input({ payload: { task_id: 'task-1' } }));
+        await tx.appendStateTransition({
+          ...input({ type: 'TaskLifecycleChanged', payload: { task_id: 'task-1' } }),
+          from: 'ready',
+          to: 'active',
+        });
+        throw new Error('boom');
+      }),
+    ).rejects.toThrow('boom');
+
+    expect(await countEvents(ctx.pool)).toBe(0);
+    const heads = await ctx.pool.query<{ n: number }>(
+      'select count(*)::int as n from event_streams',
+    );
+    expect(heads.rows[0].n).toBe(0);
+  });
+
+  it('事务内 guard 拒绝 → 该事件不写，且事务可继续提交（拒绝发生在 SQL 之前）', async () => {
+    await expect(
+      store.withTransaction(async (tx) => {
+        await tx.append(input({ payload: { task_id: 'task-1' } }));
+        await expect(
+          tx.appendStateTransition({
+            ...input({ type: 'TaskLifecycleChanged', payload: { task_id: 'task-1' } }),
+            from: 'accepted',
+            to: 'canceled',
+          }),
+        ).rejects.toBeInstanceOf(TransitionDeniedError);
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(await countEvents(ctx.pool)).toBe(1);
   });
 });
 

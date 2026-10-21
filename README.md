@@ -29,3 +29,46 @@ npm run typecheck
 npm test          # 自动确保 PG 容器；docker 不可用会大声失败，绝不 skip
 npm run db:down   # 清理测试容器（容器本身可复用，无需每次重建）
 ```
+
+## 事件存储（Batch 1）用法
+
+`stream_id = project_id`（spec §4；传 task_id 不会报错，但会建出错误的流）。`migrate(pool)` 需自己调用一次（幂等）；`createPgEventStore(pool)` 不自带迁移。
+
+```ts
+import { createPgEventStore, migrate } from './src/kernel/event-store-pg.js';
+
+await migrate(pool);
+const store = createPgEventStore(pool);
+
+// ① 普通事件：payload 形状由事件类型决定
+await store.append({
+  stream_id: projectId, type: 'TaskCaptured',
+  actor_id, actor_kind: 'human', causation_id: null, correlation_id: corr,
+  idempotency_key: clientSubmitId, // 同 key 重投只入账一次（INV-13）
+  payload: { task_id: taskId, title: '联系张三确认方案' },
+});
+
+// ② 状态迁移：guard 判定用顶层 from/to；payload 可省略 from/to（store 补齐），
+//    若写了但与顶层矛盾 → TransitionPayloadMismatchError；type 必须与 entity 家族一致。
+await store.appendStateTransition({
+  stream_id: projectId, type: 'TaskLifecycleChanged', entity: 'task',
+  actor_id, actor_kind: 'system', causation_id: null, correlation_id: corr,
+  idempotency_key: transitionKey,
+  payload: { task_id: taskId }, from: 'ready', to: 'active',
+});
+
+// ③ INV-11 accepted/canceled：收尾动作必须与 lifecycle 迁移同事务（withTransaction）。
+//    fn 抛错 → 整体回滚，零事件落库。
+const { guard } = await store.withTransaction(async (tx) => {
+  await tx.append({ /* WaitConditionCanceled */ });
+  await tx.append({ /* TaskWaitStateChanged: waiting_on_person → none */ });
+  return tx.appendStateTransition({ /* awaiting_acceptance → accepted */ });
+});
+// guard.required_effects = ['cancel_active_wait_conditions', 'reset_wait_state_none']
+
+const check = await store.verifyChain(projectId);
+// 不存在的 stream：{ ok: false, stream_exists: false, reason: 'stream_not_found' }
+// 链头（event_streams.last_hash/last_seq）被改乱：ok=false，定位到断点
+```
+
+写路径就绪范围：`append` / `appendStateTransition` / `withTransaction`（含 accepted/canceled 的 INV-11 收尾）。跨事务批量 `appendBatch`、增量订阅水位保护仍留 Batch 2；当前无生产命令层调用点。
