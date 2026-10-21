@@ -443,6 +443,54 @@ describe('INV-11：withTransaction 同事务收尾（B2）', () => {
   });
 });
 
+describe('verifyChain 运维真实性（F-b）', () => {
+  it('不存在的 stream → ok:false / stream_not_found（不冒充健康空流）', async () => {
+    expect(await store.verifyChain('proj-TYPO')).toEqual({
+      ok: false,
+      stream_id: 'proj-TYPO',
+      length: 0,
+      broken_at_seq: null,
+      reason: 'stream_not_found',
+      stream_exists: false,
+    });
+    expect(await store.verifyChain('')).toMatchObject({
+      ok: false,
+      reason: 'stream_not_found',
+      stream_exists: false,
+    });
+  });
+
+  it('链头 event_streams.last_hash 被改乱 → ok:false，报链头断点（不再假绿）', async () => {
+    await store.append(input({ payload: { step: 1 } }));
+    await store.append(input({ payload: { step: 2 } }));
+
+    await ctx.pool.query(
+      `UPDATE event_streams SET last_hash = $1 WHERE stream_id = $2`,
+      ['a'.repeat(64), 'project-1'],
+    );
+
+    const verification = await store.verifyChain('project-1');
+    expect(verification.ok).toBe(false);
+    expect(verification.stream_exists).toBe(true);
+    expect(verification.broken_at_seq).toBe(2);
+    expect(verification.reason).toContain('链头 last_hash');
+  });
+
+  it('链头 last_seq 与 events 行数不一致 → ok:false', async () => {
+    await store.append(input({ payload: { step: 1 } }));
+
+    await ctx.pool.query(
+      `UPDATE event_streams SET last_seq = 9 WHERE stream_id = $1`,
+      ['project-1'],
+    );
+
+    const verification = await store.verifyChain('project-1');
+    expect(verification.ok).toBe(false);
+    expect(verification.broken_at_seq).toBe(9);
+    expect(verification.reason).toContain('链头 last_seq');
+  });
+});
+
 describe('校验器嵌在写路径：非法迁移不产生事件（接线审计）', () => {
   it('appendStateTransition 非法迁移（accepted→canceled）→ TransitionDeniedError，行数不变', async () => {
     await store.append(input({ payload: { task_id: 'task-1' } }));

@@ -636,26 +636,55 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     }
 
     async function verifyChain(stream_id: string): Promise<ChainVerification> {
+      // 单条 SELECT = 单快照：链头与 events 在同一快照内读取，避免并发 append 造成假红。
       const { rows } = await reader.query<{
-        seq: string;
-        prev_hash: string;
-        hash: string;
-        payload_canonical: string;
+        head_last_seq: string;
+        head_last_hash: string;
+        seq: string | null;
+        prev_hash: string | null;
+        hash: string | null;
+        payload_canonical: string | null;
       }>(
-        `SELECT seq, prev_hash, hash, payload_canonical FROM events
-         WHERE stream_id = $1 ORDER BY seq ASC`,
+        `SELECT h.last_seq AS head_last_seq, h.last_hash AS head_last_hash,
+                e.seq, e.prev_hash, e.hash, e.payload_canonical
+         FROM event_streams h
+         LEFT JOIN events e ON e.stream_id = h.stream_id
+         WHERE h.stream_id = $1
+         ORDER BY e.seq ASC`,
         [stream_id],
+      );
+
+      if (rows.length === 0) {
+        return {
+          ok: false,
+          stream_id,
+          length: 0,
+          broken_at_seq: null,
+          reason: 'stream_not_found',
+          stream_exists: false,
+        };
+      }
+
+      const headLastSeq = toSafeNumber(rows[0].head_last_seq, 'event_streams.last_seq');
+      const headLastHash = rows[0].head_last_hash;
+      const eventRows = rows.filter(
+        (row): row is typeof row & {
+          seq: string;
+          prev_hash: string;
+          hash: string;
+          payload_canonical: string;
+        } => row.seq !== null,
       );
 
       let expectedPrev = GENESIS_HASH;
       let expectedSeq = 1;
-      for (const row of rows) {
+      for (const row of eventRows) {
         const seq = toSafeNumber(row.seq, 'events.seq');
         if (seq !== expectedSeq) {
           return {
             ok: false,
             stream_id,
-            length: rows.length,
+            length: eventRows.length,
             broken_at_seq: seq,
             reason: `seq 不连续：期望 ${expectedSeq}，实际 ${seq}`,
             stream_exists: true,
@@ -665,7 +694,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
           return {
             ok: false,
             stream_id,
-            length: rows.length,
+            length: eventRows.length,
             broken_at_seq: seq,
             reason: `prev_hash 断链：期望 ${expectedPrev}，实际 ${row.prev_hash}`,
             stream_exists: true,
@@ -676,7 +705,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
           return {
             ok: false,
             stream_id,
-            length: rows.length,
+            length: eventRows.length,
             broken_at_seq: seq,
             reason: `hash 不匹配：重算 ${recomputed}，实际 ${row.hash}`,
             stream_exists: true,
@@ -686,10 +715,34 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
         expectedSeq = seq + 1;
       }
 
+      // F-b：不只看 events 行，还要校验链头行。链头被改乱/半提交时不能报绿。
+      if (headLastSeq !== eventRows.length) {
+        return {
+          ok: false,
+          stream_id,
+          length: eventRows.length,
+          broken_at_seq: headLastSeq,
+          reason: `链头 last_seq 与 events 不一致：last_seq=${headLastSeq}，events 行数=${eventRows.length}`,
+          stream_exists: true,
+        };
+      }
+      if (headLastHash !== expectedPrev) {
+        return {
+          ok: false,
+          stream_id,
+          length: eventRows.length,
+          broken_at_seq: eventRows.length === 0 ? null : eventRows.length,
+          reason:
+            `链头 last_hash 与 events 末行不一致：` +
+            `last_hash=${headLastHash}，期望 ${expectedPrev}`,
+          stream_exists: true,
+        };
+      }
+
       return {
         ok: true,
         stream_id,
-        length: rows.length,
+        length: eventRows.length,
         broken_at_seq: null,
         reason: null,
         stream_exists: true,
