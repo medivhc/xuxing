@@ -1,0 +1,1 @@
+{"description":"续行（Xuxing）K0 脊柱：事件溯源确定性内核 + 只产提议的智能层 + 可插拔执行适配层","devDependencies":{"typescript":"^5.6.0","vitest":"^2.1.0"},"name":"xuxing","private":true,"scripts":{"build":"tsc -p tsconfig.json","test":"vitest run","typecheck":"tsc --noEmit"},"type":"module","version":"0.0.1"}

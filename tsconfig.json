@@ -1,0 +1,1 @@
+{"compilerOptions":{"declaration":false,"module":"NodeNext","moduleResolution":"NodeNext","outDir":"dist","rootDir":".","sourceMap":true,"strict":true,"target":"ES2022"},"include":["src/**/*.ts","tests/**/*.ts"]}
