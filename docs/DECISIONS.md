@@ -23,3 +23,9 @@
 | S5（Q3） | Tool Gateway 形态 | 内核模块 + 专用凭据；双轨导入 Evidence 一律 `external_doc`，不给导入器网关凭据 |
 | S6（Q4） | 适配器代发心跳 | 必须绑定子进程存活探针，不许无条件代发（防假活） |
 | S7（Q5） | Outcome 维度封闭 | 维持封闭维度集；内核/Scheduler 判定不得解析 `blockers`/`followup_suggestions` 文本；扩维唯一触发 = K0 退出评审的"维度不足清单" |
+
+## D9 交互与产品质量门（2026-10-24，用户批准）
+
+> D9 交互与产品质量门：交互契约先行评审；投影一致性硬约束；功能覆盖可追溯矩阵缺链 CI 红；批次验收必备旅程 E2E+视觉回归+异模型 friction report。2026-10-24 用户批准。
+
+落点：`docs/interaction-contract.md`（D9 质量门交付物；Web 实现开工前须评审通过）。
