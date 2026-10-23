@@ -1,0 +1,99 @@
+/* Design tokens（docs/interaction-contract.md §7）——Tailwind theme 的 CSS 变量镜像。
+ * 组件里优先用 Tailwind class；动效时长/曲线等无法用 class 表达的用 var(--motion-*)。 */
+
+:root {
+  /* §7.6 动效 token：时长 */
+  --motion-feedback: 80ms;
+  --motion-state: 160ms;
+  --motion-expand: 200ms;
+  --motion-panel: 240ms;
+  --motion-route: 280ms;
+  --motion-exit: 160ms;
+  --motion-max: 600ms;
+  /* §7.6 动效 token：曲线（全部单调收敛，无 spring/bounce/overshoot） */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-panel: cubic-bezier(0.05, 0.7, 0.1, 1);
+  --ease-exit: cubic-bezier(0.3, 1, 1, 1);
+}
+
+html {
+  /* §6.5：数字用 tabular numerals，避免计数跳动 */
+  font-variant-numeric: tabular-nums;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-canvas, #f7f8fa);
+  color: #1a1d21;
+  font-family: Inter, 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 26px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* §6.6：焦点环 2px，不被 overflow 裁剪（组件侧需避免 overflow:hidden 包住可聚焦元素） */
+:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* §7.1/§7.6：prefers-reduced-motion 下时长压到 0–100ms，只保留 opacity */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 100ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* 列表项原位展开（§7.1 按隐喻编排） */
+@keyframes xux-expand {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.xux-anim-expand {
+  animation: xux-expand var(--motion-expand) var(--ease-standard);
+}
+
+/* 回执在输入框下方出现（§7.1） */
+@keyframes xux-receipt {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.xux-anim-receipt {
+  animation: xux-receipt var(--motion-expand) var(--ease-standard);
+}
+
+/* 页面转场：opacity + 8px translate（§7.6 motion-route） */
+@keyframes xux-route {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.xux-anim-route {
+  animation: xux-route var(--motion-route) var(--ease-standard);
+}
