@@ -31,7 +31,7 @@ function Layout({ children }: { children: React.ReactNode }) {
               >
                 {item.label}
               </NavLink>
-            )}
+            ))}
           </nav>
         </div>
       </header>
