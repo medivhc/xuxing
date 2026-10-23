@@ -34,3 +34,17 @@ mock 只通过拦截 `fetch` 生效。
 | `src/components/` | 共享呈现组件（徽标、骨架、错误条、空态、pending 按钮、同步徽标等） |
 | `src/state/` | Zustand：P 层连接状态、I 层输入态 |
 | `src/styles/` | design tokens（契约 §7） |
+
+## 验证（E2E 旅程）
+
+`VITE_API_MOCK=1 npm run dev` 后，浏览器可走通完整旅程（已用 Chromium 自动化全量验证）：
+
+1. **Home**：投影渲染（项目卡 / lifecycle 计数 / attention 按 rank / recent）；连接徽标 online、同步徽标 fresh。
+2. **Capture → 提议**：`__xuxMock.forceNextProposalDegraded()` 后捕获 → 提议页 **降级明示**（role=alert 横幅 + 原因 + 标题「降级解释」+ 接受钮变体「核对后接受…」）→ 二次确认接受 → 跳项目页，新任务（ready，带提议判据）入列。
+3. **My Actions**：按 `available_actions` 渲染；决策行 `approved_modified` 置灰（OQ-04=B）；开始/完成任务后投影实时更新（done 离列）。
+4. **Project → 逐判据验收**：`awaiting_acceptance` 任务表单默认展开；每条判据独立 `record_criterion_verdict`（passed/failed/not_applicable + 备注 + 证据）；覆盖完整性提示（已判 N/M）；继承锁定（已 passed 改判无证据 → 409 `criterion_locked` 原样呈现）；补证据 supersede 成功；覆盖完整按 verdict 一致性落结论（全 passed → accepted；含 failed → rejected → 迁移矩阵回 defined）。
+5. **SSE 三纪律**：订阅先行（main.tsx 渲染前 start）；`__xuxMock.stopHeartbeats()` 后约 35s 看护判定 offline、1s 退避自动重连 online（游标自理补发）；`startHeartbeats()` 恢复。
+
+页面交互用 `data-testid` 标记（`criterion-pass-*`/`my-actions-row`/`proposal-degraded-banner`/`error-conflict` 等），供 e2e 定位。
+
+已知边界：mock 为页面级内存单例，**整页刷新即回种子状态**（SPA 内导航不重置）；命令 `type` 字符串为 web 车道草案（见 `src/mock/README.md` 交卷登记项）。
