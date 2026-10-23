@@ -84,7 +84,7 @@ interface CommandEnvelope {
 | `duplicate` | 同 `client_submit_id` / `idempotency_key` 重放（Spec §4 INV-13） | 展示首次结果，不报错、不重复入账 | 是（幂等） |
 | `forbidden` | actor 无权、Agent 验收自己执行的 Run（Spec §2.6 REQ-ACC-2） | 说明限制；不提供绕过入口 | 否 |
 | `not_found` | 引用的 Task/Decision/Project 不存在或不在当前项目 | 回到列表并提示「已不存在，可能已被处理」 | 否 |
-| `projection_stale` | 读模型游标落后于写入 | 保留快照 + 「同步中」徽标；写动作可禁用 | 是；追平后重试 |
+| `projection_stale` | 读模型游标落后于写入 | 保留快照 + 「同步中」徽标；游标落后超过阈值或涉及关键写动作时禁用写动作，其余仅徽标提示 | 是；追平后重试 |
 | `offline` | 连接断开 | 离线徽标；仅 Capture/Feedback 允许本地先行 | 是 |
 | `internal` | 未分类服务端错误 | 错误码 + request id + 重试；不展示堆栈 | 是 |
 
@@ -302,7 +302,7 @@ stateDiagram-v2
 
 ### 3.2 投影契约与捕获落点
 
-**OQ-01=A 已裁决（2026-10-24，D10）**：K0 事件目录（Spec §4）没有独立的 Capture 实体/事件；本契约按选项 A 把一条捕获落为**游离 Feedback**（`task_id=null`），即 `FeedbackReceived`，再由 Intent Interpreter 提议产生 `TaskCaptured` / PlanChange，**不新增实体**。落点链固定为：`FeedbackReceived` → `FeedbackInterpreted`（Interpreter 提议）→ `TaskCaptured`（直接成 Task）或 `PlanChangeProposed`（`needs_decision` → `DecisionCreated(pending)` → `DecisionResolved` → `PlanChangeApplied`/`PlanChangeRejected` → 对应 `TaskCaptured`）。该映射与 Spec §2.5 Feedback、§5.7 REQ-HUM-2「游离 Feedback 只入账并触发解释」一致；K0 不新增 Capture 实体/事件（若未来修订，只需替换事件名，不改状态与动作结构）。
+**OQ-01=A 已裁决（2026-10-24，D10）**：K0 事件目录（Spec §4）没有独立的 Capture 实体/事件；本契约按选项 A 把一条捕获落为**游离 Feedback**（`task_id=null`），即 `FeedbackReceived`，再由 Intent Interpreter 提议产生 `TaskCaptured` / PlanChange，**不新增实体**。落点链固定为：`FeedbackReceived` → `FeedbackInterpreted`（Interpreter 提议）→ `TaskCaptured`（直接成 Task）或 `PlanChangeProposed`（`needs_decision` → `DecisionCreated(pending)` → `DecisionResolved` → `PlanChangeApplied`/`PlanChangeRejected` → 对应 `TaskCaptured`）。该映射与 Spec §2.5 Feedback、§5.7 REQ-HUM-2「无绑定的游离 Feedback 只入账并触发解释」一致；K0 不新增 Capture 实体/事件（若未来修订，只需替换事件名，不改状态与动作结构）。
 
 ```ts
 interface CaptureProjection {
