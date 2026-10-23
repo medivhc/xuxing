@@ -6,6 +6,10 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     fileParallelism: false,
+    // tests/e2e 是 Playwright 骨架（@playwright/test 未安装、UI 未实现），
+    // 必须由 vitest 排除，否则默认 include 会扫到 *.spec.ts 并在收集阶段报错。
+    // 这里显式重写 exclude，故 vitest 默认项（node_modules/dist）一并列出。
+    exclude: ['**/node_modules/**', '**/dist/**', 'tests/e2e/**'],
     testTimeout: 30_000,
     hookTimeout: 90_000,
   },
