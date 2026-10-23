@@ -1,4 +1,11 @@
 import { NavLink, Route, Routes } from 'react-router-dom';
+import { ConnectionBadge } from './components/ConnectionBadge';
+import { HomePage } from './pages/HomePage';
+import { CapturePage } from './pages/CapturePage';
+import { ProposalPage } from './pages/ProposalPage';
+import { MyActionsPage } from './pages/MyActionsPage';
+import { ProjectPage } from './pages/ProjectPage';
+import { NotFoundPage } from './pages/NotFoundPage';
 
 const navItems = [
   { to: '/', label: '首页' },
@@ -33,19 +40,13 @@ function Layout({ children }: { children: React.ReactNode }) {
               </NavLink>
             ))}
           </nav>
+          <div className="ml-auto">
+            <ConnectionBadge />
+          </div>
         </div>
       </header>
       <main className="mx-auto max-w-content px-4 py-6 desktop:px-8">{children}</main>
     </div>
-  );
-}
-
-function Placeholder({ title }: { title: string }) {
-  return (
-    <section className="rounded-m border border-border bg-surface p-5 shadow-1">
-      <h1 className="text-title font-semibold text-text-primary">{title}</h1>
-      <p className="mt-2 text-body-s text-text-secondary">脚手架占位，后续增量填充。</p>
-    </section>
   );
 }
 
@@ -54,13 +55,13 @@ export default function App() {
     <Layout>
       <div className="xux-anim-route">
         <Routes>
-          <Route path="/" element={<Placeholder title="首页" />} />
-          <Route path="/capture" element={<Placeholder title="快速捕获" />} />
-          <Route path="/capture/:proposalId" element={<Placeholder title="提议" />} />
-          <Route path="/actions" element={<Placeholder title="待我处理" />} />
-          <Route path="/projects" element={<Placeholder title="项目" />} />
-          <Route path="/projects/:projectId" element={<Placeholder title="项目" />} />
-          <Route path="*" element={<Placeholder title="页面不存在" />} />
+          <Route path="/" element={<HomePage />} />
+          <Route path="/capture" element={<CapturePage />} />
+          <Route path="/capture/:proposalId" element={<ProposalPage />} />
+          <Route path="/actions" element={<MyActionsPage />} />
+          <Route path="/projects" element={<NotFoundPage />} />
+          <Route path="/projects/:projectId" element={<ProjectPage />} />
+          <Route path="*" element={<NotFoundPage />} />
         </Routes>
       </div>
     </Layout>
