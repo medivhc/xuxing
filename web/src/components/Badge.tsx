@@ -117,7 +117,7 @@ export function CriterionVerdictBadge({ verdict }: { verdict: CriterionVerdict }
   const cls =
     verdict === 'passed'
       ? 'bg-success-subtle text-success'
-      verdict === 'failed'
+      : verdict === 'failed'
         ? 'bg-danger-subtle text-danger'
         : 'bg-subtle text-text-secondary';
   return <BadgeBase className={cls}>{CRITERION_VERDICT_LABEL[verdict]}</BadgeBase>;
