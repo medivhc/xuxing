@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "@hono/node-server": "^1.19.17",
     "hono": "^4.6.0",
     "pg": "^8.13.0",
     "ulid": "^2.3.0"
