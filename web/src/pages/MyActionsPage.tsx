@@ -17,8 +17,9 @@ import { api } from '../api/client';
 import { queryKeys } from '../api/queryKeys';
 import type { ActionItem } from '../api/types';
 import { useCommand } from '../features/commands/use-command';
-import { LifecycleBadge, SyncBadge, WaitStateBadge } from '../components/Badge';
+import { LifecycleBadge, WaitStateBadge } from '../components/Badge';
 import { EmptyState, ErrorBanner, PendingButton, Skeleton } from '../components/Feedback';
+import { SyncBadge } from '../components/Badge';
 import { formatRelative } from '../lib/time';
 
 type Resolution = 'approved' | 'approved_modified' | 'rejected' | 'deferred';
