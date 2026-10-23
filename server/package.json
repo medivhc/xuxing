@@ -1,0 +1,26 @@
+{
+  "name": "@xuxing/server",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "续行 K0 Web 车道 A：Hono 服务端（与内核同进程），HTTP API + SSE 实时通道 + 提议层（magpie 网关，可降级）",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types src/main.ts",
+    "seed": "node --experimental-strip-types src/seed/cli.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "hono": "^4.6.0",
+    "pg": "^8.13.0",
+    "ulid": "^2.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

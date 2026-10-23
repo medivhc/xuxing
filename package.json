@@ -13,7 +13,11 @@
     "typecheck": "tsc --noEmit",
     "db:up": "docker inspect xuxing-pg-test >/dev/null 2>&1 && docker start xuxing-pg-test || docker run -d --name xuxing-pg-test -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=xuxing_test -p 127.0.0.1:55432:5432 --tmpfs /var/lib/postgresql/data:rw,size=512m postgres:16-alpine",
     "db:down": "docker rm -f xuxing-pg-test",
-    "db:reset": "npm run db:down; npm run db:up"
+    "db:reset": "npm run db:down; npm run db:up",
+    "server": "npm --prefix server start",
+    "server:test": "vitest run --config server/vitest.config.ts",
+    "server:typecheck": "npm --prefix server run typecheck",
+    "seed:demo": "npm --prefix server run seed"
   },
   "devDependencies": {
     "@types/pg": "^8.11.0",
