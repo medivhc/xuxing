@@ -31,7 +31,7 @@ export interface UseCommandOptions {
   onIndeterminate?: (error: NetworkError | ApiError) => void;
 }
 
-/** 结果未知的 ApiError：5xx / 408（§0.7）。 */
+/** 结果未知的错误：网络失败、5xx、408（§0.7）。 */
 function isIndeterminateApiError(error: ApiError): boolean {
   return error.retryable;
 }
