@@ -7,9 +7,9 @@
 | 项 | 值 |
 |---|---|
 | 分支 | `web/server` |
-| HEAD | `ad689c8` fix(server): 运行时改为先编译再跑产物 |
+| HEAD | `dbedf55` docs(server): 车道 A 交卷说明 |
 | 基线 | `github/develop/eventstore-batch1`（`362972d`） |
-| 提交 | `be1786d` 脚手架 → `e25d031` 投影 → `bfac952` 提议层 → `033912d` 路由/命令层/种子 → `974524a` 全命令 → `6c0982c` 事件广播与 SSE 背压 → `ad689c8` 运行时编译 |
+| 提交 | `be1786d` 脚手架 → `e25d031` 投影 → `bfac952` 提议层 → `033912d` 路由/命令层/种子 → `974524a` 全命令 → `6c0982c` 事件广播与 SSE 背压 → `ad689c8` 运行时编译 → `dbedf55` 交卷文档 |
 
 未推 `develop` / `master`，未使用 `--no-verify`。
 
