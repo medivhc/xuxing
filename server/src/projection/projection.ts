@@ -573,6 +573,8 @@ export class XuxingProjection {
         return;
       }
       case 'PlanChangeApplied': {
+        // 命令回执（服务端命令层的幂等账）：不是提议状态流转，不参与提议投影
+        if (p.command_receipt === 'command_receipt') return;
         const id = str(p, 'change_id', event);
         const proposal = this.proposals.get(id);
         if (!proposal) throw new Error(`PlanChangeApplied@${event.global_seq} 引用不存在的提议 ${id}`);

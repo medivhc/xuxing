@@ -59,6 +59,9 @@ export class IdempotencyConflictError extends Error {
 /** 每个命令都落一条回执事件：类型取封闭目录内的 PlanChangeApplied（payload 带 command + client_submit_id）。 */
 const RECEIPT_EVENT_TYPE = 'PlanChangeApplied';
 
+/** 命令回执的机器可读标记（投影据此与真实的 PlanChangeApplied 区分）。 */
+export const COMMAND_RECEIPT_TAG = 'command_receipt';
+
 export interface CommandResult {
   command_type: CommandType;
   client_submit_id: string;
@@ -172,7 +175,9 @@ async function findReceipt(ctx: CommandContext, client_submit_id: string): Promi
   const events = await ctx.store
     .replay(0)
     .then((all) => all.filter((e) => e.idempotency_key === `client_id:${client_submit_id}`));
-  const receipt = events.find((e) => e.type === RECEIPT_EVENT_TYPE);
+  const receipt = events.find(
+    (e) => e.type === RECEIPT_EVENT_TYPE && (e.payload as Record<string, unknown>).command_receipt === COMMAND_RECEIPT_TAG,
+  );
   if (!receipt) {
     if (events.length > 0) throw new IdempotencyConflictError(client_submit_id);
     return null;
@@ -342,7 +347,7 @@ function receipt(
     type: RECEIPT_EVENT_TYPE,
     idempotency_key: receiptIdempotencyKey(client_submit_id),
     payload: {
-      change_id: `cmd:${client_submit_id}`,
+      command_receipt: COMMAND_RECEIPT_TAG,
       command,
       client_submit_id,
       request_fingerprint: fingerprint(requestPayload),

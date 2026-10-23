@@ -209,7 +209,7 @@ export function isActionableFor(task: TaskRecord, snapshot: ProjectionSnapshot, 
   if (task.lifecycle === 'active') {
     return activeHumanRun(snapshot, task.task_id, actorId) !== undefined || canSubmitFeedback(task, snapshot, actorId);
   }
-  // 捕获后未定义的任务同样需要"当前用户"处理（捕获者本人）
-  if (task.lifecycle === 'captured') return true;
+  // 已定义但尚不就绪 / 捕获后未定义：仍是"当前用户"要推进的事（proposal 接受后即在此列）
+  if (task.lifecycle === 'captured' || task.lifecycle === 'defined') return true;
   return false;
 }
