@@ -8,8 +8,9 @@
     "node": ">=24"
   },
   "scripts": {
-    "start": "node --experimental-strip-types src/main.ts",
-    "seed": "node --experimental-strip-types src/seed/cli.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "npm run build && node dist/server/src/main.js",
+    "seed": "npm run build && node dist/server/src/seed/cli.js",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {

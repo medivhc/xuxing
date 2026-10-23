@@ -12,5 +12,6 @@
     "types": ["node"],
     "verbatimModuleSyntax": false
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "../src/**/*.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "../src/**/*.ts"],
+  "exclude": ["dist"]
 }
