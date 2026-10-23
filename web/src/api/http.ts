@@ -84,6 +84,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       },
     });
   } catch (cause) {
+    // AbortError 是「调用方取消」而非「结果未知」：原样重抛，
+    // 让 TanStack Query / 调用方按取消语义处理（不走 §0.7 待确认路径）。
+    if (cause instanceof DOMException && cause.name === 'AbortError') {
+      throw cause;
+    }
     throw new NetworkError(cause);
   }
   if (!response.ok) {

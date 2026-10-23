@@ -20,13 +20,18 @@ export interface AppRuntime {
   sse: SseClient;
 }
 
+export interface AppRuntimeOptions {
+  /** SSE 看护时长（ms，默认 35_000）：无任何帧到达即判定断线重连。 */
+  watchdogMs?: number;
+}
+
 function extractProjectionVersion(data: unknown): number | undefined {
   if (typeof data !== 'object' || data === null) return undefined;
   const version = (data as { projection_version?: unknown }).projection_version;
   return typeof version === 'number' && Number.isFinite(version) ? version : undefined;
 }
 
-export function createAppRuntime(): AppRuntime {
+export function createAppRuntime(options: AppRuntimeOptions = {}): AppRuntime {
   let noteProjectionVersion: (version: number) => void = () => {};
 
   const queryCache = new QueryCache({
@@ -49,6 +54,7 @@ export function createAppRuntime(): AppRuntime {
   });
 
   const sse = new SseClient({
+    watchdogMs: options.watchdogMs,
     onEvent: (event: StreamEvent) => {
       useConnectionStore.getState().noteEvent(event.seq);
       for (const target of invalidationTargetsFor(event.kind)) {
