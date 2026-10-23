@@ -9,6 +9,7 @@
 
 import { ulid } from 'ulid';
 import type { PgEventStore } from '../../../src/kernel/event-store-pg.ts';
+import type { EventEnvelope } from '../../../src/kernel/events.ts';
 import type { Proposer } from '../proposers/proposer.ts';
 import type { ProjectionService } from '../projection/service.ts';
 
@@ -23,6 +24,10 @@ export interface CaptureOutcome {
   draft: { title: string; description: string; assignee_kind: 'human' | 'agent'; acceptance_criteria: unknown[] };
   replayed: boolean;
   projection_version: number;
+  /** 本次真正写入的事件信封（供 SSE 广播；幂等重放为空）。不出现在 HTTP 响应体里。 */
+  events: EventEnvelope[];
+  /** 本次落账的事件序号与类型（响应体里可读，客户端据此对齐 SSE cursor）。 */
+  emitted: Array<{ seq: number; kind: string }>;
 }
 
 export interface CaptureContext {
@@ -110,6 +115,8 @@ export async function runCapture(
       draft: proposalAfter.details.task,
       replayed: true,
       projection_version: ctx.projection.version(),
+      events: [],
+      emitted: [],
     };
   }
 
@@ -125,8 +132,9 @@ export async function runCapture(
     correlation_id: `capture-${capture_id}`,
   };
 
+  const events: EventEnvelope[] = [];
   await ctx.store.withTransaction(async (tx) => {
-    await tx.append({
+    events.push(await tx.append({
       ...base,
       type: 'PlanChangeProposed',
       idempotency_key: idemKey,
@@ -158,9 +166,9 @@ export async function runCapture(
         },
         proposed_at: now,
       },
-    });
+    }));
 
-    await tx.append({
+    events.push(await tx.append({
       ...base,
       type: 'FeedbackReceived',
       idempotency_key: `${idemKey}:feedback`,
@@ -173,12 +181,10 @@ export async function runCapture(
         raw_attachments: [],
         capture_id,
       },
-    });
+    }));
   });
 
-  const current = ctx.projection.version();
-  const events = await ctx.store.readStream(project_id, 1);
-  ctx.projection.ingest(events.filter((e) => e.global_seq > current));
+  await ctx.projection.refresh();
 
   return {
     capture_id,
@@ -195,5 +201,7 @@ export async function runCapture(
     },
     replayed: false,
     projection_version: ctx.projection.version(),
+    events,
+    emitted: events.map((event) => ({ seq: event.global_seq, kind: event.type })),
   };
 }

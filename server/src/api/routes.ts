@@ -1,5 +1,4 @@
 import { Hono } from 'hono';
-import { stream } from 'hono/streaming';
 import type { Pool } from 'pg';
 import { ulid } from 'ulid';
 import { fail, ok } from './http.ts';
@@ -8,7 +7,7 @@ import type { ProjectionService } from '../projection/service.ts';
 import type { Proposer } from '../proposers/proposer.ts';
 import type { PgEventStore } from '../../../src/kernel/event-store-pg.ts';
 import type { EventEnvelope } from '../../../src/kernel/events.ts';
-import type { Hub } from '../sse/hub.ts';
+import { MAX_OUTSTANDING_WRITES, type Hub, type SseConnection } from '../sse/hub.ts';
 import {
   CommandDeniedError,
   CommandValidationError,
@@ -55,6 +54,16 @@ function errorResponse(error: unknown): Response {
   return Response.json(fail('internal', message), { status: 500 });
 }
 
+/**
+ * 在响应返回前广播本次写入真正落账的事件（写入返回即可推）。
+ *
+ * 广播的是写入方自己交出的事件信封，而不是"写后再读尾部"：写入路径已在返回前把
+ * 同一批事件并入投影，此时水位已越过它们，再读尾部只会读到空集。
+ */
+function commitAndBroadcast(ctx: AppContext, events: EventEnvelope[]): void {
+  ctx.hub.broadcast(events);
+}
+
 async function readJsonObject(c: { req: { json: () => Promise<unknown> } }): Promise<Record<string, unknown> | null> {
   let body: unknown;
   try {
@@ -68,6 +77,7 @@ async function readJsonObject(c: { req: { json: () => Promise<unknown> } }): Pro
 
 export function createApp(ctx: AppContext): Hono {
   const app = new Hono();
+
 
   app.use('*', async (c, next) => {
     await next();
@@ -128,13 +138,15 @@ export function createApp(ctx: AppContext): Hono {
           actor_id: actor.actor_id,
         },
       );
+      const { events, ...view } = result;
+      if (!result.replayed) commitAndBroadcast(ctx, events);
       if (result.degraded) {
         ctx.hub.notice(
           { kind: 'proposal_degraded', proposal_id: result.proposal_id, degraded_reason: result.degraded_reason },
           result.project_id,
         );
       }
-      return c.json(ok(result), result.replayed ? 200 : 201);
+      return c.json(ok(view), result.replayed ? 200 : 201);
     } catch (error) {
       return errorResponse(error);
     }
@@ -154,18 +166,14 @@ export function createApp(ctx: AppContext): Hono {
     if (body === null) return c.json(fail('bad_request', '请求体必须是 JSON 对象'), 400);
     const actor = actorOf(c.req.header('x-xuxing-actor'), ctx.defaultActorId);
     try {
-      const before = ctx.projection.version();
-      const result = await runCommand(ctx, {
+      const execution = await runCommand(ctx, {
         type: typeof body.type === 'string' ? body.type : '',
         payload: body.payload ?? {},
         client_submit_id: body.client_submit_id,
         actor,
       });
-      if (!result.replayed) {
-        const committed = await committedSince(ctx, before);
-        ctx.projection.ingest(committed);
-        ctx.hub.broadcast(committed);
-      }
+      commitAndBroadcast(ctx, execution.events);
+      const result = execution.result;
       return c.json(ok(result), result.replayed ? 200 : 201);
     } catch (error) {
       return errorResponse(error);
@@ -173,63 +181,115 @@ export function createApp(ctx: AppContext): Hono {
   });
 
   // ---- GET /api/stream（SSE：补发 + 对齐 + 背压）----
-  app.get('/api/stream', (c) => {
+  //
+  // 不用 hono/streaming 的 stream()：它会 new Request(url, request) 重新包一层请求，
+  // c.req.raw.signal 不再是客户端连接（断线不可见）。这里直接用 ReadableStream，
+  // 断线由 cancel()（客户端断开）与 enqueue 抛错（写端已关）两条路感知，二者都走 closeOnce。
+  app.get('/api/stream', async (c) => {
     const query = { cursor: c.req.query('cursor') ?? null, project_id: c.req.query('project_id') ?? null };
-    return stream(c, async (s) => {
-      c.header('Content-Type', 'text/event-stream; charset=utf-8');
-      c.header('Cache-Control', 'no-cache, no-store');
-      c.header('Connection', 'keep-alive');
-      c.header('X-Accel-Buffering', 'no');
 
-      const abort = new AbortController();
-      c.req.raw.signal.addEventListener('abort', () => abort.abort(), { once: true });
-      let established = false;
-
-      const result = await establishSseConnection({
-        pool: ctx.pool,
-        projection: ctx.projection,
-        hub: ctx.hub,
-        options: ctx.sse,
-        query,
-        connectionId: `sse_${ulid()}`,
-        writer: {
-          write: (chunk: string) => {
-            void s.write(chunk).catch(() => abort.abort());
-          },
-          isAlive: () => !abort.signal.aborted,
-          close: () => {
-            if (established) void s.close();
-          },
-        },
-      });
-
-      if (!result.ok) {
-        if (result.status === 503) c.header('Retry-After', '5');
-        await s.write(JSON.stringify({ ok: false, error: result.error }));
-        await s.close();
-        return;
+    // 建立（预算/参数/订阅/补发/ready）必须在返回 Response 之前完成：
+    // 这样 400/503 仍是普通 JSON 响应（带 Retry-After），而不是已经开始的 SSE 流。
+    let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const encoder = new TextEncoder();
+    const pending: string[] = [];
+    let connection: SseConnection | null = null;
+    let closedOnce = false;
+    /** 已写出、但调用方还没拉走的帧数（背压窗口）；pull 时由 confirmWrites 归还 */
+    let awaitingDrain = 0;
+    /** 对端是否已断开（只有 cancel() 能置 true；服务端主动关闭不算） */
+    let peerGone = false;
+    const closeOnce = (): void => {
+      if (closedOnce) return;
+      closedOnce = true;
+      if (connection !== null) ctx.hub.detach(connection);
+      // 建连接阶段（stream 还没交给调用方）出错时，流尚未被消费，直接把流关掉
+      if (connection === null && controller !== null) {
+        try {
+          controller.close();
+        } catch {
+          // 已关闭/已取消
+        }
       }
+    };
 
-      established = true;
-      await new Promise<void>((resolve) => {
-        const finish = (): void => resolve();
-        abort.signal.addEventListener('abort', finish, { once: true });
-        // 背压断开（慢连接/队列溢出/对端关闭）时 hub 会 close 连接，这里同步收尾
-        const timer = setInterval(() => {
-          if (result.connection.isClosed) {
-            clearInterval(timer);
-            finish();
+    const result = await establishSseConnection({
+      pool: ctx.pool,
+      projection: ctx.projection,
+      hub: ctx.hub,
+      options: ctx.sse,
+      query,
+      connectionId: `sse_${ulid()}`,
+      writer: {
+        // 返回 false = 写端过载：占住背压窗口，等对端消化（drain）再继续，不无限堆内存
+        write: (chunk: string) => {
+          awaitingDrain += 1;
+          if (controller === null) {
+            // 建立阶段：流还没被调用方拉取，帧先排队（同样受背压窗口约束）
+            pending.push(chunk);
+            return awaitingDrain < MAX_OUTSTANDING_WRITES;
           }
-        }, 50);
-      });
-      ctx.hub.detach(result.connection);
+          try {
+            controller.enqueue(encoder.encode(chunk));
+            return awaitingDrain < MAX_OUTSTANDING_WRITES;
+          } catch {
+            // 流已取消/关闭：写不进去了，直接判对端不可用
+            peerGone = true;
+            return false;
+          }
+        },
+        isAlive: () => !peerGone,
+        close: () => closeOnce(),
+      },
+    });
+
+    if (!result.ok) {
+      if (result.status === 503) c.header('Retry-After', '5');
+      const code = result.error.code === 'sse_capacity_exhausted' ? 'unavailable' : 'bad_request';
+      return c.json(fail(code, result.error.message, result.error.detail), result.status);
+    }
+
+    connection = result.connection;
+    // 背压记账回到连接：调用方拉走的那几帧视为已消化，归还对应窗口
+    connection.confirmWrites = (count: number) => {
+      if (count <= 0) return;
+      awaitingDrain = 0;
+      for (let i = 0; i < count; i += 1) connection?.approveWrite(true);
+    };
+    c.header('Content-Type', 'text/event-stream; charset=utf-8');
+    c.header('Cache-Control', 'no-cache, no-store');
+    c.header('Connection', 'keep-alive');
+    c.header('X-Accel-Buffering', 'no');
+
+    // pull() = 调用方要下一块：此刻把"已写出未收回"的帧记为对端已消化。这是请求驱动的真背压：
+    // 对端不拉，pull 就不发生，窗口不归还，慢连接判定才会触发（而不是无限排队到内存里）。
+    const body = new ReadableStream<Uint8Array>({
+      start(ctrl) {
+        controller = ctrl;
+        for (const chunk of pending.splice(0)) ctrl.enqueue(encoder.encode(chunk));
+        if (connection !== null) connection.confirmWrites(awaitingDrain);
+      },
+      pull() {
+        if (connection !== null) connection.confirmWrites(awaitingDrain);
+        // 建立阶段积压的帧还没进流 → 催一把，不等到下一拍定时器
+        if (connection !== null && pending.length > 0) connection.pumpPending();
+      },
+      cancel() {
+        peerGone = true;
+        closeOnce();
+      },
+    });
+
+    return new Response(body, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-store',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      },
     });
   });
 
   return app;
-}
-
-async function committedSince(ctx: AppContext, after: number): Promise<EventEnvelope[]> {
-  const events = await ctx.store.replay(after + 1);
-  return events.filter((event) => event.global_seq > after);
 }

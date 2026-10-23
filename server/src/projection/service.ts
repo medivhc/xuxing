@@ -3,8 +3,8 @@
 // 投影不是持久表，而是"事件流按 global_seq 重演"得到的进程内快照：
 // - 这满足任务书红线（投影状态一律由事件派生），并天然满足内核 C5 口径（清空重演 diff 为零）；
 // - projection_version = 已并入的最大 global_seq，与 SSE cursor 同量纲（SSE 纪律 1）；
-// - 写入后立即 readStream(stream_id) 增量并入：拿到的事件与 readStream 的提交序一致，
-//   避免"提交序先于 global_seq 分配序"导致的漏并发（内核 event-store 注释里登记的 batch2 限界）。
+// - 写入后按 global_seq 排序增量并入（见 refresh）；不能只读单个 stream，
+//   因为 global_seq 是全局序号，别的流先提交会留洞，而水位必须连续推进。
 
 import type { Pool } from 'pg';
 import type { EventEnvelope } from '../../../src/kernel/events.ts';
@@ -20,6 +20,8 @@ export interface ProjectionService {
   rebuild(): Promise<ProjectionSnapshot>;
   /** 并入已提交事件（按 global_seq 升序、幂等）；返回本次实际并入的条数。 */
   ingest(events: EventEnvelope[]): number;
+  /** 从事件表读"水位之后"的尾部并并入（提交序与 global_seq 都可能乱，由 ingest 排序去重）。 */
+  refresh(): Promise<number>;
   /** 每次水位前进后触发（SSE 广播钩子）。 */
   onAdvance(listener: (snapshot: ProjectionSnapshot, merged: EventEnvelope[]) => void): () => void;
   /** 该 project 流内 seq 大于给定值的事件（供 SSE 快照-订阅对齐用）。 */
@@ -56,11 +58,22 @@ export function createProjectionService(pool: Pool, store: PgEventStore): Projec
     return pending.length;
   }
 
+  /**
+   * 读尾部：只做读取（不写库），读到的事件按 global_seq 排序后并入。
+   * 用写后读的强一致通道（同一连接池的串行 SELECT）保证刚提交的事务可见。
+   */
+  async function refresh(): Promise<number> {
+    const current = projection.version();
+    const tail = (await store.replay(current)).filter((event) => event.global_seq > current);
+    return ingest(tail);
+  }
+
   return {
     snapshot: () => projection.snapshot(),
     version: () => projection.version(),
     rebuild,
     ingest,
+    refresh,
     onAdvance(listener) {
       listeners.add(listener);
       return () => listeners.delete(listener);

@@ -74,6 +74,12 @@ export interface CommandResult {
   receipt_event_id: string;
 }
 
+/** 命令执行的内部返回：对外结果 + 本次真正写入的事件信封（供 SSE 广播，免去再读尾部）。 */
+export interface CommandExecution {
+  result: CommandResult;
+  events: EventEnvelope[];
+}
+
 export interface CommandActor {
   actor_id: string;
   actor_kind: 'human' | 'agent' | 'system';
@@ -116,7 +122,7 @@ function fingerprint(value: unknown): string {
 export async function runCommand(
   ctx: CommandContext,
   input: { type: string; payload: unknown; client_submit_id: unknown; actor: CommandActor },
-): Promise<CommandResult> {
+): Promise<CommandExecution> {
   const client_submit_id = requireClientSubmitId(input.client_submit_id);
   const payload = asRecord(input.payload);
   const type = input.type as CommandType;
@@ -128,13 +134,16 @@ export async function runCommand(
       throw new IdempotencyConflictError(client_submit_id);
     }
     return {
-      command_type: existing.command_type,
-      client_submit_id,
-      replayed: true,
-      projection_version: ctx.projection.version(),
-      emitted: [],
-      subject: existing.subject,
-      receipt_event_id: existing.event_id,
+      result: {
+        command_type: existing.command_type,
+        client_submit_id,
+        replayed: true,
+        projection_version: ctx.projection.version(),
+        emitted: [],
+        subject: existing.subject,
+        receipt_event_id: existing.event_id,
+      },
+      events: [],
     };
   }
 
@@ -217,7 +226,7 @@ async function acceptProposal(
   payload: Record<string, unknown>,
   client_submit_id: string,
   actor: CommandActor,
-): Promise<CommandResult> {
+): Promise<CommandExecution> {
   const now = ctx.clock().toISOString();
   const proposal_id = requireString(payload, 'proposal_id');
   const snapshot = ctx.projection.snapshot();
@@ -331,7 +340,7 @@ async function acceptProposal(
   });
 
   await ingestProject(ctx, proposal.project_id);
-  return resultOf(ctx, 'proposal_accept', client_submit_id, emitted, { proposal_id, task_id, project_id: proposal.project_id });
+  return finishCommand(ctx, 'proposal_accept', client_submit_id, emitted, { proposal_id, task_id, project_id: proposal.project_id });
 }
 
 function receipt(
@@ -362,7 +371,7 @@ async function rejectProposal(
   payload: Record<string, unknown>,
   client_submit_id: string,
   actor: CommandActor,
-): Promise<CommandResult> {
+): Promise<CommandExecution> {
   const now = ctx.clock().toISOString();
   const proposal_id = requireString(payload, 'proposal_id');
   const proposal = ctx.projection.snapshot().proposals.find((p) => p.proposal_id === proposal_id);
@@ -392,7 +401,7 @@ async function rejectProposal(
     addEmitted(emitted, await tx.append(receipt(base, client_submit_id, 'proposal_reject', payload, { proposal_id, project_id: proposal.project_id }, now)));
   });
   await ingestProject(ctx, proposal.project_id);
-  return resultOf(ctx, 'proposal_reject', client_submit_id, emitted, { proposal_id, project_id: proposal.project_id });
+  return finishCommand(ctx, 'proposal_reject', client_submit_id, emitted, { proposal_id, project_id: proposal.project_id });
 }
 
 /**
@@ -404,7 +413,7 @@ async function taskAdvance(
   payload: Record<string, unknown>,
   client_submit_id: string,
   actor: CommandActor,
-): Promise<CommandResult> {
+): Promise<CommandExecution> {
   const now = ctx.clock().toISOString();
   const task_id = requireString(payload, 'task_id');
   const snapshot = ctx.projection.snapshot();
@@ -504,7 +513,7 @@ async function taskAdvance(
   });
 
   await ingestProject(ctx, task.project_id);
-  return resultOf(ctx, 'task_advance', client_submit_id, emitted, { task_id, from, to, project_id: task.project_id });
+  return finishCommand(ctx, 'task_advance', client_submit_id, emitted, { task_id, from, to, project_id: task.project_id });
 }
 
 /**
@@ -518,7 +527,7 @@ async function feedbackSubmit(
   payload: Record<string, unknown>,
   client_submit_id: string,
   actor: CommandActor,
-): Promise<CommandResult> {
+): Promise<CommandExecution> {
   const now = ctx.clock().toISOString();
   const task_id = requireString(payload, 'task_id');
   const content = requireString(payload, 'content');
@@ -642,7 +651,7 @@ async function feedbackSubmit(
   });
 
   await ingestProject(ctx, task.project_id);
-  return resultOf(ctx, 'feedback_submit', client_submit_id, emitted, {
+  return finishCommand(ctx, 'feedback_submit', client_submit_id, emitted, {
     task_id,
     feedback_id,
     outcome_id,
@@ -664,7 +673,7 @@ async function acceptanceRecord(
   payload: Record<string, unknown>,
   client_submit_id: string,
   actor: CommandActor,
-): Promise<CommandResult> {
+): Promise<CommandExecution> {
   const now = ctx.clock().toISOString();
   const task_id = requireString(payload, 'task_id');
   const snapshot = ctx.projection.snapshot();
@@ -811,7 +820,7 @@ async function acceptanceRecord(
   });
 
   await ingestProject(ctx, task.project_id);
-  return resultOf(ctx, 'acceptance_record', client_submit_id, emitted, {
+  return finishCommand(ctx, 'acceptance_record', client_submit_id, emitted, {
     task_id,
     acceptance_id,
     verdict: derived,
@@ -829,7 +838,7 @@ async function taskCancel(
   payload: Record<string, unknown>,
   client_submit_id: string,
   actor: CommandActor,
-): Promise<CommandResult> {
+): Promise<CommandExecution> {
   const now = ctx.clock().toISOString();
   const task_id = requireString(payload, 'task_id');
   const snapshot = ctx.projection.snapshot();
@@ -924,7 +933,7 @@ async function taskCancel(
   });
 
   await ingestProject(ctx, task.project_id);
-  return resultOf(ctx, 'task_cancel', client_submit_id, emitted, {
+  return finishCommand(ctx, 'task_cancel', client_submit_id, emitted, {
     task_id,
     lifecycle: lifecycleTarget ?? task.lifecycle,
     cancel_requested: true,
@@ -934,30 +943,41 @@ async function taskCancel(
 }
 
 // ---------------------------------------------------------------------------
-// 写入后并把事件并入投影（readStream 增量：提交序一致，避免 global_seq 空洞漏并）
+// 写入后并把事件并入投影。
+//
+// 不能只 readStream(project_id)：global_seq 是全局序号，其它 project 流先提交时会留洞，
+// 而投影水位必须连续推进（否则 apply 会判乱序）。这里读全局尾部再按 global_seq 排序并入。
 // ---------------------------------------------------------------------------
 
-async function ingestProject(ctx: CommandContext, project_id: string): Promise<void> {
+async function ingestAll(ctx: CommandContext): Promise<EventEnvelope[]> {
   const current = ctx.projection.version();
-  const events = await ctx.store.readStream(project_id, 1);
-  ctx.projection.ingest(events.filter((e) => e.global_seq > current));
+  const events = (await ctx.store.replay(current)).filter((event) => event.global_seq > current);
+  ctx.projection.ingest(events);
+  return events;
 }
 
-function resultOf(
+async function ingestProject(ctx: CommandContext, _project_id: string): Promise<void> {
+  await ingestAll(ctx);
+}
+
+function finishCommand(
   ctx: CommandContext,
   command_type: CommandType,
   client_submit_id: string,
   emitted: EmittedEvent[],
   subject: Record<string, unknown>,
-): CommandResult {
+): CommandExecution {
   return {
-    command_type,
-    client_submit_id,
-    replayed: false,
-    projection_version: ctx.projection.version(),
-    emitted: emitted.map(({ event }) => ({ seq: event.global_seq, kind: event.type })),
-    subject,
-    receipt_event_id: emitted[emitted.length - 1]!.event.id,
+    result: {
+      command_type,
+      client_submit_id,
+      replayed: false,
+      projection_version: ctx.projection.version(),
+      emitted: emitted.map(({ event }) => ({ seq: event.global_seq, kind: event.type })),
+      subject,
+      receipt_event_id: emitted[emitted.length - 1]!.event.id,
+    },
+    events: emitted.map(({ event }) => event),
   };
 }
 

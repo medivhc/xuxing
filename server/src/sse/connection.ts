@@ -1,12 +1,15 @@
-// SSE 连接建立流程（纪律①②的落地）：
+// SSE 连接建立流程（纪律①②的落地），顺序本身就是纪律：
 //
 //   1. 预算检查（纪律③）：超上限 → 503 + Retry-After，不建连接；
-//   2. 先订阅：把连接挂进 hub（此后所有提交都会被广播）；
+//   2. 先订阅：连接立刻进 hub 推送名单，但写帧先缓冲（buffer 模式）——订阅之后提交的事件只进缓冲，不会漏；
 //   3. 再取快照水位 snapshot_version = 投影已并入最大 global_seq；
-//   4. 按 cursor 补发：cursor 为 null 时以 snapshot_version 为起点（新客户端只关心此后）；
-//      cursor 落后时从事件表按 global_seq 补发（跨 project 缺口，纪律②）；
-//   5. 发 ready 帧：{projection_version, cursor, replayed, last_seq}；客户端以 ready.cursor 为起点；
-//   6. 转实时；每帧带 seq，客户端按 seq 幂等去重（重复订阅窗口内的重叠由 seq 丢弃）。
+//   4. 按 cursor 补发：cursor 为 null 时以 snapshot_version 为起点（新客户端只关心此后）；否则从事件表
+//      按 global_seq 补发缺口（纪律②）。补发帧直接写，且与缓冲帧按 seq 去重（seq <= lastSeq 丢弃）；
+//   5. 释放缓冲转实时（缓冲里的帧 seq 都 > 补发水位，客户端按 seq 幂等去重）；
+//   6. 发 ready 帧：{projection_version, cursor, replayed, last_seq}，放在补发之后、缓冲之前，
+//      客户端以 ready.cursor 为起点续传。
+//
+// 这样"订阅"与"快照"之间不存在无主窗口：任何在步骤 2 之后提交的事件要么出现在补发里，要么在缓冲里。
 
 import type { Pool } from 'pg';
 import type { EventEnvelope } from '../../../src/kernel/events.ts';
@@ -21,7 +24,7 @@ export interface EstablishInput {
   hub: Hub;
   options: SseOptions;
   query: { cursor?: string | null; project_id?: string | null };
-  writer: { write(chunk: string): void; isAlive(): boolean; close(): void };
+  writer: { write(chunk: string): boolean | void; isAlive(): boolean; close(): void; settled?(): void };
   connectionId: string;
 }
 
@@ -64,10 +67,7 @@ export async function establishSseConnection(input: EstablishInput): Promise<Est
     return { ok: false, status: 400, error: { code: 'bad_request', message: parsed.error ?? 'cursor 非法' } };
   }
 
-  // ① 快照水位（订阅前先取：作为"无 cursor"时的起点）
-  const snapshotVersion = input.projection.version();
-
-  // ③ 连接预算
+  // ③ 连接预算（先于任何挂载，避免超限连接占住 hub 名额）
   if (!input.hub.budget.tryAcquire()) {
     return {
       ok: false,
@@ -80,40 +80,62 @@ export async function establishSseConnection(input: EstablishInput): Promise<Est
     };
   }
 
-  const from = parsed.cursor ?? snapshotVersion;
-  let connection: SseConnection;
+  let connection: SseConnection | null = null;
   try {
-    // ② 先补发 cursor 之后的事件（含订阅窗口之前已提交的），再发 ready
-    const backlog = await replayFromPool(input.pool, from, parsed.project_id);
+    // ② 先订阅（缓冲模式）：订阅开始之后提交的事件都会进缓冲
     connection = new SseConnectionImpl(
       input.connectionId,
       input.writer,
       { options: input.options, project_id: parsed.project_id },
       input.hub.budget,
-      from,
+      parsed.cursor ?? 0,
     );
-    for (const event of backlog) {
-      if (!connection.pushEvent(event)) break;
-    }
-    // 先订阅（此后实时事件不会漏），再声明 ready：ready 之前的帧都是补发
-    input.hub.attach(connection);
+    connection.buffer();
+    input.hub.attachBuffered(connection);
+
+    // ① 再取快照水位（此刻已订阅，水位之后的事件都在缓冲里或有 seq）
+    const snapshotVersion = input.projection.version();
+    const from = parsed.cursor ?? snapshotVersion;
+    connection.lastSeq = from;
+
+    // ② 补发 cursor 之后的事件（直接写，不占队列；与缓冲帧由 seq 去重）
+    const backlog = await replayFromPool(input.pool, from, parsed.project_id);
+    const replayed = connection.pushEvents(backlog);
+
+    // 4. 补发完成 → 释放缓冲（缓冲帧 seq 必然 > from，安全）
+    connection.unbuffer();
     connection.push(frame('ready', {
       projection_version: snapshotVersion,
       cursor: connection.lastSeq,
       requested_cursor: parsed.cursor,
-      replayed: backlog.length,
+      replayed,
       project_id: parsed.project_id,
       heartbeat_ms: input.options.heartbeatMs,
     }));
+
+    if (connection.isClosed) {
+      input.hub.detach(connection);
+      return {
+        ok: false,
+        status: 503,
+        error: {
+          code: 'sse_backlog_too_large',
+          message: 'connection dropped while replaying backlog',
+          detail: { from, project_id: parsed.project_id },
+        },
+      };
+    }
+
     return {
       ok: true,
       connection,
       cursor: connection.lastSeq,
-      replayed: backlog.length,
+      replayed,
       projection_version: snapshotVersion,
     };
   } catch (error) {
-    input.hub.budget.release();
+    if (connection !== null) input.hub.detach(connection);
+    else input.hub.budget.release();
     throw error;
   }
 }
