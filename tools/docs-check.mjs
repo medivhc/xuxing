@@ -53,7 +53,7 @@ function collectRefs(file, content) {
   const refs = [];
   const push = (raw) => {
     if (typeof raw !== 'string') return;
-    let target = raw.trim().replace(/^<|>$/, '');
+    let target = raw.trim().replace(/^<|>$/g, '');
     if (!target || target.startsWith('#') || SCHEME_RE.test(target)) return;
     target = target.split('#')[0].split('?')[0];
     if (target) refs.push(target);
