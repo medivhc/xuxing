@@ -6,7 +6,7 @@
 | 版本 | v0.2 |
 | 分支 | `qoder/interaction-contract` |
 | 基线 | `develop/eventstore-batch1` |
-| 规范依据 | `spec/K0-SPEC-FROZEN-v1.0.md`（下称 Spec）、`docs/DECISIONS.md`、`README.md` |
+| 规范依据 | `spec/K0-SPEC-FROZEN-v1.0.md`（下称 Spec）、`docs/DECISIONS.md`、`../README.md` |
 | 覆盖范围 | Home / Capture / My Actions / Project 四入口的状态机、动作表、异常呈现；design tokens；UI 质感验收 checklist |
 | 非范围 | `src/` 实现、API 最终形状、视觉稿、K1+ 能力 |
 
