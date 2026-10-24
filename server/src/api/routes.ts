@@ -10,6 +10,8 @@ import type { EventEnvelope } from '../../../src/kernel/events.ts';
 import { MAX_OUTSTANDING_WRITES, type Hub, type SseConnection } from '../sse/hub.ts';
 import {
   CommandDeniedError,
+  CommandForbiddenError,
+  CommandNotFoundError,
   CommandValidationError,
   IdempotencyConflictError,
   runCommand,
@@ -21,6 +23,16 @@ import { CaptureValidationError, runCapture } from '../commands/capture.ts';
 import type { SseOptions } from '../sse/protocol.ts';
 import { establishSseConnection } from '../sse/connection.ts';
 import { registerStaticHosting } from './static.ts';
+import {
+  clearedCookieHeader,
+  createAuthMiddleware,
+  sessionCookieHeader,
+  sessionCookieOf,
+  tokensEqual,
+  type AuthService,
+} from '../auth/auth.ts';
+import { registerNodeRoutes } from './nodes-routes.ts';
+import type { NodeDispatcher } from '../nodes/dispatcher.ts';
 
 export interface AppContext {
   pool: Pool;
@@ -34,6 +46,10 @@ export interface AppContext {
   defaultActorId: string;
   /** A 案静态自托管的 web/dist 目录；null/未设 = 纯 API 形态，不注册静态兜底。 */
   webDist?: string | null;
+  /** K1-C 访问控制（双令牌 + 会话存储）。 */
+  auth: AuthService;
+  /** K1-B 执行节点派发服务。 */
+  dispatcher: NodeDispatcher;
 }
 
 /**
@@ -59,7 +75,31 @@ function actorOf(header: string | undefined, fallback: string, kindHeader?: stri
   };
 }
 
+/**
+ * 命令信封 actor（K1 §3.2）：body.actor 若带合法 actor_id/actor_kind 则以其
+ * 为准（resolve_decision 的 actor_not_human 校验据此）；缺省回落请求头口径。
+ * 其余命令不读 body.actor，行为不变。
+ */
+function envelopeActorOf(body: Record<string, unknown>, header: string | undefined, fallback: string, kindHeader?: string): CommandActor {
+  const raw = body.actor;
+  if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+    const record = raw as Record<string, unknown>;
+    const kind = record.actor_kind;
+    const id = record.actor_id;
+    if ((kind === 'human' || kind === 'agent' || kind === 'system') && typeof id === 'string' && id.trim() !== '') {
+      return { actor_id: id, actor_kind: kind };
+    }
+  }
+  return actorOf(header, fallback, kindHeader);
+}
+
 function errorResponse(error: unknown): Response {
+  if (error instanceof CommandForbiddenError) {
+    return Response.json(fail('forbidden', error.message, error.detail), { status: 403 });
+  }
+  if (error instanceof CommandNotFoundError) {
+    return Response.json(fail('not_found', error.message, error.detail), { status: 404 });
+  }
   if (error instanceof CommandDeniedError) {
     return Response.json(fail('conflict', error.message, error.detail), { status: 409 });
   }
@@ -109,6 +149,9 @@ export function createApp(ctx: AppContext): Hono {
     if (!c.res.headers.has('Cache-Control')) c.header('Cache-Control', 'no-store');
   });
 
+  // K1-C：访问控制中间件覆盖全部 /api/*（豁免 health 与 auth/session，见 auth.ts）。
+  app.use('/api/*', createAuthMiddleware(ctx.auth, ctx.clock));
+
   // ---- GET /api/health ----
   // 信封与全部端点一致（FIX-ROUND-1 R-2）：外层 ok 表示"服务在应答"，data 里再区分运行时状态。
   app.get('/api/health', async (c) => {
@@ -125,9 +168,41 @@ export function createApp(ctx: AppContext): Hono {
         db,
         projection_version: ctx.projection.version(),
         limits: limitsOf(ctx.sse),
+        auth_enabled: ctx.auth.userAuthEnabled,
       }),
     );
   });
+
+  // ---- POST /api/auth/session（K1-C §5.2）----
+  // 以请求体提交用户令牌换会话 cookie。节点令牌提交到这里同样 401、不下发
+  // cookie（双令牌互不通用）。失败一律 401 同形，不区分错令牌/无令牌。
+  app.post('/api/auth/session', async (c) => {
+    const body = await readJsonObject(c);
+    const token = body !== null && typeof body.token === 'string' ? body.token : null;
+    const { config } = ctx.auth;
+    if (config.accessToken === null) {
+      // 未启用访问控制（非 production）：无会话可换，前端入口门不会出现。
+      return c.json(ok({ auth_enabled: false }));
+    }
+    if (token === null || !tokensEqual(token, config.accessToken)) {
+      return c.json(fail('unauthorized', 'unauthorized'), 401);
+    }
+    const { sessionId } = ctx.auth.sessions.issue(ctx.clock());
+    const secure = config.cookieSecure || new URL(c.req.url).protocol === 'https:';
+    c.header('Set-Cookie', sessionCookieHeader(sessionId, config, secure));
+    return c.json(ok({ auth_enabled: true }));
+  });
+
+  // ---- POST /api/auth/logout（K1-C §5.2）----
+  // 清 cookie 并作废服务端会话凭证（中间件已先行校验凭据）。
+  app.post('/api/auth/logout', (c) => {
+    ctx.auth.sessions.revoke(sessionCookieOf(c));
+    c.header('Set-Cookie', clearedCookieHeader());
+    return c.json(ok({ logged_out: true }));
+  });
+
+  // ---- K1-B 节点面 + 节点列表（§4.5；令牌面隔离在 auth 中间件）----
+  registerNodeRoutes(app, { dispatcher: ctx.dispatcher, auth: ctx.auth });
 
   // ---- GET /api/home ----
   app.get('/api/home', (c) => {
@@ -136,10 +211,12 @@ export function createApp(ctx: AppContext): Hono {
   });
 
   // ---- GET /api/projects/:projectId ----
-  app.get('/api/projects/:projectId', (c) => {
+  app.get('/api/projects/:projectId', async (c) => {
     const actor = actorOf(c.req.header('x-xuxing-actor'), ctx.defaultActorId);
     const project_id = c.req.param('projectId');
-    const view = projectView(ctx.projection.snapshot(), project_id, actor);
+    // K1-B §4.4：Run 视图合成派发行 state_reason（只读映射）。
+    const reasons = await ctx.dispatcher.dispatchReasons();
+    const view = projectView(ctx.projection.snapshot(), project_id, actor, reasons);
     if (view === null) return c.json(fail('not_found', `项目 ${project_id} 不存在`), 404);
     return c.json(ok(view));
   });
@@ -197,7 +274,7 @@ export function createApp(ctx: AppContext): Hono {
   app.post('/api/commands', async (c) => {
     const body = await readJsonObject(c);
     if (body === null) return c.json(fail('bad_request', '请求体必须是 JSON 对象'), 400);
-    const actor = actorOf(c.req.header('x-xuxing-actor'), ctx.defaultActorId, c.req.header('x-xuxing-actor-kind'));
+    const actor = envelopeActorOf(body, c.req.header('x-xuxing-actor'), ctx.defaultActorId, c.req.header('x-xuxing-actor-kind'));
     try {
       const execution = await runCommand(ctx, {
         type: typeof body.type === 'string' ? body.type : '',

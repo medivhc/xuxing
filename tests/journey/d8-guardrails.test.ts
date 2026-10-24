@@ -84,8 +84,14 @@ afterAll(async () => {
 });
 
 describe('封闭事件目录（spec §4）', () => {
-  it('目录条目与 spec 一致：53 类，且心跳不在目录内（P1-4）', () => {
-    expect(EVENT_TYPES).toHaveLength(53);
+  it('目录条目与 spec 一致：53 类冻结 + K1 修订增补 3 类，且心跳不在目录内（P1-4）', () => {
+    // K1-SPEC v0.4 §1.2/§4.2/§4.4 修订增补（登记于 docs/interaction-contract.md
+    // K1 附则）：NodeRegistered / NodeOffline（$system 流）、RunSideEffectRecorded。
+    // 除此三类外，目录仍须与冻结 spec §4 逐字一致——多一类少一类都失败。
+    expect(EVENT_TYPES).toHaveLength(56);
+    for (const added of ['NodeRegistered', 'NodeOffline', 'RunSideEffectRecorded']) {
+      expect(EVENT_TYPES as readonly string[]).toContain(added);
+    }
     expect(EVENT_TYPES).not.toContain('RunHeartbeat');
     // 旅程里出现过的类型必须全在目录内
     const used = new Set(stream.map((event) => event.type));

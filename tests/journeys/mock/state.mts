@@ -214,6 +214,7 @@ const ACTION_LABEL: Record<CommandType, string> = {
   feedback_submit: '提交执行反馈',
   acceptance_record: '逐判据验收',
   task_cancel: '取消任务',
+  resolve_decision: '裁决决策',
 };
 
 /** 首次命令回执（R-6）：与真服务一致，receipt_event_id 是幂等键本身（事件表 idempotency_key = client_id:<id>）。 */
@@ -1073,6 +1074,8 @@ export class JourneyState {
         available_actions: availableActionsFor(task, actorId, this.liveRuns.has(task.task_id)),
         updated_global_seq: this.head,
       })),
+      // K1-B：mock 不建模 executor Run 派发，runs 恒空数组（字段须在场）。
+      runs: [],
       acceptance_status: {
         accepted: tasks.filter((task) => task.lifecycle === 'accepted').length,
         awaiting: tasks.filter((task) => task.lifecycle === 'awaiting_acceptance').length,
@@ -1098,6 +1101,7 @@ export class JourneyState {
   }
 
   actionsData(actorId = CURRENT_ACTOR_ID): ActionsData {
+    // K1 §3.6 形状：扁平联合条目（mock 只产 task 条目；decision 条目以真服务为准）。
     const items: ActionItem[] = [];
     for (const task of [...this.tasks.values()].sort(
       (a, b) => a.created_at.localeCompare(b.created_at) || a.task_id.localeCompare(b.task_id),
@@ -1105,6 +1109,9 @@ export class JourneyState {
       const available = availableActionsFor(task, actorId, this.liveRuns.has(task.task_id));
       if (available.length === 0) continue;
       items.push({
+        kind: 'task',
+        item_id: `task:${task.task_id}`,
+        rank: items.length + 1,
         task_id: task.task_id,
         project_id: task.project_id,
         project_name: this.projects.get(task.project_id)?.name ?? task.project_id,
@@ -1114,6 +1121,13 @@ export class JourneyState {
         next_action: ACTION_LABEL[available[0]],
         available_actions: available,
         updated_global_seq: this.head,
+        decision_id: null,
+        subject_ref: null,
+        question: null,
+        recommendation: null,
+        alternatives: [],
+        evidence_refs: [],
+        created_at: null,
       });
     }
     return { projection_version: this.head, actor_id: actorId, items };

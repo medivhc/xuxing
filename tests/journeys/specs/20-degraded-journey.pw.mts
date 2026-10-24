@@ -168,7 +168,7 @@ test.describe('D9 降级旅程（degraded 明示 + 全链路可走通）', () =>
         await page.goto('/#/actions');
         const uiRow = actionRow(page, taskId);
         await expect(uiRow).toBeVisible();
-        await expect(uiRow.getByTestId(TID.taskLifecycle)).toHaveText(row.lifecycle);
+        await expect(uiRow.getByTestId(TID.taskLifecycle)).toHaveText(row.lifecycle!);
       }
 
       for (const [index, expectedLifecycle] of ['ready', 'active'].entries()) {

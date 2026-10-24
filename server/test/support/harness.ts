@@ -100,6 +100,9 @@ export async function bootApp(options: {
   sse?: SseOptions;
   /** A 案静态自托管：显式传 dist 目录启用；缺省 undefined（按环境解析）。 */
   webDist?: string | null;
+  /** K1-C/K1-B 测试装配透传（缺省行为不变）。 */
+  auth?: Parameters<typeof buildApp>[0]['auth'];
+  dispatcherConfig?: Parameters<typeof buildApp>[0]['dispatcherConfig'];
 } = {}): Promise<BootedApp> {
   const harness = await createHarness();
   const { app, config } = await buildApp({
@@ -109,6 +112,8 @@ export async function bootApp(options: {
     sse: options.sse ?? TEST_SSE,
     clock: () => harness.clock.now,
     webDist: options.webDist,
+    auth: options.auth,
+    dispatcherConfig: options.dispatcherConfig,
   });
   if (options.seed !== false) {
     await seedDemo({ store: harness.store, projection: config.projection });

@@ -86,6 +86,8 @@ export function handleCommand(store: MockStore, request: CommandRequest): Comman
       );
     case 'task_cancel':
       return withIdempotency(store, request.client_submit_id, () => cancelTask(store, payload));
+    case 'resolve_decision':
+      return withIdempotency(store, request.client_submit_id, () => resolveDecision(store, payload));
     default:
       // canonical 词表内但 mock 未实现的命令（当前仅 feedback_submit：
       // K0 无界面入口，捕获走 /api/capture 专用端点）
@@ -416,10 +418,49 @@ function recordCriterionVerdict(store: MockStore, payload: Payload): void {
 
 // ---------- 决策 ----------
 
-// resolve_decision 已整体移除（FIX-ROUND-1 R-1）：服务端命令词表无对应项，
-// 本轮下线动作入口，不许自造端点或本地假实现。决策领域状态（种子/事件历史）
-// 保留供投影呈现；契约缺口登记见 web/README.md「已知边界」，待协调者裁决
-// 后再恢复命令处理。
+// K1-A：resolve_decision 已进服务端 canonical 词表（K1-SPEC §3.2），mock
+// 同步实现裁决语义：校验（存在性/状态/reason/wake_condition）+ 状态落账 +
+// DecisionResolved 事件。mock 的 Decision 是独立演示实体（无 subject 联动
+// 的图效果），图效果以真服务端为准——mock 只保证界面交互与校验口径一致。
+function resolveDecision(store: MockStore, payload: Payload): void {
+  const decisionId = str(payload.decision_id, 'decision_id');
+  const decision = store.decisions.get(decisionId);
+  if (!decision) throw new MockHttpError(404, 'not_found', `Decision ${decisionId} 不存在`, { decision_id: decisionId });
+  if (decision.status === 'expired') {
+    throw MockHttpError.conflict('decision_expired', '该决策已过期，未执行', {
+      reason: 'decision_expired',
+      decision_id: decisionId,
+      status: decision.status,
+    });
+  }
+  if (decision.status !== 'pending') {
+    throw MockHttpError.conflict('terminal_state', `Decision 已裁决（status=${decision.status}）`, {
+      reason: 'terminal_state',
+      decision_id: decisionId,
+      status: decision.status,
+      decided_by: 'user_demo',
+      decided_at: decision.created_at,
+    });
+  }
+  const verdict = payload.verdict;
+  if (verdict !== 'approved' && verdict !== 'rejected' && verdict !== 'deferred') {
+    throw new MockHttpError(400, 'schema_invalid', 'verdict 必须是 approved / rejected / deferred', { field: 'verdict' });
+  }
+  if (verdict === 'rejected' && (typeof payload.reason !== 'string' || payload.reason.trim() === '')) {
+    throw new MockHttpError(400, 'schema_invalid', 'verdict=rejected 时 reason 必填非空', { field: 'reason' });
+  }
+  if (verdict === 'deferred' && (payload.wake_condition === null || typeof payload.wake_condition !== 'object')) {
+    throw new MockHttpError(400, 'schema_invalid', 'verdict=deferred 时 wake_condition 必填', { field: 'wake_condition' });
+  }
+  decision.status = verdict;
+  decision.updated_global_seq = store.currentSeq() + 1;
+  store.appendEvent({
+    kind: 'DecisionResolved',
+    project_id: decision.project_id,
+    decision_id: decision.decision_id,
+    summary: `决策「${decision.question}」已裁决：${verdict}`,
+  });
+}
 
 // ---------- 取消 ----------
 

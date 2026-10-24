@@ -232,6 +232,8 @@ interface HomeProjection {
 | `cancel_pending` | `TaskCancelRequested` 且尚无 `TaskCanceled` | `TaskCanceled` |
 
 > **服务端实现口径（2026-10-24 落地于 server/src/api/views.ts 的 attentionItems 函数，投影层单测 server/test/home-attention.test.ts 钉死）**：K0 服务端无独立 Decision 实体——`decision_pending` 由待裁决提议承载（`ProposalRecord.status ∈ {proposed, needs_decision}`，`decision_id = proposal_id`，裁决走提议命令）；其余五类按上表条件映射到投影记录现状字段（awaiting_acceptance 且最新有效 Acceptance 缺失或 `partially_accepted`；`Run.state = indeterminate`；`Task.duplicate_suspect` 且未 canceled；`WaitCondition.status = expired` 且任务未终态；`Task.cancel_requested_by` 非空且未 canceled）。`attention_id` 格式为 `attention:<kind>:<entity_id>`（kind 限定保证同任务多类共存时唯一）。`rank` 由服务端计算：kind 优先序 `decision_pending → acceptance_due → run_indeterminate → cancel_pending → wait_expired → duplicate_suspect`，同 kind 按 `created_at` 升序、`attention_id` 字典序兜底，顺序编号 1..n；任务派生项的 `created_at` 取该任务在投影保留窗口内最近事件的 `occurred_at`。`/api/home` 响应为本节页面契约的超集：另保留 API 级附加键（`actor_id` / `my_actions_count` / `recent_activity` / `proposals` / 项目 `last_event_at`），页面只消费本节键集。空态时 `attention` 恒为空数组、字段不得缺失（曾因缺失导致整页白屏，见 WHITESCREEN-FIX-1024）。
+>
+> **K1 修订（2026-10-25，见 §12 附则）**：上段 K0 口径中的「decision_pending 由待裁决提议承载」已被 K1 取代——Decision 成为独立投影实体，`decision_pending` 只由 `DecisionCreated` 且 `status=pending` 的 Decision 派生，与 My Actions 的 decision 条目同源同数；普通待决提议不再派生该条目。
 
 ### 2.3 状态集（7）
 
@@ -998,6 +1000,7 @@ Lifecycle 徽标（文字色 / 背景色；同时必须有文字标签）：
 |---|---|---|---|
 | 2026-10-23 | v0.1 | 初稿：四入口状态机、动作表、异常矩阵、design tokens、质感 checklist、可追溯矩阵、Open Questions | 待评审；未通过前不得开始 Web 实现 |
 | 2026-10-24 | v0.2 | 收官修订：D10 四条裁决（OQ-01/02/04/05）+ 协调者裁定四条（OQ-08/09/10/11）+ 收官两条（OQ-03/07）+ OQ-06 承接 §0.7 正文口径，11 条 OQ 全部关闭；评审 M1–M5（Capture 落点链、outbox 改称 P 层传输缓冲、移除 create_project、Spec §3.1 矩阵口径、人工置位 blocked/on_hold）；独立评审 F-001~F-012 修复（F-001~F-010 按评审清单逐条落地；F-011/F-012 按上下文推断落地，见下方注） | 已定版（转正）；Web 实现可开工 |
+| 2026-10-25 | v0.3（K1 附则） | 新增 §12 K1 附则：Decision 实体与 resolve_decision、actions 扁平联合形状（取代 §4.2 的 decision 嵌套形状）、$system 流与节点面端点、双令牌访问控制面、Project 的 runs 视图与 state_reason、事件目录 K1 增补 3 类 | 已定版（K1-SPEC v0.4 批准后落地） |
 
 > 注：F-011/F-012 所依据的独立评审报告（2026-10-24-D9A-contract-review.md）未随本 commit 入库；两条修复按文档现存一致性缺口推断执行（F-011：§1.1 补 `lag_state=catching_up` 呈现规则；F-012：§7.2 正文行宽像素范围与 16px 字号对齐），如与报告原文不符，后续修订以报告为准。
 
@@ -1020,3 +1023,34 @@ Lifecycle 徽标（文字色 / 背景色；同时必须有文字标签）：
 **评审状态**：D9 决策要求「交互契约先行评审」。2026-10-24 评审逐项确认：四入口状态/动作覆盖 Spec 承重约束；§10 的 11 条 OQ 已全部裁决（索引见上表，无「待用户拍板」残留）；§9 矩阵无待决 OQ 项，可作为 CI 缺链检查的输入（测试/截图链接仍由实现批次按 §8.I 补齐）。本契约由草案转为已定版 v0.2，Web 实现可开工。
 
 **与 D9 的关系**：本文件是 `docs/DECISIONS.md` D9 的交付物；D9 原文「交互契约先行评审；投影一致性硬约束；功能覆盖可追溯矩阵缺链 CI 红；批次验收必备旅程 E2E+视觉回归+异模型 friction report」。收官裁决同步记入 `docs/DECISIONS.md` D11。
+
+---
+
+## 12. K1 附则（2026-10-25，依据 K1-SPEC v0.4）
+
+本附则登记 K1 三块新增面对既有契约的修订与增补；与正文冲突处以本附则为准。
+
+### 12.1 Decision 实体与 resolve_decision（K1-A）
+
+- Decision 是独立投影实体（DecisionCreated / DecisionResolved / DecisionExpired 派生），字段含 `subject_ref{kind,id}`、`wake_condition`、`disposition`、`duplicate_of`、`expires_at` 等；`subject_ref.kind` 在 K1 可裁决集 = `plan_change` / `run_reconciliation` / `duplicate_suspect`，其余 409 `subject_not_resolvable_in_k1`。
+- 命令词表增补第 7 词 `resolve_decision`（canonical）。裁决唯一审计事件为 `DecisionResolved`（不新增重复事件，OQ-K1-2）；处理顺序 actor（非 human → 403 `actor_not_human`）→ 存在性（404）→ 状态（409 `decision_expired` / `terminal_state`）→ 入参（400 字段级）→ 幂等 → 落盘；效果按 subject 分类在同事务执行（PlanChange 应用/驳回、Run 对账三 disposition、疑似重复级联/放行，语义见 K1-SPEC §3.4）。
+- `approved_modified` 不走前端表单（OQ-K1-1）：经 `proposal_accept` 的 `supersedes_change_id` + `decision_reason` 旁路完成，同事务旧 Change 置 rejected(superseded_by_decision) 并补发 DecisionResolved(approved_modified)。
+- deferred 的 wake_condition：`at_time` 必备时刻，`on_event` 可填 `event_type`（OQ-K1-4）；唤起/过期由服务端无状态扫描器落账（DecisionExpired / REQ-PC-5 回路），状态全在事件流、重启靠重演恢复。
+
+### 12.2 My Actions 形状修订（取代 §4.2 的 decision 嵌套形状）
+
+`/api/actions` 的 items 为扁平联合条目：公共字段 `kind: 'task' | 'decision'`、`item_id`、`rank`、`task_id`（decision 条目为 null）、`project_id`、`project_name`、`title`（decision 为 null）、`lifecycle` / `wait_state`（decision 为 null）、`next_action`、`available_actions`、`updated_global_seq`；decision 条目另带 `decision_id`、`subject_ref`、`question`、`recommendation`、`alternatives`、`evidence_refs`、`created_at`（task 条目恒 null/空）。排序口径：decision 优先、同类按 `updated_global_seq` 升序、`rank` 1..n 顺序编号；`my_actions_count` 与条目总数同源。Home 的 `decision_pending` 与本节同源同数（见 §2.2 K1 修订注记）。
+
+### 12.3 $system 流与节点面（K1-B）
+
+- 系统流 `$system` 登记为合法 stream_id：承载 `NodeRegistered` / `NodeOffline`（payload 不带 project_id），不参与任何项目投影。
+- 节点面端点（节点令牌，见 §12.4）：`POST /api/nodes/register`、`POST /api/nodes/:id/heartbeat`、`POST /api/nodes/:id/deregister`、`GET /api/nodes/:id/dispatch-poll?wait=<sec>`（响应恒为 `{dispatch, cancel_requests, probe_requests}` 三键）、`POST /api/nodes/:id/runs/:runId/{ack,nack,started,heartbeat,raw-result,cancel-confirmed,side-effect-note,probe-result}`。派发占用排他（待 ack 不重复下发），ack 租约缺省 45s；租约过期分流按 REQ-RUN-4；probe 按 REQ-RUN-3 三结论且只处置一次。
+- Project 投影增补 `runs[]` 视图：`{run_id, task_id, run_kind, state, executor_kind, side_effect_level, side_effect_count, state_reason, updated_global_seq}`；`state` 为事件派生，`state_reason` 为派发行合成字段——无能力匹配的 online 节点时固定 `awaiting_node`。用户面节点列表 `GET /api/nodes`。
+- 事件目录 K1 增补 3 类：`NodeRegistered`、`NodeOffline`、`RunSideEffectRecorded`（冻结目录 53 类之外唯一合法增补）。
+
+### 12.4 访问控制双令牌面（K1-C，OQ-K1-3 分离裁决）
+
+- 两把独立令牌：用户令牌护用户面（全部 `/api/*` 读面、命令、捕获、SSE、节点列表）；节点令牌只护节点面（§12.3 端点），互不通用（错面一律 401 同形 `{code:'unauthorized'}`，不泄漏对面存在性）。
+- fail-closed：production 缺用户令牌或任一令牌 <16 字符 → 启动期抛错拒启（消息只含变量名）；production 缺节点令牌 → WARN + 节点面一律 401。
+- 承载：`Authorization: Bearer <令牌>` 或会话 cookie（`POST /api/auth/session` 以用户令牌换不透明随机会话凭证，HttpOnly/SameSite=Lax/Path=/，HTTPS 或显式配置加 Secure；`POST /api/auth/logout` 作废）。令牌比较为定长摘要 + 常数时间比较。豁免仅 `GET /api/health`（响应增补 `auth_enabled` 字段，既有字段保留为超集）与 `POST /api/auth/session`。
+- 前端入口门：`auth_enabled` 为真时先探受保护读面，401 只渲染令牌门（零业务 DOM）；令牌不落任何 Web Storage。

@@ -16,6 +16,9 @@
 //   @tailwind），文本断言全过、页面却是裸 HTML——样式必须直接验产物效果；
 // - FIX-ROUND-4 新增待我处理页真形状渲染：任务项曾被误判为 decision 行
 //   只出下线占位卡（ACTIONS-EMPTY-1024），断言任务项标题/动作按钮在场。
+// - K1 移植（feat/k1 → ab1504e）：/api/actions 条目是 K1 §3.6 的封闭联合
+//   kind ∈ {task, decision}，故标题断言按 kind 取 title / question，并断言
+//   decision 条目的裁决面开关与 decision 条目同数（断言不删不减）。
 // - 新增项目页/提议页两条真形状渲染：两页曾按 mock 形状读真投影而崩
 //   （acceptance_status / proposed 包装层），种子数据驱动、不依赖 magpie。
 
@@ -248,7 +251,13 @@ test('页面级冒烟：待我处理页按真形状渲染任务项（标题/项�
   const actionsRes = await page.request.get(`${origin}/api/actions`);
   expect(actionsRes.ok()).toBeTruthy();
   const actions = (await actionsRes.json()) as ApiEnvelope<{
-    items: Array<{ task_id: string; title: string; available_actions: string[] }>;
+    items: Array<{
+      kind: 'task' | 'decision';
+      task_id: string | null;
+      title: string | null;
+      question: string | null;
+      available_actions: string[];
+    }>;
   }>;
   expect(actions.data.items.length).toBeGreaterThan(0);
 
@@ -259,11 +268,18 @@ test('页面级冒烟：待我处理页按真形状渲染任务项（标题/项�
   await expect(page.getByTestId('my-actions-row')).toHaveCount(actions.data.items.length);
   await expect(page.getByTestId('decision-action-offline')).toHaveCount(0);
 
-  // 种子任务标题在场（种子 active 任务 task_demo_contact），且接口每条
-  // 任务项的标题都真渲染出来——不只是「页面不崩」
+  // K1 §3.6 起 items 是封闭联合（kind ∈ {task, decision}）：task 条目的
+  // title、decision 条目的 question 都必须真渲染出来（不是「页面不崩」）；
+  // decision 条目带可展开的裁决面，故裁决面开关数与 decision 条目数相等。
+  const decisionItems = actions.data.items.filter((item) => item.kind === 'decision');
+  await expect(page.getByTestId('decision-resolve-toggle')).toHaveCount(decisionItems.length);
+
+  // 种子任务标题在场（种子 active 任务 task_demo_contact）
   await expect(page.getByText('联系张三确认方案')).toBeVisible();
   for (const item of actions.data.items) {
-    await expect(page.getByText(item.title, { exact: true }).first()).toBeVisible();
+    const label = item.kind === 'task' ? item.title : item.question;
+    expect(label, `${item.kind} 条目的展示文案不应为空`).toBeTruthy();
+    await expect(page.getByText(label!, { exact: true }).first()).toBeVisible();
   }
 
   // 动作按钮在场（以接口真值为准，不硬编码构成）：有 feedback_submit 的

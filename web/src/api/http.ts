@@ -94,6 +94,15 @@ function toApiError(response: Response, envelope: FailureEnvelope): ApiError {
   return new ApiError({ status: response.status, code, message, requestId, detail, retryable });
 }
 
+/** K1-C：任一受保护请求 401 → 广播本事件，入口门（AuthGate）据此回锁。 */
+export const UNAUTHORIZED_EVENT = 'xuxing:unauthorized';
+
+function notifyUnauthorized(): void {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
@@ -121,6 +130,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // 响应体解析失败（空体/非 JSON）按 undefined 进入信封判定，
   // 由下面的 malformed_envelope 分支统一报错，不把裸体误当 data。
   const body: unknown = await response.json().catch(() => undefined);
+
+  // K1-C：会话失效/未授权 → 入口门回锁（不自动重试、不白屏，见 AuthGate）。
+  if (response.status === 401) {
+    notifyUnauthorized();
+  }
 
   if (isResponseEnvelope(body)) {
     if (body.ok) {
