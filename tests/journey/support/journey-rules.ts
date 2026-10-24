@@ -68,6 +68,8 @@ export interface PlanChangeDraft {
   rationale: string;
   assumptions: string[];
   ops: JOp[];
+  /** REQ-PC-5（approved_modified）：新 Change 取代旧 Change 时指向旧 change_id；其余情形不填。 */
+  supersedes_change_id?: string | null;
 }
 
 export interface PlanChangeVerdict {

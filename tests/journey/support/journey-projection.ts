@@ -82,6 +82,8 @@ export interface JPlanChange {
   ops: JOp[];
   reason_code: string | null;
   decision_id: string | null;
+  /** REQ-PC-5：approved_modified 时新 Change 对旧 Change 的取代链接（payload 未带则为 null）。 */
+  supersedes_change_id: string | null;
 }
 
 export interface JOp {
@@ -494,6 +496,7 @@ export class JourneyProjection {
           estimated_budget: num(event, 'estimated_budget'),
           status: 'proposed',
           ops: arr<JOp>(event, 'ops'),
+          supersedes_change_id: optField<string>(event, 'supersedes_change_id'),
           reason_code: null,
           decision_id: null,
         });

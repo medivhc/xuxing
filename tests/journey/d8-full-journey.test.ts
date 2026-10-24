@@ -203,25 +203,27 @@ describe('②b 主计划应用（rev 1）', () => {
 });
 
 describe('②c 越权提议 → Decision 回路（REQ-PC-3/5）', () => {
-  it('事件流：提议→Decision→needs_decision→批准→重提议→应用→TaskCaptured→Revision', () => {
+  it('事件流：提议→Decision→needs_decision→approved_modified→新 Change 提议→旧 Change rejected→应用→TaskCaptured→Revision', () => {
     expect(step('②c').appendedTypes).toEqual([
       'PlanChangeProposed', 'DecisionCreated', 'PlanChangeStatusChanged', 'DecisionResolved',
-      'PlanChangeProposed', 'PlanChangeApplied', 'TaskCaptured', 'PlanRevisionCreated',
+      'PlanChangeProposed', 'PlanChangeRejected', 'PlanChangeApplied', 'TaskCaptured', 'PlanRevisionCreated',
     ]);
   });
 
-  it('投影：原越权 Change=needs_decision，批准后的新 Change=applied，rev→2', () => {
+  it('投影：原越权 Change=rejected（superseded_by_decision），取代它的新 Change=applied，rev→2', () => {
     const state = stateAt(4);
-    expect(state.changes.get(D8.planDocGap)?.status).toBe('needs_decision');
-    expect(state.changes.get(`${D8.planDocGap}-approved`)?.status).toBe('applied');
-    expect(state.decisions.get(D8.decisionDocGap)?.status).toBe('approved');
+    expect(state.changes.get(D8.planDocGap)?.status).toBe('rejected');
+    expect(state.changes.get(D8.planDocGap)?.reason_code).toBe('superseded_by_decision');
+    expect(state.changes.get(`${D8.planDocGap}-modified`)?.status).toBe('applied');
+    expect(state.changes.get(`${D8.planDocGap}-modified`)?.supersedes_change_id).toBe(D8.planDocGap);
+    expect(state.decisions.get(D8.decisionDocGap)?.status).toBe('approved_modified');
     expect(state.planRev).toBe(2);
     expect(state.tasks.has(D8.docTask)).toBe(true);
   });
 
-  it('REQ-PC-5：批准不等于绕过校验 —— 重提交时 base 已换成裁决时刻的当前 rev', () => {
+  it('REQ-PC-5：approved_modified 不等于绕过校验 —— 新 Change 仍以裁决时刻的当前 rev 为 base 重走 REQ-PC-1', () => {
     const state = stateAt(4);
-    const resubmitted = state.changes.get(`${D8.planDocGap}-approved`);
+    const resubmitted = state.changes.get(`${D8.planDocGap}-modified`);
     expect(resubmitted?.base_plan_rev).toBe(1);
     expect(resubmitted?.proposer_id).toBe('actor-planner');
     expect(step('②c').notes.join(' | ')).toContain('base 已更新为 1');

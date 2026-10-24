@@ -459,7 +459,7 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
   // ======================================================================
   // ②c Policy 越权 → Decision 回路（REQ-PC-3 / REQ-PC-5）→ rev 2
   // ======================================================================
-  await r.begin('②c 越权提议 → Decision → 批准后以当前 rev 为新 base 重走校验', ['REQ-PC-1④', 'REQ-PC-3', 'REQ-PC-5', 'REQ-GD-2']);
+  await r.begin('②c 越权提议 → Decision（approved_modified）→ 新 Change 取代旧 Change', ['REQ-PC-1④', 'REQ-PC-3', 'REQ-PC-5', 'REQ-GD-2']);
 
   const shadowPlan: PlanChangeDraft = {
     change_id: D8.planDocGap, client_proposal_id: 'prop-shadow-1', proposer_id: SHADOW_PLANNER.id,
@@ -478,15 +478,21 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
   }, KERNEL);
   await r.emit('PlanChangeStatusChanged', { change_id: shadowPlan.change_id, from: 'proposed', to: 'needs_decision', decision_id: D8.decisionDocGap }, KERNEL);
 
-  // REQ-PC-5：approved ≠ 绕过校验，以裁决时刻当前 rev 为新 base 重走 REQ-PC-1
-  await r.emit('DecisionResolved', { decision_id: D8.decisionDocGap, resolution: 'approved', decided_by: HUMAN.id, decided_at: FIXED_NOW.toISOString() }, HUMAN);
-  const resubmit: PlanChangeDraft = { ...shadowPlan, change_id: `${shadowPlan.change_id}-approved`, client_proposal_id: 'prop-shadow-1-approved', proposer_id: PLANNER.id, base_plan_rev: projection.planRev };
+  // REQ-PC-5 的 approved_modified 路径（写死）：裁决文案要求「改由在册 Planner 重新提交」，
+  // 即修改后批准 —— 禁止原地改 ops 或给旧 Change 换皮重提：由裁决者提交新 PlanChange
+  // （新 id、supersedes_change_id 指向旧 Change），旧 Change 置 rejected、原因码
+  // superseded_by_decision，不再永远停在 needs_decision。新 Change 仍须以裁决时刻的
+  // 当前 rev 为 base 重走 REQ-PC-1 完整校验（批准不等于绕过校验）。
+  // （纯 approved 路径是「原 Change 换 base 重走校验、不产生新 Change」，与本例裁决文案不符，不走。）
+  await r.emit('DecisionResolved', { decision_id: D8.decisionDocGap, resolution: 'approved_modified', decided_by: HUMAN.id, decided_at: FIXED_NOW.toISOString() }, HUMAN);
+  const resubmit: PlanChangeDraft = { ...shadowPlan, change_id: `${shadowPlan.change_id}-modified`, client_proposal_id: 'prop-shadow-1-modified', proposer_id: PLANNER.id, base_plan_rev: projection.planRev, supersedes_change_id: shadowPlan.change_id };
   const vResubmit = validatePlanChange(projection, D8.project, resubmit, seenProposals);
-  r.note(`批准后重走校验 → ok=${vResubmit.ok} base 已更新为 ${resubmit.base_plan_rev}`);
-  if (!vResubmit.ok) throw new Error(`REQ-PC-5 批准后重走校验理应通过：${vResubmit.detail}`);
+  r.note(`approved_modified 新 Change 重走校验 → ok=${vResubmit.ok} base 已更新为 ${resubmit.base_plan_rev}，supersedes=${resubmit.supersedes_change_id}`);
+  if (!vResubmit.ok) throw new Error(`REQ-PC-5 approved_modified 新 Change 重走校验理应通过：${vResubmit.detail}`);
 
   await r.emit('PlanChangeProposed', planChangePayload(resubmit), PLANNER);
   seenProposals.set(proposalKey(resubmit), resubmit.change_id);
+  await r.emit('PlanChangeRejected', { change_id: shadowPlan.change_id, reason_code: 'superseded_by_decision', detail: 'Decision 裁决 approved_modified：旧 Change 被新 Change 取代（REQ-PC-5）' }, KERNEL);
   await r.emit('PlanChangeApplied', { change_id: resubmit.change_id, plan_rev: 2, applied_ops: resubmit.ops.length }, KERNEL);
   await r.emit('TaskCaptured', { task_id: D8.docTask, goal_id: D8.goal, title: '登记无法映射字段清单（缺陷证据）', change_id: resubmit.change_id, introduced_via: 'plan-change-op:add_task' }, KERNEL);
   await r.emit('PlanRevisionCreated', { rev: 2, change_id: resubmit.change_id, applied_at: FIXED_NOW.toISOString(), diff_summary: '+1 Task' }, KERNEL);
@@ -494,7 +500,7 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
   step = await r.end();
   assertTypes(step, [
     'PlanChangeProposed', 'DecisionCreated', 'PlanChangeStatusChanged', 'DecisionResolved',
-    'PlanChangeProposed', 'PlanChangeApplied', 'TaskCaptured', 'PlanRevisionCreated',
+    'PlanChangeProposed', 'PlanChangeRejected', 'PlanChangeApplied', 'TaskCaptured', 'PlanRevisionCreated',
   ]);
 
   // ======================================================================
@@ -974,6 +980,7 @@ function planChangePayload(draft: PlanChangeDraft): Record<string, unknown> {
     risk_level: draft.risk_level,
     estimated_budget: draft.estimated_budget,
     proposer_id: draft.proposer_id,
+    ...(draft.supersedes_change_id ? { supersedes_change_id: draft.supersedes_change_id } : {}),
     status: 'proposed',
   };
 }
