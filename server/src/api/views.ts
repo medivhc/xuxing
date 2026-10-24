@@ -48,6 +48,8 @@ function taskSummary(task: ProjectionSnapshot['tasks'][number], snapshot: Projec
       ? null
       : {
         acceptance_id: acceptance.acceptance_id,
+        acceptor_id: acceptance.acceptor_id,
+        acceptor_kind: acceptance.acceptor_kind,
         verdict: acceptance.verdict,
         criterion_results: acceptance.criterion_results,
         created_at: acceptance.created_at,
