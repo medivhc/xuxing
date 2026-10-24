@@ -888,12 +888,16 @@ async function taskCancel(
   };
 
   await ctx.store.withTransaction(async (tx) => {
-    addEmitted(emitted, await tx.append({
-      ...base,
-      type: 'TaskCancelRequested',
-      idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:cancel-requested`,
-      payload: { task_id, requested_by: actor.actor_id, reason: typeof payload.reason === 'string' ? payload.reason : 'user_canceled' },
-    }));
+    // 重复落意图去重（跨线复审 MINOR-3）：意图已在账时不再重复 append TaskCancelRequested
+    // （幂等键随 submit id 变、靠它去重不住）；后续收尾/等待逻辑照常按当前快照推进。
+    if (task.cancel_requested_by === null) {
+      addEmitted(emitted, await tx.append({
+        ...base,
+        type: 'TaskCancelRequested',
+        idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:cancel-requested`,
+        payload: { task_id, requested_by: actor.actor_id, reason: typeof payload.reason === 'string' ? payload.reason : 'user_canceled' },
+      }));
+    }
 
     for (const run of liveRuns.filter((r) => r.run_kind === 'human_light')) {
       addEmitted(emitted, await tx.append({
@@ -921,23 +925,26 @@ async function taskCancel(
           payload: { task_id, from: task.wait_state, to: 'none', reason: 'task_canceled (INV-11)' },
         }));
       }
-      addEmitted(emitted, (await tx.appendStateTransition({
+      const transition = await tx.appendStateTransition({
         ...base,
         type: 'TaskLifecycleChanged',
         entity: 'task',
         idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc`,
-      trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc:trigger`,
-      from: task.lifecycle,
-      to: 'canceled',
+        trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc:trigger`,
+        from: task.lifecycle,
+        to: 'canceled',
         facts: { allRunsTerminal: true },
         payload: { task_id },
-      })).event);
-      addEmitted(emitted, await tx.append({
-        ...base,
-        type: 'TaskCanceled',
-        idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:canceled`,
-        payload: { task_id, reason: 'task_canceled' },
-      }));
+      });
+      addEmitted(emitted, transition.event);
+      // MAJOR-1（跨线复审）：迁入 canceled 时内核已在同事务落 TaskCanceled（F2 收尾），
+      // 命令层不得再手动补发（否则流内重复 2 条）；把内核收尾事件并入 emitted，响应口径不变。
+      const taskCanceledEventId = transition.closure?.task_canceled_event_id ?? null;
+      if (taskCanceledEventId !== null) {
+        const stream = await tx.readStream(asProjectId(task.project_id), 1);
+        const taskCanceled = stream.find((e) => e.id === taskCanceledEventId);
+        if (taskCanceled) addEmitted(emitted, taskCanceled);
+      }
     }
 
     addEmitted(emitted, await tx.append(receipt(base, client_submit_id, 'task_cancel', payload, {
