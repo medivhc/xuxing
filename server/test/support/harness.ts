@@ -98,6 +98,8 @@ export async function bootApp(options: {
   proposer?: Proposer;
   seed?: boolean;
   sse?: SseOptions;
+  /** A 案静态自托管：显式传 dist 目录启用；缺省 undefined（按环境解析）。 */
+  webDist?: string | null;
 } = {}): Promise<BootedApp> {
   const harness = await createHarness();
   const { app, config } = await buildApp({
@@ -106,6 +108,7 @@ export async function bootApp(options: {
     proposer: options.proposer ?? stubProposer(),
     sse: options.sse ?? TEST_SSE,
     clock: () => harness.clock.now,
+    webDist: options.webDist,
   });
   if (options.seed !== false) {
     await seedDemo({ store: harness.store, projection: config.projection });

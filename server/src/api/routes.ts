@@ -18,6 +18,7 @@ import {
 import { CaptureValidationError, runCapture } from '../commands/capture.ts';
 import type { SseOptions } from '../sse/protocol.ts';
 import { establishSseConnection } from '../sse/connection.ts';
+import { registerStaticHosting } from './static.ts';
 
 export interface AppContext {
   pool: Pool;
@@ -29,6 +30,8 @@ export interface AppContext {
   clock: () => Date;
   defaultProjectId: string;
   defaultActorId: string;
+  /** A 案静态自托管的 web/dist 目录；null/未设 = 纯 API 形态，不注册静态兜底。 */
+  webDist?: string | null;
 }
 
 /**
@@ -310,6 +313,9 @@ export function createApp(ctx: AppContext): Hono {
       },
     });
   });
+
+  // ---- A 案静态自托管（兜底，必须最后注册；/api 行为不变）----
+  if (ctx.webDist) registerStaticHosting(app, ctx.webDist);
 
   return app;
 }

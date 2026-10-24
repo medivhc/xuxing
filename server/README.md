@@ -43,6 +43,34 @@ npm run server                   # 起服务（默认 127.0.0.1:8787）
 | `MAGPIE_API_KEY` | 网关 key，仅由运行环境注入；**代码不读取、不打印、不落日志** |
 | `XUXING_PROPOSER_MODEL` | 模型，缺省免费模型 `workbuddy-ai/deepseek-v4.1-flash` |
 | `XUXING_SSE_MAX_CONNECTIONS` / `XUXING_SSE_QUEUE_LIMIT` / `XUXING_SSE_SLOW_TIMEOUT_MS` / `XUXING_SSE_HEARTBEAT_MS` | SSE 背压参数（缺省 32 / 256 / 15000 / 15000）；`GET /api/health` 的 `data.limits` 直接反映这四个值（单点来源，无第二份常量） |
+| `XUXING_WEB_DIST` | A 案静态自托管的 web/dist 目录；未设时按缺省相对定位自动探测（源码/构建两种布局 + cwd），探不到则纯 API 形态；显式指定但目录无 `index.html` 时启动直接报错 |
+
+## 部署形态（A 案：服务端静态自托管）
+
+服务端可直接托管 web 构建产物（`web/dist`），部署形态回归 **app 容器自包含**：
+静态资源与 SPA 回退由服务端出，/api 与 SSE 行为不变（`/api/*` 永远优先，
+未知 /api 路径仍是 JSON 404，绝不回退 index.html；带扩展名的缺失资产大声
+404，不拿 index.html 冒充）。
+
+- 启用条件：`resolveWebDist()` 解析到含 `index.html` 的目录（`XUXING_WEB_DIST`
+  显式指定，或缺省相对定位命中仓库 `web/dist`）。
+- 启动日志的 `web_dist` 字段即最终口径：路径 = 已托管；`null` = 纯 API 形态。
+- SPA 回退只对无扩展名路径生效（BrowserRouter 直达/刷新）；`/assets/`
+  内容哈希资产长缓存 immutable，index.html 与回退响应 no-store。
+
+从 B 案（Caddy 托管静态 + 仅反代 /api）切换到 A 案的步骤（只写文档，执行归部署轨）：
+
+1. 构建镜像时把 `web/dist` 一并打进 app 镜像（与 server 同一发布单元），
+   容器内 `XUXING_WEB_DIST` 指向镜像内 dist 路径（或放仓库相对位置走缺省定位）。
+2. 先在预发/本地按 `server/test/static-hosting.test.ts` 与 journeys spec60
+   口径验：子路径直达 200、刷新不 404、资产 200、/api 与 SSE 不变。
+3. 部署新镜像，公网先直验 app 端口（或经临时域名）：`GET /` 与
+   `GET /projects/<id>` 均回 index.html、`/api/health` 信封正常、SSE ready 帧到达。
+4. 改 Caddy：该站点从「静态 root + /api 反代」改为**整站反代**到 app
+   （`reverse_proxy 127.0.0.1:8787`，保留 SSE 所需 `flush_interval -1`），
+   reload 后跑公网 e2e 全轮。
+5. 回滚：还原 Caddyfile 备份并 reload 即回到 B 案（app 的静态托管闲置无害，
+   B 案下 Caddy 不把非 /api 流量转给 app）。
 
 ## 种子契约（FIX-ROUND-1 R-7 成文）
 

@@ -24,6 +24,7 @@ const server = serve({ fetch: app.fetch, port, hostname }, (info) => {
       event: 'listening',
       url: `http://${info.address}:${info.port}`,
       projection_version: config.projection.version(),
+      web_dist: config.webDist,
       proposer: {
         model: proposerConfig.model,
         configured: proposerConfig.apiKey !== null,
