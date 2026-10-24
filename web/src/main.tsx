@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import { QueryClientProvider } from '@tanstack/react-query';
 import App from './App';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { createAppRuntime } from './app/runtime';
 import { installMockFetch, isMockEnabled } from './mock/install';
 import './styles/tokens.css';
@@ -36,7 +37,9 @@ createRoot(container).render(
   <StrictMode>
     <QueryClientProvider client={runtime.queryClient}>
       <BrowserRouter>
-        <App />
+        <ErrorBoundary>
+          <App />
+        </ErrorBoundary>
       </BrowserRouter>
     </QueryClientProvider>
   </StrictMode>,
