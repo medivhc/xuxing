@@ -1,14 +1,19 @@
-based_on: 9efe5308ef6384449f848892e2b922a540922986
+based_on: a7b8cfc4b42c9d52fcdeb8c7cb44cca7f21e104b
 
 # 续行状态（STATUS）
 
 | 项 | 状态 |
 |---|---|
-| 基线 | develop/eventstore-batch1 @ 80a09c1 |
-| Batch1 复审 fix 波次 | 两轮进行中 |
+| 基线 | develop/eventstore-batch1 @ ab1504e（FR4 已合入）+ Batch 2 合入中 |
+| Batch 2（eventstore 硬化批次） | 实现完成，独立评审 APPROVED（BLOCKER/MAJOR 0），合入 develop 中 |
+| 内核能力 | appendBatch 批量追加 · Run 命令层守卫与派发审计 · 事务作用域与 COMMIT 真实性 · 增量消费水位（落库 + 投递幂等） · Scheduler 定时器（REQ-SCH-3） · Acceptance 重算（REQ-ACC-3） |
+| 仍留后续批次 | 生产调度循环、生产投影消费者、C1/C1b 租约对账、G1 全旅程、PlanChange 校验流水线 |
 | D9 交互契约 | 已评审，按 D10 裁决修订中 |
-| D9 旅程测试 | 开发中 |
-| 门禁：沙箱测试 | 165 passed / 48 skipped / 5 todo；PG 集成待 CI 复跑 |
-| 门禁：fix 波次自装 PG16 环境 | 251 passed / 0 failed |
+| 门禁：根测试（真 PG16） | 522 passed / 5 todo / 0 failed |
+| 门禁：server 测试 | 72 passed / 0 failed |
+| 门禁：typecheck | 根 + server 均 0 错 |
+| 门禁：web 构建 | 成功（tsc --noEmit + vite build） |
+| 门禁：journeys | mock 轮 13 passed / 3 skipped（spec50 真服务轮单跑 3 passed） |
+| 门禁：docs-check | 本次刷新后通过（based_on 指向 Batch 2 末次代码提交） |
 
 决策见 docs/DECISIONS.md

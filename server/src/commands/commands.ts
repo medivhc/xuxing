@@ -11,6 +11,7 @@ import type { PgEventStore, PgEventStoreTx } from '../../../src/kernel/event-sto
 import { IdempotencyKeyConflictError } from '../../../src/kernel/event-store-pg.ts';
 import { asProjectId, type EventEnvelope, type ProjectId } from '../../../src/kernel/events.ts';
 import { guardWaitStateChange } from '../../../src/kernel/transition-guard.ts';
+import { appendRunCreated, appendRunTransition } from '../../../src/kernel/run-events.ts';
 import type { AcceptanceCriterion, CriterionResult, ProjectionSnapshot, TaskRecord } from '../projection/projection.ts';
 import { activeHumanRun, computeAvailableActions, COMMAND_TYPES, type CommandType } from '../projection/actions.ts';
 import { availableCommands } from '../api/views.ts';
@@ -91,9 +92,20 @@ function requireClientSubmitId(value: unknown): string {
   return value;
 }
 
+/** 形状点名（杂-1①）：数组/null/Date 等要说清收到的是什么，不要笼统说 object。 */
+function describeShape(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (value instanceof Date) return 'Date';
+  return typeof value;
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new CommandValidationError('payload 必须是对象', { field: 'payload' });
+    throw new CommandValidationError(
+      `payload 必须是 plain object（收到 ${describeShape(value)}）`,
+      { field: 'payload' },
+    );
   }
   return value as Record<string, unknown>;
 }
@@ -463,9 +475,10 @@ async function taskAdvance(
     if (from === 'ready' && to === 'active') {
       // 派发：人类执行者 → human_light Run（REQ-HUM-1：无租约、无心跳，created → running）
       const run_id = `run_${ulid()}`;
-      addEmitted(emitted, await tx.append({
+      addEmitted(emitted, await appendRunCreated(tx, {
         ...base,
         type: 'RunCreated',
+        run_kind: 'human_light',
         idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:run-created`,
         payload: {
           run_id,
@@ -487,12 +500,15 @@ async function taskAdvance(
           idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:run`,
         },
       }));
-      addEmitted(emitted, await tx.append({
+      addEmitted(emitted, (await appendRunTransition(tx, {
         ...base,
         type: 'RunStarted',
+        entity: 'run',
+        from: 'created',
+        to: 'running',
         idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:run-started`,
         payload: { run_id, started_by: actor.actor_id },
-      }));
+      })).event);
     }
 
     // guard facts 与投影动作判定同源：captured→defined 用任务本体事实；
@@ -636,12 +652,15 @@ async function feedbackSubmit(
         proposal_id: `pc_${feedback_id}`,
       },
     }));
-    addEmitted(emitted, await tx.append({
+    addEmitted(emitted, (await appendRunTransition(tx, {
       ...base,
       type: 'RunSucceeded',
+      entity: 'run',
+      from: 'running',
+      to: 'succeeded',
       idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:run-succeeded`,
       payload: { run_id: run.run_id, outcome_id },
-    }));
+    })).event);
     addEmitted(emitted, (await tx.appendStateTransition({
       ...base,
       type: 'TaskLifecycleChanged',
@@ -900,12 +919,15 @@ async function taskCancel(
     }
 
     for (const run of liveRuns.filter((r) => r.run_kind === 'human_light')) {
-      addEmitted(emitted, await tx.append({
+      addEmitted(emitted, (await appendRunTransition(tx, {
         ...base,
         type: 'RunCanceled',
+        entity: 'run',
+        from: run.state,
+        to: 'canceled',
         idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:run-${run.run_id}`,
         payload: { run_id: run.run_id, reason: 'task_canceled' },
-      }));
+      })).event);
     }
 
     if (lifecycleTarget !== null) {

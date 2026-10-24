@@ -11,8 +11,11 @@
 //   IdempotencyKeyConflictError，同 key 相同内容返回首次结果（INV-13）。
 // - seq 原子分配：每 stream 一行 event_streams 作为链头，SELECT … FOR UPDATE 串行化同
 //   stream 追加；UNIQUE(stream_id, seq) 兜底命中即 StoreInvariantError（大声失败，不重试）。
+// - 提交序护栏（S5 / Q5）：所有事件写在分配 seq 前取事务级咨询锁并持有到提交，
+//   因此「可见的最大 global_seq」不会越过任何未提交事件 —— 增量消费的水位由它定义。
+//   代价是写路径全局串行（K0 §7 量级下无感；跨 stream 并行写入降为串行）。
 // - replay 用单条 SELECT（单快照）按 global_seq 重演；global_seq 允许空洞（回滚跳号），
-//   只保证单调。增量 tailing 需要水位保护，按 Q5 留给 batch 2。
+//   只保证单调。增量消费见 tailing 方法（水位落库 + 投递幂等键）。
 // - occurred_at 由注入时钟提供（store 接口无该参数，见假设 A8）。
 // - 状态迁移写路径（appendStateTransition）：
 //   ① 事件类型必须属于 entity 家族（spec §4）且与 from→to 格匹配（F6）；
@@ -23,14 +26,28 @@
 //      覆盖调用方自述（F3/F4/F5）；
 //   ⑤ 迁入 accepted/canceled 时 INV-11 / REQ-RUN-6 收尾事件由内核在同一事务内自动落库，
 //      调用方无法忽略（F2/F4）；通用 append 路径禁止直写终态迁移，堵死绕过口。
-// - 跨事务批量（appendBatch）仍留给 batch 2（Q4）；withTransaction 提供显式同事务入口。
+// - 跨事务批量：appendBatch 在**同一事务**内按序写入同一 stream（Q4）；非法形状在开事务前
+//   拒绝，guard 拒绝则整批回滚；withTransaction 提供显式同事务入口。
+// - 增量消费：append 事务持全局追加锁（提交序 = global_seq 序），水位见 tailing.ts（Q5）。
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { ulid } from 'ulid';
 import type { EventEnvelope, EventType, ProjectId } from './events.js';
 import { EVENT_TYPES } from './events.js';
-import type { EventStore } from './event-store.js';
+import type {
+  AppendBatchEntryInput,
+  AppendBatchResult,
+  AppendEventInput,
+  EventStore,
+} from './event-store.js';
+
+export type {
+  AppendBatchEntryInput,
+  AppendBatchResult,
+  AppendEventInput,
+} from './event-store.js';
 import {
   RUN_STATES,
   TASK_STATES,
@@ -72,13 +89,27 @@ export class UnknownEventTypeError extends Error {
 export class IdempotencyKeyConflictError extends Error {
   readonly stream_id: string;
   readonly idempotency_key: string;
-  constructor(stream_id: string, idempotency_key: string) {
+  /** 冲突定位（杂-2③）：既有事件 id 与首个不一致字段，便于直接排查。 */
+  readonly existing_event_id: string | null;
+  readonly conflicting_fields: string[];
+  constructor(
+    stream_id: string,
+    idempotency_key: string,
+    location: { existing_event_id?: string | null; conflicting_fields?: string[] } = {},
+  ) {
+    const existing_event_id = location.existing_event_id ?? null;
+    const conflicting_fields = location.conflicting_fields ?? [];
     super(
-      `idempotency_key 冲突：stream=${stream_id} key=${idempotency_key} 已存在不同内容的事件（A3：同 key 不同内容视为错误）`,
+      `idempotency_key 冲突：stream=${stream_id} key=${idempotency_key} ` +
+        `已存在不同内容的事件（A3：同 key 不同内容视为错误）` +
+        (existing_event_id !== null ? ` existing_event_id=${existing_event_id}` : '') +
+        (conflicting_fields.length > 0 ? ` 冲突字段=${conflicting_fields.join(',')}` : ''),
     );
     this.name = 'IdempotencyKeyConflictError';
     this.stream_id = stream_id;
     this.idempotency_key = idempotency_key;
+    this.existing_event_id = existing_event_id;
+    this.conflicting_fields = conflicting_fields;
   }
 }
 
@@ -116,8 +147,13 @@ export class EventEntityMismatchError extends Error {
   readonly type: string;
   constructor(entity: 'task' | 'run', type: string) {
     super(
-      `事件类型 ${type} 不属于 ${entity} 状态迁移事件家族：` +
-        `task 用 TaskLifecycleChanged，run 用 Run* 状态事件（spec §4）`,
+      `事件类型 ${type} 不属于 ${entity} 状态迁移事件家族（spec §4）。` +
+        (entity === 'task'
+          ? '生命周期迁移请用 appendStateTransition({entity:"task", type:"TaskLifecycleChanged"})；' +
+            'wait_state 变更（TaskWaitStateChanged）与取消附随事件（TaskCanceled / WaitConditionCanceled）' +
+            '请用 append 或 requestTaskCancellation，它们不走生命周期矩阵。'
+          : 'Run 状态迁移请用 appendRunTransition(...)（内部 appendStateTransition({entity:"run"})）；' +
+            '建 Run 用 appendRunCreated(...)。'),
     );
     this.name = 'EventEntityMismatchError';
     this.entity = entity;
@@ -179,6 +215,39 @@ export class TerminalClosureRequiredError extends Error {
     this.name = 'TerminalClosureRequiredError';
     this.task_id = task_id;
     this.to = to;
+  }
+}
+
+/**
+ * S4-②（reverify-R2）：事务结果必须真实反映 COMMIT 状态。
+ * fn 吞掉 SQL 错误后 PG 把事务置为 aborted，COMMIT 实际执行 ROLLBACK 且不抛错；
+ * 不检查 command tag 就会「返回成功但零落库」。
+ */
+export class TransactionCommitError extends Error {
+  readonly command: string | null;
+  constructor(command: string | null) {
+    super(
+      `事务提交未成功：COMMIT 返回 ${command ?? '<无 command tag>'}（PG 对 aborted 事务会隐式 ROLLBACK）。` +
+        `fn 内若吞掉了 SQL 错误，请重新抛出而不是继续 return`,
+    );
+    this.name = 'TransactionCommitError';
+    this.command = command;
+  }
+}
+
+/**
+ * S4-①：事务进行中误用外层 store 写同一 stream 会因链头行锁自锁挂起。
+ * 这里在写之前立即显式拒绝，把「静默挂起」变成「可定位的编程错误」。
+ */
+export class TransactionScopeError extends Error {
+  readonly stream_id: string;
+  constructor(stream_id: string) {
+    super(
+      `store 事务作用域误用：stream ${JSON.stringify(stream_id)} 已在 withTransaction 的 tx 内被写入；` +
+        `事务内请只用 tx.append / tx.appendStateTransition（用外层 store 会等待自己持有的行锁而挂起）`,
+    );
+    this.name = 'TransactionScopeError';
+    this.stream_id = stream_id;
   }
 }
 
@@ -391,6 +460,19 @@ const DDL: string[] = [
   `DROP TRIGGER IF EXISTS events_no_truncate ON events`,
   `CREATE TRIGGER events_no_truncate BEFORE TRUNCATE ON events
      FOR EACH STATEMENT EXECUTE FUNCTION events_forbid_mutation()`,
+  // S5：增量消费水位（落库，进程重启后恢复）与投递幂等键。
+  `CREATE TABLE IF NOT EXISTS consumer_watermarks (
+     consumer_id     text PRIMARY KEY,
+     last_global_seq bigint NOT NULL DEFAULT 0 CHECK (last_global_seq >= 0),
+     updated_at      timestamptz NOT NULL DEFAULT now()
+   )`,
+  `CREATE TABLE IF NOT EXISTS consumer_deliveries (
+     consumer_id      text NOT NULL,
+     event_id         text NOT NULL,
+     event_global_seq bigint NOT NULL,
+     delivered_at     timestamptz NOT NULL DEFAULT now(),
+     PRIMARY KEY (consumer_id, event_id)
+   )`,
 ];
 
 /** 建表 + 触发器（幂等；重复调用安全）。 */
@@ -467,7 +549,7 @@ function isUniqueViolation(error: unknown, constraint: string): boolean {
  * F15：幂等 key 的「同内容」定义 = type + payload + actor_id + actor_kind +
  * correlation_id + causation_id。任一不同都视为同 key 不同内容，拒绝静默返回首次事件。
  */
-function idempotencyContentMismatch(
+function idempotencyConflictFields(
   existing: {
     type: string;
     payload_canonical: string;
@@ -476,17 +558,17 @@ function idempotencyContentMismatch(
     causation_id: string | null;
     correlation_id: string;
   },
-  input: Parameters<EventStore['append']>[0],
+  input: AppendEventInput,
   payload_canonical: string,
-): boolean {
-  return (
-    existing.type !== input.type ||
-    existing.payload_canonical !== payload_canonical ||
-    existing.actor_id !== input.actor_id ||
-    existing.actor_kind !== input.actor_kind ||
-    existing.correlation_id !== input.correlation_id ||
-    existing.causation_id !== input.causation_id
-  );
+): string[] {
+  const fields: string[] = [];
+  if (existing.type !== input.type) fields.push('type');
+  if (existing.payload_canonical !== payload_canonical) fields.push('payload');
+  if (existing.actor_id !== input.actor_id) fields.push('actor_id');
+  if (existing.actor_kind !== input.actor_kind) fields.push('actor_kind');
+  if (existing.correlation_id !== input.correlation_id) fields.push('correlation_id');
+  if (existing.causation_id !== input.causation_id) fields.push('causation_id');
+  return fields;
 }
 
 // ---------------------------------------------------------------------------
@@ -498,9 +580,15 @@ export interface PgEventStoreOptions {
   clock?: () => Date;
   /** 注入 id 工厂（默认 ULID），测试可固定 id。 */
   idFactory?: () => string;
+  /**
+   * S3-②（F13 残留）：默认要求流的首条事件是 ProjectCreated（spec §4 / INV-12：stream = Project）。
+   * 仅 store 机制测试（哈希链/幂等/并发）需要「无 ProjectCreated 的局部流」时显式关闭；
+   * 生产入口（server / seed / journeys）不得关闭。
+   */
+  requireProjectCreated?: boolean;
 }
 
-export type AppendStateTransitionInput = Parameters<EventStore['append']>[0] & {
+export type AppendStateTransitionInput = AppendEventInput & {
   entity?: 'task' | 'run';
   from: string;
   to: string;
@@ -508,6 +596,22 @@ export type AppendStateTransitionInput = Parameters<EventStore['append']>[0] & {
   /** F7：TaskLifecycleChanged 的触发事件 id；缺省时回落到信封 causation_id。 */
   trigger_event_id?: string;
 };
+
+/** appendBatch 的单条结果：迁移条目带 guard 与收尾证据；普通事件只在 events 里。 */
+export interface AppendBatchTransitionResult extends AppendStateTransitionResult {}
+
+export interface PgAppendBatchResult extends AppendBatchResult {
+  /** 按条目顺序记录的迁移结果（普通事件条目不占位）。 */
+  transitions: AppendBatchTransitionResult[];
+}
+
+/** appendBatch 的使用错误（空批次 / 跨 stream / from-to 只给一半）——编程错误，不静默。 */
+export class AppendBatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AppendBatchError';
+  }
+}
 
 /** F2/F4 收尾动作的落库证据（与 lifecycle 迁移同事务）。 */
 export interface TransitionClosure {
@@ -567,6 +671,24 @@ export class ProjectStreamRequiredError extends Error {
     );
     this.name = 'ProjectStreamRequiredError';
     this.stream_id = stream_id;
+  }
+}
+
+/**
+ * S3-②（F13 残留）：流内必须有 ProjectCreated 事实才能承载后续事件。
+ * 品牌类型与撞值校验只能保证「看起来像 project_id」，不能证明项目真的被创建过。
+ */
+export class ProjectCreatedRequiredError extends Error {
+  readonly stream_id: string;
+  readonly type: string;
+  constructor(stream_id: string, type: string) {
+    super(
+      `stream ${JSON.stringify(stream_id)} 尚无 ProjectCreated 事实：拒绝写入 ${type}。` +
+        `事件流按 Project 划分（spec §4 / INV-12），建流的第一条事件必须是 ProjectCreated`,
+    );
+    this.name = 'ProjectCreatedRequiredError';
+    this.stream_id = stream_id;
+    this.type = type;
   }
 }
 
@@ -663,7 +785,8 @@ const DERIVED_EVENT_TYPES: readonly EventType[] = [
   'RunIndeterminate',
 ];
 
-const RUN_STATE_BY_EVENT: Partial<Record<EventType, RunState>> = {
+/** Run 事件 → 它把 Run 迁入的目标状态（S3-①：命令层用同一张表校验 type ↔ to）。 */
+export const RUN_STATE_BY_EVENT: Partial<Record<EventType, RunState>> = {
   RunCreated: 'created',
   RunQueued: 'queued',
   RunLeased: 'leased',
@@ -679,18 +802,24 @@ const TERMINAL_RUN_STATES: ReadonlySet<string> = new Set([
   'succeeded', 'failed', 'canceled', 'timed_out',
 ]);
 
+type RunKind = 'executor' | 'human_light';
+
 interface RunFactsRow {
   run_id: string;
   task_id: string | null;
   state: RunState;
   /** 是否出现过 RunStarted（REQ-RUN-4 的「已启动」判据）。 */
   started: boolean;
+  /** REQ-HUM-1：运行形态（缺省 executor）。由 RunCreated.payload.run_kind 派生。 */
+  run_kind: RunKind;
 }
 
 interface WaitConditionFactsRow {
   id: string;
   task_id: string | null;
   active: boolean;
+  /** REQ-SCH-3：定时器持久化在事件里（due_at），Scheduler 从流恢复。 */
+  due_at: string | null;
 }
 
 interface DecisionFactsRow {
@@ -812,6 +941,7 @@ async function deriveStreamFacts(
           id,
           task_id: payloadField(payload, 'task_id'),
           active: true,
+          due_at: payloadField(payload, 'due_at'),
         });
         break;
       }
@@ -829,6 +959,7 @@ async function deriveStreamFacts(
             id,
             task_id: payloadField(payload, 'task_id'),
             active: false,
+            due_at: null,
           });
         }
         break;
@@ -896,6 +1027,9 @@ async function deriveStreamFacts(
           task_id: existing?.task_id ?? payloadField(payload, 'task_id'),
           state: runState,
           started: started || runState === 'running',
+          run_kind:
+            existing?.run_kind
+            ?? (payloadField(payload, 'run_kind') === 'human_light' ? 'human_light' : 'executor'),
         });
         break;
       }
@@ -921,6 +1055,21 @@ function deriveTaskLifecycle(
     });
   }
   return lifecycle as TaskLifecycle;
+}
+
+/** 幂等重放路径的轻量查询：只取 RunCreated 的运行形态，不派生整条流（F2：不在重放路径求值 facts）。 */
+async function deriveRunKind(
+  reader: Pool | PoolClient,
+  stream_id: string,
+  run_id: string,
+): Promise<RunKind> {
+  const { rows } = await reader.query<{ run_kind: string | null }>(
+    `SELECT payload->>'run_kind' AS run_kind FROM events
+     WHERE stream_id = $1 AND type = 'RunCreated' AND payload->>'run_id' = $2
+     LIMIT 1`,
+    [stream_id, run_id],
+  );
+  return rows[0]?.run_kind === 'human_light' ? 'human_light' : 'executor';
 }
 
 function deriveRunState(facts: StreamFacts, run_id: string): RunFactsRow | null {
@@ -1050,11 +1199,52 @@ function withTransitionTrigger(
   return { ...payload, trigger_event_id: trigger };
 }
 
+/** REQ-SCH-3：到期待触发的 WaitCondition（due_at 来自事件，不靠内存计时）。 */
+export interface DueWaitCondition {
+  stream_id: string;
+  wait_condition_id: string;
+  task_id: string | null;
+  due_at: string;
+}
+
+/** S5：增量消费的一批事件与安全水位。 */
+export interface TailingBatch {
+  events: EventEnvelope[];
+  /** 本批可推进到的安全水位（不越过任何未提交事件）；空批=当前水位不变。 */
+  watermark: number;
+  /** 本次是否被 limit 截断（还有更多待消费）。 */
+  has_more: boolean;
+}
+
+export interface CommitDeliveriesInput {
+  consumer_id: string;
+  /** 消费到的 global_seq（单调推进；回退被忽略）。 */
+  last_global_seq: number;
+  /** 本批已处理事件 id：作为消费幂等键，重复提交不产生重复投递记录。 */
+  event_ids: string[];
+}
+
+export interface CommitDeliveriesResult {
+  new_deliveries: number;
+  watermark: number;
+}
+
+/** 运维视图：全库流清单（listStreams；dashboard / 巡检用）。 */
+export interface StreamSummary {
+  stream_id: string;
+  last_seq: number;
+  last_hash: string;
+  updated_at: string;
+  event_count: number;
+}
+
 export interface ChainVerification {
   ok: boolean;
   stream_id: string;
   length: number;
   broken_at_seq: number | null;
+  /** 断点位置（杂-1③）：events 行内 / 链头行本身；ok 为 null。 */
+  broken_in: 'events' | 'stream_head' | null;
   reason: string | null;
   /** event_streams 是否有链头行：区分「不存在的 stream」与「健康的空流」。 */
   stream_exists: boolean;
@@ -1086,6 +1276,7 @@ export interface TaskCancellationResult {
 
 /** 事务内的 store 视图：append / appendStateTransition 共享调用方开启的同一 client 与事务。 */
 export interface PgEventStoreTx extends EventStore {
+  appendBatch(entries: AppendBatchEntryInput[]): Promise<PgAppendBatchResult>;
   /**
    * 校验器嵌在写路径：先按事件流派生期望 from（F1），再 guardTransition，
    * 拒绝则抛 TransitionDeniedError / TransitionStateError 且不写任何行。
@@ -1096,6 +1287,16 @@ export interface PgEventStoreTx extends EventStore {
   requestTaskCancellation(input: RequestTaskCancellationInput): Promise<TaskCancellationResult>;
   /** 读全流、用 payload_canonical 重算链，返回首个断点（不在 append/replay 热路径）。 */
   verifyChain(stream_id: ProjectId): Promise<ChainVerification>;
+  /** S5：读消费水位（落库；不存在时为 0）。 */
+  readWatermark(consumer_id: string): Promise<number>;
+  /** S5：按水位取增量事件（单快照；水位不会越过未提交事件）。 */
+  fetchAfterWatermark(input: { consumer_id: string; limit?: number }): Promise<TailingBatch>;
+  /** S5：原子提交「消费到 last_global_seq」+ 投递幂等键（重复提交不重复入账）。 */
+  commitDeliveries(input: CommitDeliveriesInput): Promise<CommitDeliveriesResult>;
+  /** 运维：列出全部 stream 的链头与事件数。 */
+  listStreams(): Promise<StreamSummary[]>;
+  /** REQ-SCH-3：列出 due_at 已到且仍 active 的 WaitCondition（进程重启后由事件流恢复）。 */
+  listDueWaitConditions(now: Date): Promise<DueWaitCondition[]>;
 }
 
 export interface PgEventStore extends PgEventStoreTx {
@@ -1117,7 +1318,7 @@ const INSERT_EVENT_SQL = `
   RETURNING global_seq, recorded_at`;
 
 interface PreparedAppend {
-  input: Parameters<EventStore['append']>[0];
+  input: AppendEventInput;
   payload_canonical: string;
 }
 
@@ -1132,7 +1333,7 @@ interface PrepareAppendOptions {
  * 形状（F7）与格级纵深防御、payload 可规范化。
  */
 function prepareAppend(
-  input: Parameters<EventStore['append']>[0],
+  input: AppendEventInput,
   options: PrepareAppendOptions = {},
 ): PreparedAppend {
   if (!(EVENT_TYPES as readonly string[]).includes(input.type)) {
@@ -1222,6 +1423,29 @@ function prepareAppend(
 }
 
 /**
+ * S5（Q5）：全局追加顺序锁。事件写事务在分配 seq 之前取它，并持有到提交/回滚。
+ * 这样 allocations 与 commits 同序，消费者可以用「快照内可见的最大 global_seq」
+ * 作为安全水位，不会越过并发未提交事件。锁按事务释放，可重入（同一事务多次取不阻塞）。
+ */
+const APPEND_ORDER_LOCK_KEY = 0x7878_0001;
+
+/**
+ * S4-①：withTransaction 的异步作用域。事务内误用外层 store 写（任意 stream）时，
+ * 外层调用仍处在同一个 async context 里 → 立即抛 TransactionScopeError。
+ * 与全局追加顺序锁配合：同事务内跨 stream 的外层写入同样会等锁死锁，故一并拒绝。
+ * 并发请求各自不在该 context 中，不受影响（只会等锁，不会误报）。
+ */
+const TX_SCOPE = new AsyncLocalStorage<{ stream_id?: string }>();
+
+function assertOutsideTransactionScope(stream_id: string): void {
+  if (TX_SCOPE.getStore() !== undefined) throw new TransactionScopeError(stream_id);
+}
+
+async function lockAppendOrder(conn: PoolClient): Promise<void> {
+  await conn.query('SELECT pg_advisory_xact_lock($1)', [APPEND_ORDER_LOCK_KEY]);
+}
+
+/**
  * 在已开启的事务内追加一条事件：不 BEGIN / COMMIT / ROLLBACK，连接生命周期由调用方管。
  * 任何一步失败都让所在事务进入 aborted 状态，由调用方整体回滚。
  */
@@ -1230,8 +1454,12 @@ async function appendWithin(
   prepared: PreparedAppend,
   idFactory: () => string,
   clock: () => Date,
+  requireProjectCreated: boolean,
 ): Promise<EventEnvelope> {
   const { input, payload_canonical } = prepared;
+
+  // S5：先取全局追加顺序锁（在链头行锁之前，避免锁序反转），再分配 seq。
+  await lockAppendOrder(client);
 
   // 幂等建链头行；genesis last_hash = 64 个 0
   await client.query(
@@ -1253,6 +1481,11 @@ async function appendWithin(
   const last_seq = toSafeNumber(head.rows[0].last_seq, 'event_streams.last_seq');
   const last_hash = head.rows[0].last_hash;
 
+  // S3-②：新流的首条事件必须是 ProjectCreated（其余事件不得凭空建项目流）。
+  if (requireProjectCreated && last_seq === 0 && input.type !== 'ProjectCreated') {
+    throw new ProjectCreatedRequiredError(input.stream_id, input.type);
+  }
+
   // 锁内快路径：同 key 已入账 → 返回首次结果（INV-13）
   if (input.idempotency_key !== null) {
     const existing = await client.query<EventRow>(
@@ -1261,8 +1494,12 @@ async function appendWithin(
     );
     if (existing.rows.length > 0) {
       const row = existing.rows[0];
-      if (idempotencyContentMismatch(row, input, payload_canonical)) {
-        throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+      const conflicting_fields = idempotencyConflictFields(row, input, payload_canonical);
+      if (conflicting_fields.length > 0) {
+        throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, {
+          existing_event_id: row.id,
+          conflicting_fields,
+        });
       }
       return rowToEnvelope(row);
     }
@@ -1303,6 +1540,35 @@ async function appendWithin(
       reason: typeof payload.reason === 'string' ? payload.reason : undefined,
     });
     if (!waitGuard.allowed) throw new TransitionDeniedError(waitGuard);
+  }
+
+  // R1：原始 append 也不得绕行流派生状态写生命周期迁移——
+  // 形状已在 prepareAppend 校验（from/to/trigger 必填 + 格合法），这里补「from 必须等于
+  // 事件流当前状态」与「主体必须已存在」，否则同一条流可以写出两条互斥的生命周期分支。
+  if (input.type === 'TaskLifecycleChanged') {
+    const payload = input.payload as Record<string, unknown>;
+    const task_id = requirePayloadId(input.type, payload, 'task_id');
+    const facts = await deriveStreamFacts(client, input.stream_id);
+    const lifecycle = deriveTaskLifecycle(facts, task_id);
+    if (lifecycle === null) {
+      throw new TransitionStateError({
+        reason: 'subject_not_found',
+        entity: 'task',
+        subject_id: task_id,
+        provided_from: payload.from as string,
+        detail: 'stream 内没有 TaskCaptured / TaskLifecycleChanged（R1：原始 append 不得凭空建生命周期）',
+      });
+    }
+    if (payload.from !== lifecycle) {
+      throw new TransitionStateError({
+        reason: 'from_mismatch',
+        entity: 'task',
+        subject_id: task_id,
+        expected_from: lifecycle,
+        provided_from: payload.from as string,
+        detail: '原始 append 的 payload.from 与流派生 lifecycle 不一致（R1）',
+      });
+    }
   }
 
   const seq = last_seq + 1;
@@ -1356,9 +1622,63 @@ async function appendWithin(
   };
 }
 
+// ---------------------------------------------------------------------------
+// 批量追加（Q4）：同 stream、同事务、哈希链内连续
+// ---------------------------------------------------------------------------
+
+function isTransitionEntry(entry: AppendBatchEntryInput): boolean {
+  return typeof entry.from === 'string' && typeof entry.to === 'string';
+}
+
+/**
+ * 批次形状预校验：在所有 DB 动作之前跑一遍，非法批次连事务都不开
+ * （「非法迁移先拒、不进事务」）。guard 的前置条件仍由事务内的
+ * appendStateTransitionOn 按流派生 fact 判定。
+ */
+function prevalidateBatchEntry(entry: AppendBatchEntryInput): void {
+  if (entry.from === undefined && entry.to === undefined) {
+    prepareAppend(entry);
+    return;
+  }
+  if (typeof entry.from !== 'string' || typeof entry.to !== 'string') {
+    throw new AppendBatchError(
+      `appendBatch 条目 from/to 必须成对提供：stream=${entry.stream_id} type=${entry.type}`,
+    );
+  }
+  const entity = entry.entity ?? 'task';
+  assertTransitionEventType(entity, entry.type);
+  const merged = mergeTransitionPayload(entry.payload, entry.from, entry.to);
+  assertProjectStreamId(entry.stream_id, merged);
+  // 与 appendStateTransitionOn 同口径：trigger_event_id 可由 causation_id 补齐
+  const withTrigger = withTransitionTrigger(
+    merged,
+    entry.type,
+    entry.causation_id,
+    entry.trigger_event_id,
+  );
+  // 批量入口本身就是「同事务收尾」的兑现方式，终态迁移在此合法。
+  prepareAppend({ ...entry, payload: withTrigger }, { allowTerminalLifecycle: true });
+}
+
+function batchStreamId(entries: AppendBatchEntryInput[]): ProjectId {
+  if (entries.length === 0) {
+    throw new AppendBatchError('appendBatch 至少需要一条事件（空批次不产生任何写入）');
+  }
+  const stream_id = entries[0].stream_id;
+  for (const entry of entries) {
+    if (entry.stream_id !== stream_id) {
+      throw new AppendBatchError(
+        `appendBatch 只允许同一 stream（同事务同链）：${stream_id} ≠ ${entry.stream_id}`,
+      );
+    }
+  }
+  return stream_id;
+}
+
 export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}): PgEventStore {
   const clock = options.clock ?? (() => new Date());
   const idFactory = options.idFactory ?? (() => ulid());
+  const requireProjectCreated = options.requireProjectCreated ?? true;
 
   /**
    * 构造一个 store 视图。client = null 时每次写各自开事务（pool 路径）；
@@ -1370,17 +1690,20 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     /** 在指定连接上写一条事件（调用方负责事务边界）。 */
     async function appendOn(
       conn: PoolClient,
-      input: Parameters<EventStore['append']>[0],
+      input: AppendEventInput,
       prepareOptions: PrepareAppendOptions = {},
     ): Promise<EventEnvelope> {
-      return appendWithin(conn, prepareAppend(input, prepareOptions), idFactory, clock);
+      return appendWithin(conn, prepareAppend(input, prepareOptions), idFactory, clock, requireProjectCreated);
     }
 
     async function append(
-      input: Parameters<EventStore['append']>[0],
+      input: AppendEventInput,
     ): Promise<EventEnvelope> {
       // 事务内：直接复用调用方连接，失败由 withTransaction 整体回滚
       if (client) return appendOn(client, input);
+
+      // S4-①：事务内只能用 tx 写（外层 store 会等自己持有的行锁/全局追加锁而挂起）
+      assertOutsideTransactionScope(input.stream_id);
 
       const conn = await pool.connect();
       try {
@@ -1388,7 +1711,10 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
         const event = await appendOn(conn, input);
 
         // 快路径命中已存在事件时事务是只读的，COMMIT 同样安全
-        await conn.query('COMMIT');
+        const committed = await conn.query('COMMIT');
+        if (committed.command !== 'COMMIT') {
+          throw new TransactionCommitError(committed.command ?? null);
+        }
         return event;
       } catch (error) {
         await conn.query('ROLLBACK').catch(() => undefined);
@@ -1403,8 +1729,16 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             [input.stream_id, input.idempotency_key],
           );
           if (rows.length === 1) {
-            if (idempotencyContentMismatch(rows[0], input, canonicalJson(input.payload))) {
-              throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+            const conflicting_fields = idempotencyConflictFields(
+              rows[0],
+              input,
+              canonicalJson(input.payload),
+            );
+            if (conflicting_fields.length > 0) {
+              throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, {
+                existing_event_id: rows[0].id,
+                conflicting_fields,
+              });
             }
             return rowToEnvelope(rows[0]);
           }
@@ -1421,6 +1755,58 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       } finally {
         conn.release();
       }
+    }
+
+    /** 事务内执行一批：迁移条目走 appendStateTransitionOn（同一 guard 语义），其余走 appendOn。 */
+    async function appendBatchOn(
+      conn: PoolClient,
+      entries: AppendBatchEntryInput[],
+    ): Promise<PgAppendBatchResult> {
+      const stream_id = batchStreamId(entries);
+
+      // 先取全局追加顺序锁再读批次起点：否则并发事务可能在「读起点」与「拿锁」之间
+      // 提交事件，导致事后按 seq > 起点读回时把别人的事件算进本批结果。
+      await lockAppendOrder(conn);
+      const head = await conn.query<{ last_seq: string }>(
+        `SELECT last_seq FROM event_streams WHERE stream_id = $1`,
+        [stream_id],
+      );
+      const before_seq = head.rows.length === 0
+        ? 0
+        : toSafeNumber(head.rows[0].last_seq, 'event_streams.last_seq');
+
+      const transitions: AppendBatchTransitionResult[] = [];
+      for (const entry of entries) {
+        if (isTransitionEntry(entry)) {
+          transitions.push(
+            await appendStateTransitionOn(conn, {
+              ...(entry as AppendStateTransitionInput),
+              from: entry.from as string,
+              to: entry.to as string,
+            }),
+          );
+        } else {
+          await appendOn(conn, entry);
+        }
+      }
+
+      // 用同一连接读回本批真实写入（含内核自动收尾），uncommitted 行对本事务可见。
+      const { rows } = await conn.query<EventRow>(
+        `SELECT * FROM events
+         WHERE stream_id = $1 AND seq > $2
+         ORDER BY seq ASC`,
+        [stream_id, before_seq],
+      );
+      return { events: rows.map(rowToEnvelope), transitions };
+    }
+
+    async function appendBatch(entries: AppendBatchEntryInput[]): Promise<PgAppendBatchResult> {
+      // 形状预校验放在开事务之前：非法批次零 DB 动作。
+      const batch_stream = batchStreamId(entries);
+      if (client === null) assertOutsideTransactionScope(batch_stream);
+      for (const entry of entries) prevalidateBatchEntry(entry);
+
+      return withStoreTransaction((conn) => appendBatchOn(conn, entries));
     }
 
     async function readStream(stream_id: ProjectId, from_seq = 1): Promise<EventEnvelope[]> {
@@ -1470,7 +1856,8 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
           stream_id,
           length: 0,
           broken_at_seq: null,
-          reason: 'stream_not_found',
+          broken_in: null,
+          reason: '流不存在：event_streams 里没有该 stream 的链头行（stream_not_found）',
           stream_exists: false,
         };
       }
@@ -1496,6 +1883,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             stream_id,
             length: eventRows.length,
             broken_at_seq: seq,
+            broken_in: 'events',
             reason: `seq 不连续：期望 ${expectedSeq}，实际 ${seq}`,
             stream_exists: true,
           };
@@ -1506,6 +1894,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             stream_id,
             length: eventRows.length,
             broken_at_seq: seq,
+            broken_in: 'events',
             reason: `prev_hash 断链：期望 ${expectedPrev}，实际 ${row.prev_hash}`,
             stream_exists: true,
           };
@@ -1520,6 +1909,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             stream_id,
             length: eventRows.length,
             broken_at_seq: seq,
+            broken_in: 'events',
             reason:
               `payload_canonical 无法重新规范化：` +
               (error instanceof Error ? error.message : String(error)),
@@ -1532,6 +1922,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             stream_id,
             length: eventRows.length,
             broken_at_seq: seq,
+            broken_in: 'events',
             reason:
               `payload_canonical 非规范形式（F14）：` +
               `重规范化=${recanonicalized}，库中=${row.payload_canonical}`,
@@ -1545,6 +1936,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             stream_id,
             length: eventRows.length,
             broken_at_seq: seq,
+            broken_in: 'events',
             reason: `hash 不匹配：重算 ${recomputed}，实际 ${row.hash}`,
             stream_exists: true,
           };
@@ -1555,12 +1947,17 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
 
       // F-b：不只看 events 行，还要校验链头行。链头被改乱/半提交时不能报绿。
       if (headLastSeq !== eventRows.length) {
+        // 断点在链头行本身：broken_at_seq 给 events 的真实末行（不是链头声称的序号），
+        // broken_in 指明位置，reason 同时给出两边数值。
         return {
           ok: false,
           stream_id,
           length: eventRows.length,
-          broken_at_seq: headLastSeq,
-          reason: `链头 last_seq 与 events 不一致：last_seq=${headLastSeq}，events 行数=${eventRows.length}`,
+          broken_at_seq: eventRows.length === 0 ? null : eventRows.length,
+          broken_in: 'stream_head',
+          reason:
+            `链头 last_seq 与 events 不一致：链头声称 last_seq=${headLastSeq}，` +
+            `events 实际行数=${eventRows.length}（断点在链头行，不在 events）`,
           stream_exists: true,
         };
       }
@@ -1570,6 +1967,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
           stream_id,
           length: eventRows.length,
           broken_at_seq: eventRows.length === 0 ? null : eventRows.length,
+          broken_in: 'stream_head',
           reason:
             `链头 last_hash 与 events 末行不一致：` +
             `last_hash=${headLastHash}，期望 ${expectedPrev}`,
@@ -1582,9 +1980,142 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
         stream_id,
         length: eventRows.length,
         broken_at_seq: null,
+        broken_in: null,
         reason: null,
         stream_exists: true,
       };
+    }
+
+    // -----------------------------------------------------------------------
+    // S5：增量消费水位（落库）+ 投递幂等
+    // -----------------------------------------------------------------------
+
+    async function readWatermark(consumer_id: string): Promise<number> {
+      const { rows } = await reader.query<{ last_global_seq: string }>(
+        `SELECT last_global_seq FROM consumer_watermarks WHERE consumer_id = $1`,
+        [consumer_id],
+      );
+      if (rows.length === 0) return 0;
+      return toSafeNumber(rows[0].last_global_seq, 'consumer_watermarks.last_global_seq');
+    }
+
+    async function fetchAfterWatermark(input: {
+      consumer_id: string;
+      limit?: number;
+    }): Promise<TailingBatch> {
+      const limit = input.limit ?? 200;
+      if (!Number.isInteger(limit) || limit <= 0) {
+        throw new StoreInvariantError(`tailing limit 必须是正整数，收到 ${String(limit)}`);
+      }
+      // 单条 SELECT = 单快照：水位与事件在同一快照内读取。
+      const { rows } = await reader.query<EventRow>(
+        `SELECT * FROM events
+         WHERE global_seq > COALESCE(
+           (SELECT last_global_seq FROM consumer_watermarks WHERE consumer_id = $1), 0
+         )
+         ORDER BY global_seq ASC
+         LIMIT $2`,
+        [input.consumer_id, limit],
+      );
+      const events = rows.map(rowToEnvelope);
+      const watermark = events.length > 0
+        ? events[events.length - 1].global_seq
+        : await readWatermark(input.consumer_id);
+      return { events, watermark, has_more: events.length === limit };
+    }
+
+    async function commitDeliveries(
+      input: CommitDeliveriesInput,
+    ): Promise<CommitDeliveriesResult> {
+      if (!Number.isSafeInteger(input.last_global_seq) || input.last_global_seq < 0) {
+        throw new StoreInvariantError(
+          `commitDeliveries.last_global_seq 必须是非负安全整数，收到 ${String(input.last_global_seq)}`,
+        );
+      }
+      const seqs = input.event_ids.map(() => input.last_global_seq);
+      return withStoreTransaction(async (conn) => {
+        const inserted = await conn.query<{ event_id: string }>(
+          `INSERT INTO consumer_deliveries (consumer_id, event_id, event_global_seq)
+           SELECT $1, item.event_id, item.global_seq
+           FROM unnest($2::text[], $3::bigint[]) AS item(event_id, global_seq)
+           ON CONFLICT (consumer_id, event_id) DO NOTHING
+           RETURNING event_id`,
+          [input.consumer_id, input.event_ids, seqs],
+        );
+        const watermark = await conn.query<{ last_global_seq: string }>(
+          `INSERT INTO consumer_watermarks (consumer_id, last_global_seq)
+           VALUES ($1, $2)
+           ON CONFLICT (consumer_id) DO UPDATE
+             SET last_global_seq = GREATEST(consumer_watermarks.last_global_seq, EXCLUDED.last_global_seq),
+                 updated_at = now()
+           RETURNING last_global_seq`,
+          [input.consumer_id, input.last_global_seq],
+        );
+        return {
+          new_deliveries: inserted.rows.length,
+          watermark: toSafeNumber(watermark.rows[0].last_global_seq, 'consumer_watermarks.last_global_seq'),
+        };
+      });
+    }
+
+    async function listDueWaitConditions(now: Date): Promise<DueWaitCondition[]> {
+      const cutoff = now.toISOString();
+      const { rows } = await reader.query<{
+        stream_id: string;
+        type: EventType;
+        payload: unknown;
+      }>(
+        `SELECT stream_id, type, payload FROM events
+         WHERE type IN ('WaitConditionCreated','WaitConditionSatisfied','WaitConditionExpired','WaitConditionCanceled')
+         ORDER BY stream_id ASC, seq ASC`,
+      );
+
+      const conditions = new Map<string, DueWaitCondition & { active: boolean }>();
+      for (const row of rows) {
+        const id = payloadId(row.payload, 'wait_condition_id');
+        if (id === null) continue;
+        const key = `${row.stream_id}\u0000${id}`;
+        if (row.type === 'WaitConditionCreated') {
+          const due_at = payloadField(row.payload, 'due_at');
+          conditions.set(key, {
+            stream_id: row.stream_id,
+            wait_condition_id: id,
+            task_id: payloadField(row.payload, 'task_id'),
+            due_at: due_at ?? '',
+            active: true,
+          });
+        } else {
+          const existing = conditions.get(key);
+          if (existing) existing.active = false;
+        }
+      }
+
+      return [...conditions.values()]
+        .filter((item) => item.active && item.due_at.length > 0 && item.due_at <= cutoff)
+        .map(({ active: _active, ...timer }) => timer)
+        .sort((a, b) => a.due_at.localeCompare(b.due_at) || a.wait_condition_id.localeCompare(b.wait_condition_id));
+    }
+
+    async function listStreams(): Promise<StreamSummary[]> {
+      const { rows } = await reader.query<{
+        stream_id: string;
+        last_seq: string;
+        last_hash: string;
+        updated_at: Date | string;
+        event_count: string;
+      }>(
+        `SELECT h.stream_id, h.last_seq, h.last_hash, h.updated_at,
+                (SELECT count(*) FROM events e WHERE e.stream_id = h.stream_id) AS event_count
+         FROM event_streams h
+         ORDER BY h.stream_id ASC`,
+      );
+      return rows.map((row) => ({
+        stream_id: row.stream_id,
+        last_seq: toSafeNumber(row.last_seq, 'event_streams.last_seq'),
+        last_hash: row.last_hash,
+        updated_at: toIso(row.updated_at),
+        event_count: toSafeNumber(row.event_count, 'events.count'),
+      }));
     }
 
     // -----------------------------------------------------------------------
@@ -1600,7 +2131,10 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       try {
         await conn.query('BEGIN');
         const result = await fn(conn);
-        await conn.query('COMMIT');
+        const committed = await conn.query('COMMIT');
+        if (committed.command !== 'COMMIT') {
+          throw new TransactionCommitError(committed.command ?? null);
+        }
         return result;
       } catch (error) {
         await conn.query('ROLLBACK').catch(() => undefined);
@@ -1611,7 +2145,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     }
 
     /** 同 stream 串行化入口：派生状态与写入必须在同一把行锁内完成（F1）。 */
-    async function ensureAndLockStream(conn: PoolClient, stream_id: string): Promise<void> {
+    async function ensureAndLockStream(conn: PoolClient, stream_id: string): Promise<number> {
       await conn.query(
         `INSERT INTO event_streams (stream_id, last_seq, last_hash)
          VALUES ($1, 0, $2)
@@ -1625,6 +2159,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       if (head.rows.length !== 1) {
         throw new StoreInvariantError(`event_streams 缺少 stream=${stream_id} 的链头行`);
       }
+      return toSafeNumber(head.rows[0].last_seq, 'event_streams.last_seq');
     }
 
     async function findByIdempotencyKey(
@@ -1645,7 +2180,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     // -----------------------------------------------------------------------
 
     type EmitBase = Pick<
-      Parameters<EventStore['append']>[0],
+      AppendEventInput,
       'stream_id' | 'actor_id' | 'actor_kind' | 'causation_id' | 'correlation_id'
     >;
 
@@ -1828,18 +2363,24 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
 
       // 锁内：先做幂等重放检查（避免重放被 F1 的 from 校验误伤），再派生流状态。
       const payload_canonical = canonicalJson(payload);
-      await ensureAndLockStream(conn, input.stream_id);
+      await lockAppendOrder(conn);
+      const head_seq = await ensureAndLockStream(conn, input.stream_id);
+      if (requireProjectCreated && head_seq === 0 && input.type !== 'ProjectCreated') {
+        throw new ProjectCreatedRequiredError(input.stream_id, input.type);
+      }
 
       const existing = await findByIdempotencyKey(conn, input.stream_id, input.idempotency_key);
       if (existing !== null && input.idempotency_key !== null) {
-        if (
-          idempotencyContentMismatch(
-            { ...existing, payload_canonical: canonicalJson(existing.payload) },
-            input,
-            payload_canonical,
-          )
-        ) {
-          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+        const conflicting_fields = idempotencyConflictFields(
+          { ...existing, payload_canonical: canonicalJson(existing.payload) },
+          input,
+          payload_canonical,
+        );
+        if (conflicting_fields.length > 0) {
+          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, {
+            existing_event_id: existing.id,
+            conflicting_fields,
+          });
         }
         return {
           event: existing,
@@ -1848,6 +2389,10 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             from: input.from,
             to: input.to,
             event_type: input.type,
+            run_kind:
+              entity === 'run'
+                ? await deriveRunKind(conn, input.stream_id, subject_id)
+                : undefined,
           }),
           closure: null,
         };
@@ -1894,16 +2439,16 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       }
 
       // ④ F3/F4/F5：客观 fact 由流派生并覆盖调用方自述
+      const runFacts = entity === 'run' ? deriveRunState(facts, subject_id)! : null;
       const derived =
-        entity === 'task'
-          ? derivedTaskFacts(facts, subject_id)
-          : derivedRunFacts(facts, deriveRunState(facts, subject_id)!);
+        entity === 'task' ? derivedTaskFacts(facts, subject_id) : derivedRunFacts(facts, runFacts!);
       const guard = guardTransition({
         entity,
         from: expected_from,
         to: input.to,
         event_type: input.type,
         facts: mergeFacts(input.facts, derived),
+        run_kind: runFacts?.run_kind,
       });
       if (!guard.allowed) throw new TransitionDeniedError(guard);
 
@@ -1960,6 +2505,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     async function appendStateTransition(
       input: AppendStateTransitionInput,
     ): Promise<AppendStateTransitionResult> {
+      if (client === null) assertOutsideTransactionScope(input.stream_id);
       return withStoreTransaction((conn) => appendStateTransitionOn(conn, input));
     }
 
@@ -2043,13 +2589,20 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     ): Promise<TaskCancellationResult> {
       // F13：stream 必须是 Project，不能复用 task_id。
       assertProjectStreamId(input.stream_id, { task_id: input.task_id });
-      await ensureAndLockStream(conn, input.stream_id);
+      await lockAppendOrder(conn);
+      const head_seq = await ensureAndLockStream(conn, input.stream_id);
+      if (requireProjectCreated && head_seq === 0) {
+        throw new ProjectCreatedRequiredError(input.stream_id, 'TaskCancelRequested');
+      }
 
       // 幂等：同 key 已记过取消意图 → 返回首次结果（INV-13）
       const existing = await findByIdempotencyKey(conn, input.stream_id, input.idempotency_key);
       if (existing !== null && input.idempotency_key !== null) {
         if (existing.type !== 'TaskCancelRequested') {
-          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, {
+            existing_event_id: existing.id,
+            conflicting_fields: ['type'],
+          });
         }
         const facts = await deriveStreamFacts(conn, input.stream_id);
         const lifecycle = deriveTaskLifecycle(facts, input.task_id);
@@ -2182,16 +2735,23 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     async function requestTaskCancellation(
       input: RequestTaskCancellationInput,
     ): Promise<TaskCancellationResult> {
+      if (client === null) assertOutsideTransactionScope(input.stream_id);
       return withStoreTransaction((conn) => requestTaskCancellationOn(conn, input));
     }
 
     return {
       append,
+      appendBatch,
       readStream,
       replay,
       appendStateTransition,
       requestTaskCancellation,
       verifyChain,
+      readWatermark,
+      fetchAfterWatermark,
+      commitDeliveries,
+      listStreams,
+      listDueWaitConditions,
     };
   }
 
@@ -2201,10 +2761,15 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     fn: (tx: PgEventStoreTx) => Promise<T>,
   ): Promise<T> {
     const client = await pool.connect();
+    const tx = makeScoped(client);
     try {
       await client.query('BEGIN');
-      const result = await fn(makeScoped(client));
-      await client.query('COMMIT');
+      // S4-①：fn 及其后代异步调用都处于事务作用域内；此时再调外层 store 写会立即报错。
+      const result = await TX_SCOPE.run({}, () => fn(tx));
+      const committed = await client.query('COMMIT');
+      if (committed.command !== 'COMMIT') {
+        throw new TransactionCommitError(committed.command ?? null);
+      }
       return result;
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);

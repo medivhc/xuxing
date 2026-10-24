@@ -957,9 +957,9 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
   assertTypes(step, ['TaskLifecycleChanged', 'TaskLifecycleChanged', 'AssignmentCreated']);
 
   // ======================================================================
-  // 附：human_light Run 在 §3.2 矩阵上走不通（D9 发现的缺口，登记为断言）
+  // 附：human_light Run 走 REQ-HUM-1 的 created → running（D9-J2 已在 Batch 2 关闭）
   // ======================================================================
-  await r.begin('附 S7：human_light Run 的 created→running 被内核矩阵拒绝（登记缺口）', ['§2.4 INV-4', '§3.2', 'REQ-HUM-1', 'S3']);
+  await r.begin('附 S7：human_light Run 走 REQ-HUM-1（created→running）', ['§2.4 INV-4', '§3.2', 'REQ-HUM-1', 'S3']);
 
   await r.emit('RunCreated', {
     run_id: D8.runHumanLight, task_id: D8.followupTask,
@@ -970,11 +970,15 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
     actor_id: HUMAN.id, actor_version: 'human', idempotency_key: 'run-d8-humanlight-1',
     side_effect_level: 'L0' as SideEffectLevel,
   }, HUMAN);
-  const denied = await r.transitionRunDenied({ run_id: D8.runHumanLight, type: 'RunStarted', from: 'created', to: 'running', actor: HUMAN });
-  r.note(`FINDING D9-J2：REQ-HUM-1 要求 human_light 走 created→running，§3.2 矩阵（src/kernel 实现）判 ${denied}。旅程在此停住该 Run，不伪造合法迁移。`);
+  await r.transitionRun({ run_id: D8.runHumanLight, type: 'RunStarted', from: 'created', to: 'running', actor: HUMAN });
+  const executorCell = await r.transitionRunDenied({ run_id: D8.runImport, type: 'RunStarted', from: 'succeeded', to: 'running' });
+  r.note(
+    'D9-J2 关闭：human_light 由 run_kind 维度按 REQ-HUM-1 放行 created→running；' +
+      `executor 终态复活仍被 §3.2 拒绝（reason=${executorCell}）。`,
+  );
 
   step = await r.end();
-  assertTypes(step, ['RunCreated']);
+  assertTypes(step, ['RunCreated', 'RunStarted']);
 
   return { steps: r.steps, projection, seenProposals };
 }

@@ -166,7 +166,9 @@ let store: PgEventStore;
 beforeAll(async () => {
   ctx = await createTestPg();
   await migrate(ctx.pool);
-  store = createPgEventStore(ctx.pool, { clock: () => FIXED_NOW });
+  // 本套用例验证 store 机制（链/幂等/并发），使用不含 ProjectCreated 的局部流；
+  // 项目流存在性由 tests/event-store-batch2.test.ts 的 S3-② 用例覆盖（生产默认强制）。
+  store = createPgEventStore(ctx.pool, { clock: () => FIXED_NOW, requireProjectCreated: false });
 });
 
 afterAll(async () => {
@@ -284,6 +286,7 @@ describe('INV-12：哈希链', () => {
     expect(verification).toEqual({
       ok: true,
       stream_id: STREAM,
+      broken_in: null,
       length: 5,
       broken_at_seq: null,
       reason: null,
@@ -437,7 +440,7 @@ describe('并发与 seq 原子分配', () => {
     expect((await store.verifyChain(STREAM)).ok).toBe(true);
   });
 
-  it('跨 stream 并发互不阻塞，global_seq 全库唯一', async () => {
+  it('跨 stream 并发：各流 seq 独立、global_seq 全库唯一（S5 起写路径全局串行，提交序=seq 序）', async () => {
     const results = await Promise.all([
       ...Array.from({ length: 5 }, (_, i) =>
         store.append(input({ stream_id: asProjectId('project-X'), payload: { i } }))),
@@ -472,7 +475,7 @@ describe('读路径：含起点语义（A5）', () => {
 
 describe('接口一致性（接线第一层证据）', () => {
   it('createPgEventStore 可赋给 EventStore 接口并只经接口方法使用', async () => {
-    const asInterface: EventStore = createPgEventStore(ctx.pool, { clock: () => FIXED_NOW });
+    const asInterface: EventStore = createPgEventStore(ctx.pool, { clock: () => FIXED_NOW, requireProjectCreated: false });
     const envelope = await asInterface.append(input());
     expect(envelope.seq).toBe(1);
     expect(await asInterface.readStream(STREAM)).toHaveLength(1);
@@ -1196,18 +1199,19 @@ describe('F7：TaskLifecycleChanged 的 trigger_event_id', () => {
 });
 
 describe('verifyChain 运维真实性（F-b）', () => {
-  it('不存在的 stream → ok:false / stream_not_found（不冒充健康空流）', async () => {
+  it('不存在的 stream → ok:false / 中文 reason（不冒充健康空流，杂-1②）', async () => {
     expect(await store.verifyChain(asProjectId('proj-TYPO'))).toEqual({
       ok: false,
       stream_id: 'proj-TYPO',
       length: 0,
       broken_at_seq: null,
-      reason: 'stream_not_found',
+      broken_in: null,
+      reason: '流不存在：event_streams 里没有该 stream 的链头行（stream_not_found）',
       stream_exists: false,
     });
     expect(await store.verifyChain('' as ProjectId)).toMatchObject({
       ok: false,
-      reason: 'stream_not_found',
+      reason: expect.stringContaining('流不存在'),
       stream_exists: false,
     });
   });
@@ -1238,8 +1242,12 @@ describe('verifyChain 运维真实性（F-b）', () => {
 
     const verification = await store.verifyChain(STREAM);
     expect(verification.ok).toBe(false);
-    expect(verification.broken_at_seq).toBe(9);
+    // 杂-1③：断点在链头行本身；broken_at_seq 给 events 的真实末行而不是链头声称的 9
+    expect(verification.broken_at_seq).toBe(1);
+    expect(verification.broken_in).toBe('stream_head');
     expect(verification.reason).toContain('链头 last_seq');
+    expect(verification.reason).toContain('链头声称 last_seq=9');
+    expect(verification.reason).toContain('断点在链头行');
   });
 });
 
@@ -1410,7 +1418,9 @@ describe('校验器嵌在写路径：非法迁移不产生事件（接线审计�
     expect(await countEvents(ctx.pool)).toBe(0);
   });
 
-  it('append 对 TaskLifecycleChanged 做格合法性纵深防御（绕过 appendStateTransition 也拦）', async () => {
+  it('append 对 TaskLifecycleChanged 做格合法性纵深防御 + R1 流状态对账（绕过 appendStateTransition 也拦）', async () => {
+    // R1：生命周期迁移必须有事件流事实（TaskCaptured 先行），否则就是凭空建状态。
+    await store.append(input());
     const before = await countEvents(ctx.pool);
 
     await expect(
@@ -1426,6 +1436,20 @@ describe('校验器嵌在写路径：非法迁移不产生事件（接线审计�
     ).rejects.toBeInstanceOf(TransitionDeniedError);
     expect(await countEvents(ctx.pool)).toBe(before);
 
+    // R1：格合法但 from 与流派生状态不符 → 同样拒绝（否则可写出互斥分支）。
+    await expect(
+      store.append(input({
+        type: 'TaskLifecycleChanged',
+        payload: {
+          task_id: TASK_ID,
+          from: 'ready',
+          to: 'active',
+          trigger_event_id: 'trigger-stale-from',
+        },
+      })),
+    ).rejects.toBeInstanceOf(TransitionStateError);
+    expect(await countEvents(ctx.pool)).toBe(before);
+
     const ok = await store.append(input({
       type: 'TaskLifecycleChanged',
       payload: {
@@ -1435,7 +1459,7 @@ describe('校验器嵌在写路径：非法迁移不产生事件（接线审计�
         trigger_event_id: 'trigger-ok',
       },
     }));
-    expect(ok.seq).toBe(1);
+    expect(ok.seq).toBe(2);
   });
 });
 

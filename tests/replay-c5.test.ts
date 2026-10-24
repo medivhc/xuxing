@@ -97,7 +97,8 @@ beforeAll(async () => {
   ctx = await createTestPg();
   await migrate(ctx.pool);
   await createProjectionTables(ctx.pool);
-  store = createPgEventStore(ctx.pool, { clock: () => FIXED_NOW });
+  // C5 夹具以局部流（无 ProjectCreated）铺 30 条事件；项目流存在性由 S3-② 用例覆盖。
+  store = createPgEventStore(ctx.pool, { clock: () => FIXED_NOW, requireProjectCreated: false });
 });
 
 afterAll(async () => {

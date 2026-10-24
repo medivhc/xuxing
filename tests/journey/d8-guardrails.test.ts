@@ -188,7 +188,7 @@ describe('§3.1 Task 矩阵硬拒', () => {
   });
 });
 
-describe('§3.2 Run 矩阵硬拒 + FINDING D9-J2', () => {
+describe('§3.2 Run 矩阵硬拒 + D9-J2（Batch 2 关闭）', () => {
   it('终态 Run 再迁移（succeeded → running）⇒ 被拒', async () => {
     const error = await expectRefused(
       '终态 Run 复活',
@@ -291,22 +291,28 @@ describe('§3.2 Run 矩阵硬拒 + FINDING D9-J2', () => {
     expect(silentAllow.filter((entry) => /→captured$|→created$/.test(entry))).toEqual([]);
   });
 
-  it('FINDING D9-J2：REQ-HUM-1 要的 human_light created→running 在实现矩阵上是空格（旅程不伪造）', async () => {
-    const cell = isMatrixCellAllowed('run', 'created', 'running');
-    expect(cell.allowed).toBe(false);
-    expect(cell.basis.note).toBe('未经租约不可启动');
-    const error = await expectRefused(
-      'human_light created→running',
-      () => store.appendStateTransition({
-        stream_id: D8.project, type: 'RunStarted', actor_id: 'actor-human-1', actor_kind: 'human',
-        causation_id: null, correlation_id: 'd9-guardrails', idempotency_key: null,
-        payload: { run_id: D8.runHumanLight }, entity: 'run', from: 'created', to: 'running',
-      }),
-      TransitionDeniedError,
-    ) as TransitionDeniedError;
-    expect(error.result.reason).toBe('illegal_transition');
-    // 合法替代路径存在（created→queued→leased→running），但 spec REQ-HUM-1 未要求人走租约
-    expect(isMatrixCellAllowed('run', 'created', 'queued').allowed).toBe(true);
+  it('D9-J2 关闭：human_light created→running 由 run_kind 维度按 REQ-HUM-1 放行', () => {
+    // executor 的 §3.2 格不变（未经租约不可启动）
+    const executorCell = isMatrixCellAllowed('run', 'created', 'running');
+    expect(executorCell.allowed).toBe(false);
+    expect(executorCell.basis.note).toBe('未经租约不可启动');
+
+    // human_light 维度按 REQ-HUM-1 放行（无租约/无队列/无超时）
+    expect(isMatrixCellAllowed('run', 'created', 'running', 'human_light').allowed).toBe(true);
+    expect(
+      guardTransition({
+        entity: 'run', event_type: 'RunStarted', from: 'created', to: 'running', run_kind: 'human_light',
+      }).allowed,
+    ).toBe(true);
+    // 但 REQ-HUM-1 明确不出现 leased / indeterminate / timed_out
+    for (const to of ['queued', 'leased', 'indeterminate', 'timed_out'] as const) {
+      expect(
+        guardTransition({
+          entity: 'run', event_type: 'RunStarted', from: 'created', to, run_kind: 'human_light',
+        }).allowed,
+        `human_light created→${to}`,
+      ).toBe(false);
+    }
   });
 });
 

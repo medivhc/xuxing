@@ -122,7 +122,7 @@ test.describe('D8 完整旅程（浏览器级）：Capture → 计划 → 派活
   });
 
   test('⑦ 人在环轻执行路径（human_light）：G1 的等待与跟进唯一化', async ({ page }) => {
-    test.skip(!UI_READY, 'E1/E2/E3 未就绪；另需先解掉 FINDING D9-J2（§3.2 无 created→running 格）');
+    test.skip(!UI_READY, 'E1/E2/E3 未就绪');
     await page.goto(`/projects/${PROJECT_ID}/my-actions`);
     await expect(page.getByTestId(TESTID.myActionsRow)).not.toHaveCount(0);
     // 断言意图（G1）：add_wait + add_task + add_edge 一次 PlanChange 完成；
