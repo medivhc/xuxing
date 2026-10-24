@@ -8,7 +8,7 @@
 //      条目消失。断言口径：在场 + 可点 + 状态真变（API 回读为准）。
 import { test, expect } from '@playwright/test';
 import { JOURNEY_BASE_URL, USING_EXTERNAL_SERVICE } from '../journeys.config.mts';
-import { findDecisionAction, getActions, getProject, getProposal } from '../support/api.mts';
+import { findDecisionAction, getActions, getProject, getProposal, postCommand } from '../support/api.mts';
 import { startStaticWeb, type StaticWeb } from '../support/static-web.mts';
 
 const PROJECT_ID = 'proj-degraded';
@@ -70,14 +70,32 @@ test('J1：待我处理页裁决两条种子决策，批准落图、拒绝留痕
   expect(findDecisionAction(actionsAfterApprove, DECISION_1)).toBeUndefined();
   expect(findDecisionAction(actionsAfterApprove, DECISION_2)).toBeTruthy();
 
-  // ② 拒绝 dec-degraded-2（不填理由先被前端拦下，再填理由提交）
+  // ② 拒绝 dec-degraded-2：空理由时提交按钮呈 disabled 态（前端拦截的
+  // 实现形态，B-01 口径）——断言 disabled + 面板在场 + Decision 仍 pending
+  // （API 回读，无请求发出）；服务端 400 兜底以同 payload 的 API 级断言
+  // 在本旅程内补验；填理由后按钮启用再提交。
   const row2 = decisionRow('归档旧版合同模板');
   await row2.getByTestId('decision-resolve-toggle').click();
   await row2.getByTestId('decision-verdict-rejected').click();
-  await row2.getByTestId('decision-submit').click();
-  await expect(row2.getByTestId('decision-resolve-panel')).toBeVisible(); // 未提交成功，面板还在
+  const submit2 = row2.getByTestId('decision-submit');
+  await expect(submit2).toBeDisabled();
+  await expect(row2.getByTestId('decision-resolve-panel')).toBeVisible();
+  expect(findDecisionAction(await getActions(request), DECISION_2)).toBeTruthy();
+  const badResolve = await postCommand(
+    request,
+    'resolve_decision',
+    { decision_id: DECISION_2, verdict: 'rejected' },
+    `j1-empty-reason-${Date.now()}`,
+  );
+  expect(badResolve.status).toBe(400);
+  expect((badResolve.body as { error: { detail: unknown } }).error.detail).toMatchObject({
+    reason: 'schema_invalid',
+    field: 'reason',
+  });
+  expect(findDecisionAction(await getActions(request), DECISION_2)).toBeTruthy(); // 400 零效果
   await row2.getByTestId('decision-reason-input').fill('范围重复，归档另行立项');
-  await row2.getByTestId('decision-submit').click();
+  await expect(submit2).toBeEnabled();
+  await submit2.click();
   await expect(decisionRow('归档旧版合同模板')).toHaveCount(0);
 
   const change2 = await getProposal(request, CHANGE_2);
