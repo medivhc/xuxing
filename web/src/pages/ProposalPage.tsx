@@ -63,101 +63,85 @@ export function ProposalPage() {
     );
   }
 
-  const canAccept = data.available_actions.includes('proposal_accept');
-  const canReject = data.available_actions.includes('proposal_reject');
+  const isPending = data.status === 'pending';
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <header className="flex items-center justify-between gap-3">
-        <h1 className="text-title font-semibold text-text-primary">提议</h1>
+        <h1 className="text-title font-semibold text-text-primary">提议详情</h1>
         <SyncBadge meta={data} />
       </header>
 
       {data.degraded ? (
         <div
           data-testid="proposal-degraded-banner"
-          className="rounded-m border border-warning bg-warning-subtle p-4"
           role="alert"
+          className="rounded-m border border-warning/40 bg-warning-subtle p-4"
         >
-          <DegradedBadge reason={data.degraded_reason} />
+          <div className="flex items-center gap-2">
+            <DegradedBadge />
+            <p className="text-body-s font-medium text-warning">
+              这是降级提议：解释器未能高置信度理解该捕获，接受前请人工核对。
+            </p>
+          </div>
+          {data.degraded_reason ? (
+            <p className="mt-2 text-body-s text-text-secondary">原因：{data.degraded_reason}</p>
+          ) : null}
         </div>
       ) : null}
 
       <section className="rounded-m border border-border bg-surface p-5 shadow-1">
-        <h2 className="text-title-s font-semibold text-text-primary">{data.proposed.title}</h2>
-        <p className="mt-2 text-body-s text-text-secondary">{data.proposed.description}</p>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-title-s font-semibold text-text-primary">{data.summary}</h2>
+          <span className="text-caption text-text-tertiary">
+            {formatAbsolute(data.created_at)} · 状态 {data.status}
+          </span>
+        </div>
         <dl className="mt-3 space-y-1 text-body-s">
           <div className="flex gap-2">
-            <dt className="shrink-0 text-text-tertiary">捕获</dt>
-            <dd className="font-mono text-caption text-text-tertiary">{data.capture_id}</dd>
+            <dt className="shrink-0 text-text-tertiary">标题</dt>
+            <dd className="text-text-primary">{data.proposed.title}</dd>
           </div>
           <div className="flex gap-2">
-            <dt className="shrink-0 text-text-tertiary">状态</dt>
-            <dd className="text-text-primary">{data.status}</dd>
+            <dt className="shrink-0 text-text-tertiary">描述</dt>
+            <dd className="text-text-secondary">{data.proposed.description}</dd>
           </div>
-          <div className="flex gap-2">
-            <dt className="shrink-0 text-text-tertiary">创建</dt>
-            <dd className="text-text-secondary">{formatAbsolute(data.created_at)}</dd>
-          </div>
+          {data.proposed.assignee_hint ? (
+            <div className="flex gap-2">
+              <dt className="shrink-0 text-text-tertiary">建议执行者</dt>
+              <dd className="font-mono text-body-s text-text-secondary">
+                {data.proposed.assignee_hint}
+              </dd>
+            </div>
+          ) : null}
         </dl>
+
+        <h3 className="mt-4 text-body-s font-medium text-text-primary">
+          验收判据（{data.proposed.acceptance_criteria.length} 条）
+        </h3>
+        <ul className="mt-1 space-y-1">
+          {data.proposed.acceptance_criteria.map((criterion) => (
+            <li key={criterion.criterion_ref} className="flex gap-2 text-body-s">
+              <span className="font-mono text-caption text-text-tertiary">
+                {criterion.criterion_ref}
+              </span>
+              <span className="text-text-secondary">{criterion.text}</span>
+              <span className="shrink-0 text-caption text-text-tertiary">
+                {criterion.kind === 'auto' ? '自动' : '人工'}
+              </span>
+            </li>
+          ))}
+        </ul>
       </section>
 
-      <section className="rounded-m border border-border bg-surface p-5 shadow-1">
-        <h2 className="text-title-s font-semibold text-text-primary">验收判据（draft）</h2>
-        {data.proposed.acceptance_criteria.length === 0 ? (
-          <p className="mt-2 text-body-s text-text-tertiary">无验收判据。</p>
-        ) : (
-          <ul data-testid="proposal-criteria" className="mt-2 space-y-1">
-            {data.proposed.acceptance_criteria.map((criterion) => (
-              <li key={criterion.criterion_ref} className="flex items-center gap-2 text-body-s">
-                <span className="rounded-s bg-info-subtle px-2 py-0.5 text-caption font-medium text-info">
-                  {criterion.kind === 'auto' ? '自动' : '人工'}
+      {isPending ? (
+        <section className="flex flex-wrap items-center gap-3">
+          {data.available_actions.includes('proposal_accept') ? (
+            confirmAccept ? (
+              <div className="flex flex-wrap items-center gap-2 rounded-m border border-border bg-subtle p-3">
+                <span className="text-body-s text-text-secondary">
+                  {data.degraded ? '降级提议：确认已人工核对后接受？' : '确认接受该提议并生成任务？'}
                 </span>
-                <span className="text-text-primary">{criterion.text}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-        <p className="mt-3 text-caption text-text-tertiary">
-          判据为提议草稿；任务 id 在提议被接受后由服务端生成（R-11）。
-        </p>
-      </section>
-
-      {data.status === 'pending' && (canAccept || canReject) ? (
-        <section className="rounded-m border border-border bg-surface p-5 shadow-1">
-          <div className="flex flex-wrap gap-2">
-            {canAccept ? (
-              <PendingButton
-                pending={accept.isPending}
-                onClick={() => setConfirmAccept(true)}
-                testId="proposal-action-accept"
-              >
-                接受提议
-              </PendingButton>
-            ) : null}
-            {canReject ? (
-              <PendingButton
-                variant="secondary"
-                pending={reject.isPending}
-                onClick={() =>
-                  reject.mutate({
-                    idemKey: `cmd:proposal_reject:${data.proposal_id}`,
-                    payload: { proposal_id: data.proposal_id },
-                  })
-                }
-                testId="proposal-action-reject"
-              >
-                拒绝提议
-              </PendingButton>
-            ) : null}
-          </div>
-
-          {confirmAccept && canAccept ? (
-            <div className="mt-3 rounded-m border border-warning bg-warning-subtle p-3">
-              <p className="text-body-s text-text-primary">
-                接受后将生成任务并进入执行/验收流程，是否确认？
-              </p>
-              <div className="mt-2 flex gap-2">
                 <PendingButton
                   pending={accept.isPending}
                   onClick={() =>
@@ -166,25 +150,55 @@ export function ProposalPage() {
                       payload: { proposal_id: data.proposal_id },
                     })
                   }
-                  testId="proposal-action-accept-confirm"
+                  testId="proposal-accept-confirm"
                 >
                   确认接受
                 </PendingButton>
                 <PendingButton
                   variant="secondary"
                   onClick={() => setConfirmAccept(false)}
-                  testId="proposal-action-accept-cancel"
+                  testId="proposal-accept-cancel"
                 >
-                  再想想
+                  取消
                 </PendingButton>
               </div>
-            </div>
+            ) : (
+              <PendingButton
+                onClick={() => setConfirmAccept(true)}
+                testId="proposal-accept"
+              >
+                {data.degraded ? '核对后接受…' : '接受提议'}
+              </PendingButton>
+            )
           ) : null}
-
-          <ErrorBanner error={accept.error} />
-          <ErrorBanner error={reject.error} />
+          {data.available_actions.includes('proposal_reject') ? (
+            <PendingButton
+              variant="secondary"
+              pending={reject.isPending}
+              onClick={() =>
+                reject.mutate({
+                  idemKey: `cmd:proposal_reject:${data.proposal_id}`,
+                  payload: { proposal_id: data.proposal_id },
+                })
+              }
+              testId="proposal-reject"
+            >
+              拒绝
+            </PendingButton>
+          ) : null}
         </section>
-      ) : null}
+      ) : (
+        <p data-testid="proposal-terminal" className="rounded-m border border-border bg-subtle p-4 text-body-s text-text-secondary">
+          该提议已处理（{data.status}）。
+        </p>
+      )}
+
+      <ErrorBanner error={accept.error} />
+      <ErrorBanner error={reject.error} />
+
+      <Link to="/capture" className="inline-block text-body-s text-accent hover:underline">
+        返回捕获
+      </Link>
     </div>
   );
 }
