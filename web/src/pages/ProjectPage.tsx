@@ -1,7 +1,10 @@
 // Project（GET /api/projects/:projectId，契约 §5 P-*）：单项目工作台——
-// 概览（目标/计划版本/计数）、任务列表、逐判据验收（P-A5/OQ-03=A）、
+// 概览（目标/验收摘要/待处理提议）、任务列表、逐判据验收（P-A5/OQ-03=A）、
 // 聚焦子图只读渲染（P-GRAPH/OQ-09=A：固定 1-hop depends_on + data_from，
 // 不显示 conflicts_with/supersedes，不允许编辑）。
+//
+// 投影键集（FIX-ROUND-1 R-8）：{project, goal, tasks, acceptance_status,
+// graph, pending_proposals}——与真实投影一致，不再有 mock 漂移。
 //
 // 验收动作只落在 awaiting_acceptance 任务上（OQ-02=A：不进 My Actions，
 // 由 Home attention「待验收」跳转至此）。
@@ -166,7 +169,7 @@ export function ProjectPage() {
   return (
     <div className="space-y-6">
       <header className="flex items-center justify-between gap-3">
-        <h1 className="text-title font-semibold text-text-primary">{data.name}</h1>
+        <h1 className="text-title font-semibold text-text-primary">{data.project.name}</h1>
         <SyncBadge meta={data} />
       </header>
 
@@ -203,12 +206,49 @@ export function ProjectPage() {
           <p className="mt-2 text-body-s text-text-tertiary">未设定目标。</p>
         )}
         <p className="mt-3 text-caption text-text-tertiary">
-          计划版本 rev {data.plan_rev}
-          {data.plan_history.length > 0
-            ? ` · 最近更新 ${formatAbsolute(data.plan_history[data.plan_history.length - 1].applied_at)}`
-            : ''}
+          验收为本页操作落点（OQ-02=A）：待验收动作只出现在 awaiting_acceptance 任务上。
         </p>
       </section>
+
+      <section aria-label="验收摘要" className="rounded-m border border-border bg-surface p-5 shadow-1">
+        <h2 className="text-title-s font-semibold text-text-primary">验收</h2>
+        <p className="mt-2 text-body-s text-text-secondary">
+          待验收 {data.acceptance_status.awaiting_task_ids.length} 项 · 已记录{' '}
+          {data.acceptance_status.recorded_count} 项
+        </p>
+        {data.acceptance_status.outstanding.length > 0 ? (
+          <ul data-testid="acceptance-outstanding" className="mt-2 space-y-1">
+            {data.acceptance_status.outstanding.map((item) => (
+              <li key={item.task_id} className="text-caption text-warning">
+                {item.title}（{item.task_id}）待补 {item.pending_criteria.length} 条判据
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </section>
+
+      {data.pending_proposals.length > 0 ? (
+        <section aria-label="待处理提议" className="rounded-m border border-border bg-surface p-5 shadow-1">
+          <h2 className="text-title-s font-semibold text-text-primary">
+            待处理提议（{data.pending_proposals.length}）
+          </h2>
+          <ul data-testid="project-pending-proposals" className="mt-2 space-y-2">
+            {data.pending_proposals.map((proposal) => (
+              <li key={proposal.proposal_id} className="flex items-center justify-between gap-2">
+                <Link
+                  to={`/capture/${proposal.proposal_id}`}
+                  className="text-body-s text-accent hover:underline"
+                >
+                  {proposal.summary}
+                </Link>
+                <span className="text-caption text-text-tertiary">
+                  {formatAbsolute(proposal.created_at)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
 
       <section aria-label="任务列表">
         <h2 className="mb-2 text-title-s font-semibold text-text-primary">
@@ -227,26 +267,26 @@ export function ProjectPage() {
         )}
       </section>
 
-      {data.focused_subgraph ? (
+      {data.graph ? (
         <section aria-label="聚焦子图" className="rounded-m border border-border bg-surface p-5 shadow-1">
           <h2 className="text-title-s font-semibold text-text-primary">聚焦子图（只读）</h2>
           <p className="mt-1 text-caption text-text-tertiary">
             固定 1-hop depends_on + data_from；不显示 conflicts_with/supersedes，不可编辑。
           </p>
           <ul data-testid="subgraph-nodes" className="mt-3 space-y-1">
-            {data.focused_subgraph.nodes.map((node) => (
+            {data.graph.nodes.map((node) => (
               <li key={node.task_id} className="flex items-center gap-2 text-body-s">
                 <LifecycleBadge lifecycle={node.lifecycle} />
                 <span className="text-text-primary">{node.title}</span>
-                {node.task_id === data.focused_subgraph?.root_task_id ? (
+                {node.task_id === data.graph?.root_task_id ? (
                   <span className="text-caption text-text-tertiary">（根）</span>
                 ) : null}
               </li>
             ))}
           </ul>
-          {data.focused_subgraph.edges.length > 0 ? (
+          {data.graph.edges.length > 0 ? (
             <ul data-testid="subgraph-edges" className="mt-2 space-y-1">
-              {data.focused_subgraph.edges.map((edge) => (
+              {data.graph.edges.map((edge) => (
                 <li key={edge.edge_id} className="font-mono text-caption text-text-secondary">
                   {edge.from_task} → {edge.to_task}（{edge.kind}）
                 </li>
