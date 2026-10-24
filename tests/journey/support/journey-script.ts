@@ -282,7 +282,7 @@ class JourneyRunner {
             stream_id: D8.project, type: 'TaskLifecycleChanged',
             actor_id: KERNEL.id, actor_kind: KERNEL.kind,
             causation_id: null, correlation_id: 'd8-journey', idempotency_key: null,
-            payload: { task_id }, entity: 'task', from, to, facts,
+            payload: { task_id, trigger_event_id: `acceptance-recorded:${D8.acceptanceFinal}` }, entity: 'task', from, to, facts,
           });
           return result.guard.required_effects ?? [];
         },
@@ -556,7 +556,7 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
   await r.transitionTask({
     task_id: D8.importTask, from: 'captured', to: 'defined',
     facts: { hasTitle: true, assigneeKind: 'agent', contractStructured: true },
-    extra: { trigger_event_id: null, contract_rev: 1 },
+    extra: { trigger_event_id: `plan-applied:${D8.planChange}`, contract_rev: 1 }, // F7：触发事件=主计划应用（确定性 id，保 D9-4 重放逐字节一致）
   });
   await r.sync();
   const ready = computeReady(projection, D8.importTask);
@@ -564,7 +564,8 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
   const reportNotReady = computeReady(projection, D8.reportTask);
   r.note(`下游 report ready → ready=${reportNotReady.ready} 原因=${reportNotReady.reasons.join(' | ')}`);
 
-  await r.transitionTask({ task_id: D8.importTask, from: 'defined', to: 'ready' });
+  // F5 对齐：defined→ready 的 REQ-SCH-1 事实已由内核 guard 编码，写路径须显式给出（派生项 waitStateNone/duplicateSuspect 由流派生）
+  await r.transitionTask({ task_id: D8.importTask, from: 'defined', to: 'ready', facts: { dependenciesSatisfied: true, dataInputsAvailable: true, capabilityAvailable: true, policyAllows: true }, extra: { trigger_event_id: `plan-applied:${D8.planChange}` } });
   await r.emit('AssignmentCreated', {
     assignment_id: D8.assignmentImport, task_id: D8.importTask,
     actor_id: EXECUTOR.id, actor_kind: 'agent', role: 'executor',
@@ -587,7 +588,7 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
   };
   const beforeHash = canonicalJson(inputSnapshot);
 
-  await r.transitionTask({ task_id: D8.importTask, from: 'ready', to: 'active', extra: { triggered_by: '派发 Run' } });
+  await r.transitionTask({ task_id: D8.importTask, from: 'ready', to: 'active', facts: { runDispatched: true }, extra: { triggered_by: '派发 Run', trigger_event_id: `assignment-created:${D8.assignmentImport}` } }); // F5：ready→active 须带 runDispatched 事实；F7：触发事件=AssignmentCreated
   await r.emit('RunCreated', {
     run_id: D8.runImport, task_id: D8.importTask, assignment_id: D8.assignmentImport,
     run_kind: 'executor', task_rev: 1, contract_rev: 1, plan_rev: 1,
@@ -748,7 +749,7 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
     run_id: D8.runImport, type: 'RunSucceeded', from: 'running', to: 'succeeded', actor: EXECUTOR,
     payload: { budget: { estimated: 32000, actual: 9340, unit: 'token' }, finished_at: FIXED_NOW.toISOString() },
   });
-  await r.transitionTask({ task_id: D8.importTask, from: 'active', to: 'awaiting_acceptance', extra: { trigger: 'Run 出 Outcome', outcome_id: D8.outcomePartial } });
+  await r.transitionTask({ task_id: D8.importTask, from: 'active', to: 'awaiting_acceptance', extra: { trigger: 'Run 出 Outcome', outcome_id: D8.outcomePartial, trigger_event_id: `run-succeeded:${D8.runImport}` } }); // F7：触发事件=RunSucceeded
 
   step = await r.end();
   assertTypes(step, ['OutcomeRecorded', 'RunSucceeded', 'TaskLifecycleChanged']);
@@ -781,7 +782,7 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
     target_ref: 'actor-human-2', due_at: '2026-10-30T00:00:00.000Z', followup_task_id: D8.followupTask,
   }, KERNEL);
   const mappedWait = waitStateForConditionKind('person');
-  await r.emit('TaskWaitStateChanged', { task_id: D8.importTask, from: 'none', to: mappedWait ?? 'waiting_on_person', reason: 'WaitCondition kind=person（§3.1 映射表）', set_by: KERNEL.id }, KERNEL);
+  await r.emit('TaskWaitStateChanged', { task_id: D8.importTask, from: 'none', to: mappedWait ?? 'waiting_on_person', reason: 'WaitCondition kind=person（§3.1 映射表）', set_by: KERNEL.id, actor_id: KERNEL.id, actor_kind: KERNEL.kind }, KERNEL); // F12：payload 须带与信封一致的置位 actor
   await r.emit('PlanRevisionCreated', { rev: 4, change_id: followupPlan.change_id, applied_at: FIXED_NOW.toISOString(), diff_summary: '+1 Task, +1 Edge, +1 WaitCondition' }, KERNEL);
   r.note(`跟进 Task 唯一：followup_task_id=${D8.followupTask}；wait_state 映射自内核 WAIT_STATE_BY_CONDITION_KIND → ${mappedWait}`);
 
@@ -923,7 +924,7 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
   // INV-11：终态迁移同事务自动收尾（先 canceled → wait 归 none → lifecycle accepted）
   const inv11Effects = await r.withTransaction(async (tx) => {
     await tx.append('WaitConditionCanceled', { wait_condition_id: D8.waitCondition, reason: 'INV-11 终态收尾' });
-    await tx.append('TaskWaitStateChanged', { task_id: D8.importTask, from: 'waiting_on_person', to: 'none', reason: 'INV-11 终态收尾归 none' });
+    await tx.append('TaskWaitStateChanged', { task_id: D8.importTask, from: 'waiting_on_person', to: 'none', reason: 'INV-11 终态收尾归 none', actor_id: KERNEL.id, actor_kind: KERNEL.kind }); // F12 对齐
     return tx.transitionTask(D8.importTask, 'awaiting_acceptance', 'accepted', { acceptanceVerdict: 'accepted' });
   });
   r.note(`INV-11 收尾：required_effects=${inv11Effects.join('+')} → 同事务 3 事件提交`);
@@ -939,12 +940,12 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
 
   await r.begin('⑥e 下游 report 依赖满足 → ready（REQ-ACC-1 跨 rev + REQ-SCH-1/2）', ['REQ-SCH-1', 'REQ-SCH-2', 'REQ-ACC-1', 'S1', 'REQ-ASG-1']);
 
-  await r.transitionTask({ task_id: D8.reportTask, from: 'captured', to: 'defined', facts: { hasTitle: true, assigneeKind: 'human' }, extra: { contract_rev: 0 } });
+  await r.transitionTask({ task_id: D8.reportTask, from: 'captured', to: 'defined', facts: { hasTitle: true, assigneeKind: 'human' }, extra: { contract_rev: 0, trigger_event_id: `plan-applied:${D8.planChange}` } }); // F7：触发事件=主计划应用
   await r.sync();
   const reportReady = computeReady(projection, D8.reportTask);
   r.note(`report ready 判定 → ready=${reportReady.ready} 原因=${reportReady.reasons.join(' | ') || '（无）'}；上游 latest_accepted 指针=${projection.latestAcceptedOutcome(D8.importTask)}`);
   if (!reportReady.ready) throw new Error(`上游已 accepted，report 理应 ready：${reportReady.reasons.join(' | ')}`);
-  await r.transitionTask({ task_id: D8.reportTask, from: 'defined', to: 'ready' });
+  await r.transitionTask({ task_id: D8.reportTask, from: 'defined', to: 'ready', facts: { dependenciesSatisfied: true, dataInputsAvailable: true, capabilityAvailable: true, policyAllows: true }, extra: { trigger_event_id: `task-accepted:${D8.importTask}` } }); // F5 对齐，同 ③a；F7：触发事件=上游 Task accepted
   await r.emit('AssignmentCreated', {
     assignment_id: D8.assignmentReport, task_id: D8.reportTask, actor_id: HUMAN.id, actor_kind: 'human',
     role: 'reviewer', scope_note: '按导入产物复核映射成功率报告', created_via: 'human-ui',
