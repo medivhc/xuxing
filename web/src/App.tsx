@@ -1,4 +1,5 @@
 import { NavLink, Route, Routes } from 'react-router-dom';
+import { AuthGate } from './components/AuthGate';
 import { ConnectionBadge } from './components/ConnectionBadge';
 import { HomePage } from './pages/HomePage';
 import { CapturePage } from './pages/CapturePage';
@@ -53,18 +54,20 @@ function Layout({ children }: { children: React.ReactNode }) {
 
 export default function App() {
   return (
-    <Layout>
-      <div className="xux-anim-route">
-        <Routes>
-          <Route path="/" element={<HomePage />} />
-          <Route path="/capture" element={<CapturePage />} />
-          <Route path="/capture/:proposalId" element={<ProposalPage />} />
-          <Route path="/actions" element={<MyActionsPage />} />
-          <Route path="/projects" element={<ProjectsPage />} />
-          <Route path="/projects/:projectId" element={<ProjectPage />} />
-          <Route path="*" element={<NotFoundPage />} />
-        </Routes>
-      </div>
-    </Layout>
+    <AuthGate>
+      <Layout>
+        <div className="xux-anim-route">
+          <Routes>
+            <Route path="/" element={<HomePage />} />
+            <Route path="/capture" element={<CapturePage />} />
+            <Route path="/capture/:proposalId" element={<ProposalPage />} />
+            <Route path="/actions" element={<MyActionsPage />} />
+            <Route path="/projects" element={<ProjectsPage />} />
+            <Route path="/projects/:projectId" element={<ProjectPage />} />
+            <Route path="*" element={<NotFoundPage />} />
+          </Routes>
+        </div>
+      </Layout>
+    </AuthGate>
   );
 }

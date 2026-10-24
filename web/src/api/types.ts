@@ -369,4 +369,6 @@ export interface HealthResponse {
   /** 数据库连接态（如 'ok'）；K0 界面未消费，仅客户端保留端点封装。 */
   db: string;
   projection_version: number;
+  /** K1-C：用户面访问控制是否启用（入口门据此决定是否先行拦截）。 */
+  auth_enabled?: boolean;
 }

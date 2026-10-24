@@ -30,6 +30,12 @@ export interface HealthData extends ProjectionMeta {
   ok: boolean;
   db: boolean;
   limits: RuntimeLimits;
+  /**
+   * K1-C：用户面访问控制是否启用（K1-SPEC §5.3）。前端入口门据此决定是否
+   * 先探受保护读面。health 保持既有字段为超集（journeys/CI 依赖 limits 与
+   * db），只增补本字段、不泄漏任何业务数据，豁免口径不变。
+   */
+  auth_enabled: boolean;
 }
 
 /** 错误响应：code 机器可读，message 人类可读，detail 附可判定依据。 */export interface ApiError {
@@ -43,6 +49,7 @@ export interface HealthData extends ProjectionMeta {
 
 export const ERROR_CODES = {
   bad_request: 400,
+  unauthorized: 401,
   not_found: 404,
   conflict: 409,
   range_not_satisfiable: 416,

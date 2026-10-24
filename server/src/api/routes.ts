@@ -18,6 +18,14 @@ import {
 import { CaptureValidationError, runCapture } from '../commands/capture.ts';
 import type { SseOptions } from '../sse/protocol.ts';
 import { establishSseConnection } from '../sse/connection.ts';
+import {
+  clearedCookieHeader,
+  createAuthMiddleware,
+  sessionCookieHeader,
+  sessionCookieOf,
+  tokensEqual,
+  type AuthService,
+} from '../auth/auth.ts';
 
 export interface AppContext {
   pool: Pool;
@@ -29,6 +37,8 @@ export interface AppContext {
   clock: () => Date;
   defaultProjectId: string;
   defaultActorId: string;
+  /** K1-C 访问控制（双令牌 + 会话存储）。 */
+  auth: AuthService;
 }
 
 /**
@@ -96,6 +106,9 @@ export function createApp(ctx: AppContext): Hono {
     if (!c.res.headers.has('Cache-Control')) c.header('Cache-Control', 'no-store');
   });
 
+  // K1-C：访问控制中间件覆盖全部 /api/*（豁免 health 与 auth/session，见 auth.ts）。
+  app.use('/api/*', createAuthMiddleware(ctx.auth, ctx.clock));
+
   // ---- GET /api/health ----
   // 信封与全部端点一致（FIX-ROUND-1 R-2）：外层 ok 表示"服务在应答"，data 里再区分运行时状态。
   app.get('/api/health', async (c) => {
@@ -112,8 +125,37 @@ export function createApp(ctx: AppContext): Hono {
         db,
         projection_version: ctx.projection.version(),
         limits: limitsOf(ctx.sse),
+        auth_enabled: ctx.auth.userAuthEnabled,
       }),
     );
+  });
+
+  // ---- POST /api/auth/session（K1-C §5.2）----
+  // 以请求体提交用户令牌换会话 cookie。节点令牌提交到这里同样 401、不下发
+  // cookie（双令牌互不通用）。失败一律 401 同形，不区分错令牌/无令牌。
+  app.post('/api/auth/session', async (c) => {
+    const body = await readJsonObject(c);
+    const token = body !== null && typeof body.token === 'string' ? body.token : null;
+    const { config } = ctx.auth;
+    if (config.accessToken === null) {
+      // 未启用访问控制（非 production）：无会话可换，前端入口门不会出现。
+      return c.json(ok({ auth_enabled: false }));
+    }
+    if (token === null || !tokensEqual(token, config.accessToken)) {
+      return c.json(fail('unauthorized', 'unauthorized'), 401);
+    }
+    const { sessionId } = ctx.auth.sessions.issue(ctx.clock());
+    const secure = config.cookieSecure || new URL(c.req.url).protocol === 'https:';
+    c.header('Set-Cookie', sessionCookieHeader(sessionId, config, secure));
+    return c.json(ok({ auth_enabled: true }));
+  });
+
+  // ---- POST /api/auth/logout（K1-C §5.2）----
+  // 清 cookie 并作废服务端会话凭证（中间件已先行校验凭据）。
+  app.post('/api/auth/logout', (c) => {
+    ctx.auth.sessions.revoke(sessionCookieOf(c));
+    c.header('Set-Cookie', clearedCookieHeader());
+    return c.json(ok({ logged_out: true }));
   });
 
   // ---- GET /api/home ----
