@@ -13,8 +13,10 @@ import {
   CommandValidationError,
   IdempotencyConflictError,
   runCommand,
+  runEvidenceCommand,
   type CommandActor,
 } from '../commands/commands.ts';
+import { ActorValidationError, ToolOutputChannelError } from '../../../src/kernel/actor-guard.ts';
 import { CaptureValidationError, runCapture } from '../commands/capture.ts';
 import type { SseOptions } from '../sse/protocol.ts';
 import { establishSseConnection } from '../sse/connection.ts';
@@ -44,9 +46,14 @@ export function limitsOf(sse: SseOptions): RuntimeLimits {
 }
 
 /** 当前用户（K0 单用户；多用户/权限属 K2，不在这里发明）。 */
-function actorOf(header: string | undefined, fallback: string): CommandActor {
+/** Q12：actor_kind 可由 x-xuxing-actor-kind 头声明（机器通道/测试），形状合法性由命令入口统一校验。 */
+function actorOf(header: string | undefined, fallback: string, kindHeader?: string): CommandActor {
   const value = header?.trim();
-  return { actor_id: value && value.length > 0 ? value : fallback, actor_kind: 'human' };
+  const kind = kindHeader?.trim();
+  return {
+    actor_id: value && value.length > 0 ? value : fallback,
+    actor_kind: (kind && kind.length > 0 ? kind : 'human') as CommandActor['actor_kind'],
+  };
 }
 
 function errorResponse(error: unknown): Response {
@@ -59,8 +66,11 @@ function errorResponse(error: unknown): Response {
       { status: 409 },
     );
   }
-  if (error instanceof CommandValidationError || error instanceof CaptureValidationError) {
+  if (error instanceof CommandValidationError || error instanceof CaptureValidationError || error instanceof ActorValidationError) {
     return Response.json(fail('bad_request', error.message, error.detail), { status: 400 });
+  }
+  if (error instanceof ToolOutputChannelError) {
+    return Response.json(fail('conflict', error.message, error.detail), { status: 409 });
   }
   const message = error instanceof Error ? error.message : String(error);
   return Response.json(fail('internal', message), { status: 500 });
@@ -184,7 +194,7 @@ export function createApp(ctx: AppContext): Hono {
   app.post('/api/commands', async (c) => {
     const body = await readJsonObject(c);
     if (body === null) return c.json(fail('bad_request', '请求体必须是 JSON 对象'), 400);
-    const actor = actorOf(c.req.header('x-xuxing-actor'), ctx.defaultActorId);
+    const actor = actorOf(c.req.header('x-xuxing-actor'), ctx.defaultActorId, c.req.header('x-xuxing-actor-kind'));
     try {
       const execution = await runCommand(ctx, {
         type: typeof body.type === 'string' ? body.type : '',
@@ -195,6 +205,24 @@ export function createApp(ctx: AppContext): Hono {
       commitAndBroadcast(ctx, execution.events);
       const result = execution.result;
       return c.json(ok(result), result.replayed ? 200 : 201);
+    } catch (error) {
+      return errorResponse(error);
+    }
+  });
+
+  // ---- POST /api/evidence（Q12：Evidence 写入；tool_output 走 Tool Gateway 不经此口）----
+  app.post('/api/evidence', async (c) => {
+    const body = await readJsonObject(c);
+    if (body === null) return c.json(fail('bad_request', '请求体必须是 JSON 对象'), 400);
+    const actor = actorOf(c.req.header('x-xuxing-actor'), ctx.defaultActorId, c.req.header('x-xuxing-actor-kind'));
+    try {
+      const execution = await runEvidenceCommand(ctx, {
+        payload: body.payload ?? {},
+        client_submit_id: body.client_submit_id,
+        actor,
+      });
+      commitAndBroadcast(ctx, execution.events);
+      return c.json(ok(execution.result), execution.result.replayed ? 200 : 201);
     } catch (error) {
       return errorResponse(error);
     }

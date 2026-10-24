@@ -11,6 +11,13 @@ import type { PgEventStore, PgEventStoreTx } from '../../../src/kernel/event-sto
 import { IdempotencyKeyConflictError } from '../../../src/kernel/event-store-pg.ts';
 import { asProjectId, type EventEnvelope, type ProjectId } from '../../../src/kernel/events.ts';
 import { guardWaitStateChange } from '../../../src/kernel/transition-guard.ts';
+import {
+  ActorSeparationError,
+  ActorValidationError,
+  assertAcceptanceActorSeparation,
+  isEvidenceSourceKind,
+  validateActorIdentity,
+} from '../../../src/kernel/actor-guard.ts';
 import type { AcceptanceCriterion, CriterionResult, ProjectionSnapshot, TaskRecord } from '../projection/projection.ts';
 import { activeHumanRun, computeAvailableActions, COMMAND_TYPES, type CommandType } from '../projection/actions.ts';
 import { availableCommands } from '../api/views.ts';
@@ -91,6 +98,25 @@ function requireClientSubmitId(value: unknown): string {
   return value;
 }
 
+/** Q12：命令入口 actor 校验——缺失/空/类型错/kind 非法（含 external 通道冒充）一律 400、零落盘。 */
+function requireValidActor(actor: CommandActor): CommandActor {
+  try {
+    const valid = validateActorIdentity(actor?.actor_id, actor?.actor_kind);
+    if (valid.actor_kind === 'external') {
+      throw new CommandValidationError('actor_kind=external 不是命令通道（命令 actor 只许 human/agent/system）', {
+        field: 'actor_kind',
+        reason: 'actor_kind_invalid',
+      });
+    }
+    return { actor_id: valid.actor_id, actor_kind: valid.actor_kind as CommandActor['actor_kind'] };
+  } catch (error) {
+    if (error instanceof ActorValidationError) {
+      throw new CommandValidationError(error.message, error.detail);
+    }
+    throw error;
+  }
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new CommandValidationError('payload 必须是对象', { field: 'payload' });
@@ -119,6 +145,7 @@ export async function runCommand(
   input: { type: string; payload: unknown; client_submit_id: unknown; actor: CommandActor },
 ): Promise<CommandExecution> {
   const client_submit_id = requireClientSubmitId(input.client_submit_id);
+  const actor = requireValidActor(input.actor);
   const payload = asRecord(input.payload);
   const type = input.type as CommandType;
 
@@ -144,17 +171,17 @@ export async function runCommand(
 
   switch (type) {
     case 'proposal_accept':
-      return acceptProposal(ctx, payload, client_submit_id, input.actor);
+      return acceptProposal(ctx, payload, client_submit_id, actor);
     case 'proposal_reject':
-      return rejectProposal(ctx, payload, client_submit_id, input.actor);
+      return rejectProposal(ctx, payload, client_submit_id, actor);
     case 'task_advance':
-      return taskAdvance(ctx, payload, client_submit_id, input.actor);
+      return taskAdvance(ctx, payload, client_submit_id, actor);
     case 'feedback_submit':
-      return feedbackSubmit(ctx, payload, client_submit_id, input.actor);
+      return feedbackSubmit(ctx, payload, client_submit_id, actor);
     case 'acceptance_record':
-      return acceptanceRecord(ctx, payload, client_submit_id, input.actor);
+      return acceptanceRecord(ctx, payload, client_submit_id, actor);
     case 'task_cancel':
-      return taskCancel(ctx, payload, client_submit_id, input.actor);
+      return taskCancel(ctx, payload, client_submit_id, actor);
     default:
       throw new CommandValidationError(`不支持的命令 type：${String(input.type)}`, {
         field: 'type',
@@ -680,7 +707,9 @@ async function feedbackSubmit(
  * acceptance_record：逐判据验收（REQ-ACC-2 入账校验三件套 + REQ-ACC-3 重算）。
  * - 覆盖完整性：契约全部 criterion_ref 必须出现在 criterion_results；
  * - verdict 一致性：全 passed/na → accepted；全 failed → rejected；其余 → partially_accepted；
- * - actor 分离：执行该 Run 的 actor 不得担任 acceptor（K0 单用户下由 self_acceptance 标记诚实记录）。
+ * - actor 分离（REQ-ACC-2 / Q12）：subject Outcome 所属 Run 的执行者（executor 类 Run）
+ *   不得担任 acceptor，命中即 409 零落盘；非 auto 判据 system 不得代判；
+ *   human_light 的人类执行者自验收保留放行并以 self_acceptance 诚实标记（口径见 Q12-1024.md §1.3）。
  */
 async function acceptanceRecord(
   ctx: CommandContext,
@@ -693,6 +722,20 @@ async function acceptanceRecord(
   const snapshot = ctx.projection.snapshot();
   const task = snapshot.tasks.find((t) => t.task_id === task_id);
   if (!task) throw new CommandDeniedError(`任务 ${task_id} 不存在`, { reason: 'task_not_found' });
+
+  // Q12 防伪造：请求体自称的 acceptor 必须与命令 actor 本人一致（acceptor 只由 actor 派生）。
+  if (payload.acceptor_id !== undefined && payload.acceptor_id !== actor.actor_id) {
+    throw new CommandValidationError('payload.acceptor_id 与命令 actor 不一致（acceptor 不接受自称）', {
+      field: 'acceptor_id',
+      reason: 'acceptor_spoofed',
+    });
+  }
+  if (payload.acceptor_kind !== undefined && payload.acceptor_kind !== actor.actor_kind) {
+    throw new CommandValidationError('payload.acceptor_kind 与命令 actor 不一致（acceptor 不接受自称）', {
+      field: 'acceptor_kind',
+      reason: 'acceptor_spoofed',
+    });
+  }
 
   const actions = computeAvailableActions(task, snapshot, actor.actor_id);
   const acceptanceActions = actions.filter((a) => a.id === 'record_acceptance');
@@ -761,8 +804,32 @@ async function acceptanceRecord(
     });
   }
 
-  // ③ actor 分离（REQ-ACC-2）：执行该任务的 Run 由本人执行 → 记录 self_acceptance=true（人为验收，非 auto）
-  const executedBySelf = snapshot.runs.some((r) => r.task_id === task_id && r.actor_id === actor.actor_id && r.state === 'succeeded');
+  // ③ actor 分离（REQ-ACC-2 / Q12）：判定对象 = subject Outcome 所属 Run 的执行者。
+  const subjectOutcome = task.last_outcome_id
+    ? snapshot.outcomes.find((o) => o.outcome_id === task.last_outcome_id) ?? null
+    : null;
+  const subjectRun =
+    (subjectOutcome?.run_id ? snapshot.runs.find((r) => r.run_id === subjectOutcome.run_id) : undefined) ??
+    snapshot.runs.find((r) => r.task_id === task_id && r.state === 'succeeded') ??
+    null;
+  let selfAcceptance = false;
+  try {
+    const separation = assertAcceptanceActorSeparation({
+      acceptor_id: actor.actor_id,
+      acceptor_kind: actor.actor_kind,
+      subject_run: subjectRun
+        ? { run_id: subjectRun.run_id, run_kind: subjectRun.run_kind, actor_id: subjectRun.actor_id }
+        : null,
+      criteria,
+    });
+    selfAcceptance = separation.self_acceptance;
+  } catch (error) {
+    if (error instanceof ActorSeparationError) {
+      throw new CommandDeniedError(error.message, { ...error.detail });
+    }
+    throw error;
+  }
+  const executedBySelf = selfAcceptance;
   const acceptance_id = `acc_${ulid()}`;
   const emitted: EmittedEvent[] = [];
   const base = {
@@ -1011,3 +1078,131 @@ export function findTask(snapshot: ProjectionSnapshot, task_id: string): TaskRec
 }
 
 export type { AcceptanceCriterion, IdempotencyKeyConflictError };
+
+// ---------------------------------------------------------------------------
+// evidence_add（Q12）：Evidence 写入命令（走 POST /api/evidence，不进 6 命令词表）。
+// 普通 source_kind 经命令层入账；tool_output 在此直接拒（INV-6，只许 Tool Gateway）。
+// ---------------------------------------------------------------------------
+
+export interface EvidenceCommandResult {
+  evidence_id: string;
+  project_id: string;
+  task_id: string | null;
+  source_kind: string;
+  replayed: boolean;
+  projection_version: number;
+  event_id: string;
+}
+
+export interface EvidenceCommandExecution {
+  result: EvidenceCommandResult;
+  events: EventEnvelope[];
+}
+
+export async function runEvidenceCommand(
+  ctx: CommandContext,
+  input: { payload: unknown; client_submit_id: unknown; actor: CommandActor },
+): Promise<EvidenceCommandExecution> {
+  const client_submit_id = requireClientSubmitId(input.client_submit_id);
+  const actor = requireValidActor(input.actor);
+  const payload = asRecord(input.payload);
+
+  const project_id = requireString(payload, 'project_id');
+  const source_kind = payload.source_kind;
+  if (!isEvidenceSourceKind(source_kind)) {
+    throw new CommandValidationError(
+      'payload.source_kind 必须是 user_statement / agent_claim / tool_output / external_doc / device_log 之一（spec §2.5）',
+      { field: 'source_kind', reason: 'source_kind_invalid' },
+    );
+  }
+  // INV-6：tool_output 只许 Tool Gateway 通道；请求里夹带任何"网关凭据"字段都不采信、照样拒。
+  if (source_kind === 'tool_output') {
+    throw new CommandDeniedError('source_kind=tool_output 的 Evidence 只能经 Tool Gateway 通道写入（INV-6）', {
+      reason: 'tool_output_channel_required',
+    });
+  }
+  const content_ref = requireString(payload, 'content_ref');
+  const content_hash = requireString(payload, 'content_hash');
+  const task_id = payload.task_id === undefined || payload.task_id === null ? null : requireString(payload, 'task_id');
+  const verification_status = payload.verification_status === undefined ? 'unverified' : payload.verification_status;
+  if (verification_status !== 'unverified' && verification_status !== 'verified' && verification_status !== 'refuted') {
+    throw new CommandValidationError('payload.verification_status 只许 unverified / verified / refuted', {
+      field: 'verification_status',
+    });
+  }
+
+  const snapshot = ctx.projection.snapshot();
+  const project = snapshot.projects.find((pr) => pr.project_id === project_id);
+  if (!project) throw new CommandDeniedError(`项目 ${project_id} 不存在`, { reason: 'project_not_found' });
+  if (task_id !== null) {
+    const task = snapshot.tasks.find((t) => t.task_id === task_id);
+    if (!task || task.project_id !== project_id) {
+      throw new CommandDeniedError(`任务 ${task_id} 不存在或不属于项目 ${project_id}`, { reason: 'task_not_found' });
+    }
+  }
+
+  const stream_id = asProjectId(project_id);
+  const idempotency_key = `client_id:${client_submit_id}:evidence`;
+  const existing = (await ctx.store.readStream(stream_id)).find((e) => e.idempotency_key === idempotency_key);
+  if (existing) {
+    const ep = existing.payload as Record<string, unknown>;
+    if (
+      ep.source_kind !== source_kind ||
+      ep.content_ref !== content_ref ||
+      ep.content_hash !== content_hash ||
+      (ep.task_id ?? null) !== task_id
+    ) {
+      throw new IdempotencyConflictError(client_submit_id);
+    }
+    return {
+      result: {
+        evidence_id: typeof ep.evidence_id === 'string' ? ep.evidence_id : existing.id,
+        project_id,
+        task_id,
+        source_kind,
+        replayed: true,
+        projection_version: ctx.projection.version(),
+        event_id: existing.id,
+      },
+      events: [],
+    };
+  }
+
+  const evidence_id = typeof payload.evidence_id === 'string' && payload.evidence_id.length > 0
+    ? payload.evidence_id
+    : `ev_${ulid()}`;
+  const event = await ctx.store.append({
+    stream_id,
+    type: 'EvidenceAdded',
+    actor_id: actor.actor_id,
+    actor_kind: actor.actor_kind,
+    causation_id: null,
+    correlation_id: newCorrelationId(),
+    idempotency_key,
+    payload: {
+      evidence_id,
+      task_id,
+      source_kind,
+      content_ref,
+      content_hash,
+      captured_at: ctx.clock().toISOString(),
+      environment: typeof payload.environment === 'string' ? payload.environment : '',
+      verification_status,
+      supersedes_id: typeof payload.supersedes_id === 'string' ? payload.supersedes_id : null,
+    },
+  });
+
+  await ingestProject(ctx, project_id);
+  return {
+    result: {
+      evidence_id,
+      project_id,
+      task_id,
+      source_kind,
+      replayed: false,
+      projection_version: ctx.projection.version(),
+      event_id: event.id,
+    },
+    events: [event],
+  };
+}
