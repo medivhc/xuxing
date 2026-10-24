@@ -4,7 +4,7 @@ import { expect, test } from '@playwright/test';
 // D9 质量门 · 旅程即测试（Web UI 版骨架，v0）
 //
 // 现状：Web UI 尚未实现（K0 本波只做到内核/API 级）。同一份旅程已在
-//   tests/journey/d8-full-journey.test.ts 里以真 PostgreSQL 事件流跑通（88 例），
+//   tests/journey/d8-full-journey.test.ts 里以真 PostgreSQL 事件流跑通（该文件 51 例；连同 guardrails 25 例、projection-consistency 13 例，三件套共 89 例），
 // 本文件把同样的步骤落到浏览器上，全部 test.skip，等 UI 到位后逐条启用。
 //
 // 启用条件（三条同时满足才解除 skip，见 README.md 的映射表）：

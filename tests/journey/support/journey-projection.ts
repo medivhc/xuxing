@@ -238,7 +238,10 @@ export interface JourneySnapshot {
   non_state_events: Record<string, number>;
 }
 
-/** 本夹具不消费、且不携带投影状态的事件类型（spec §4 派生规则声明中属于「留痕/回执」类）。 */
+/** 本夹具不消费、且不携带投影状态的事件类型（spec §4 派生规则声明中属于「留痕/回执」类）。
+ * 例外说明：TaskCanceled 并非纯回执 —— 它承载取消级联的终态语义（§3.2 REQ-RUN-6）；
+ * 归入本列仅因 Task.lifecycle 另由 TaskLifecycleChanged 派生、不从 TaskCanceled
+ * 读状态。本旅程未发射 TaskCancelRequested/TaskCanceled，该前提一旦变化须重估本登记。 */
 export const NON_STATE_EVENT_TYPES: readonly EventType[] = [
   // 注意：ProjectCreated 不在此列 —— 它会建立 project 行并写入 policy/ceiling，是状态携带者。
   'EvidenceSuperseded',
