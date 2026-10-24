@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { api, bootApp, jsonOf, TEST_SSE, type BootedApp } from './support/harness.ts';
 import { DEFAULT_PROJECT_ID, seedDemo } from '../src/seed/demo.ts';
 import { COMMAND_TYPES } from '../src/projection/actions.ts';
+import { asProjectId } from '../../src/kernel/events.ts';
 import { sseOptionsFromEnv } from '../src/sse/protocol.ts';
 
 let booted: BootedApp;
@@ -90,7 +91,7 @@ describe('§4 HTTP 契约：投影类端点', () => {
     expect(byId.get('task_demo_kickoff')).toMatchObject({ lifecycle: 'accepted' });
     expect(byId.get('task_demo_archived')).toMatchObject({ lifecycle: 'canceled' });
 
-    const events = await booted.harness.store.readStream(DEFAULT_PROJECT_ID, 1);
+    const events = await booted.harness.store.readStream(asProjectId(DEFAULT_PROJECT_ID), 1);
     const canceledEvents = events.filter(
       (e) => e.type === 'TaskCanceled' && (e.payload as Record<string, unknown>)['task_id'] === 'task_demo_archived',
     );
@@ -187,7 +188,7 @@ describe('§4 HTTP 契约：POST /api/capture', () => {
     expect(proposal.data.details.task.title).toContain('李四');
     expect(proposal.data.available_actions).toEqual(['proposal_accept', 'proposal_reject']);
 
-    const events = await booted.harness.store.readStream(DEFAULT_PROJECT_ID, 1);
+    const events = await booted.harness.store.readStream(asProjectId(DEFAULT_PROJECT_ID), 1);
     expect(events.some((e) => e.type === 'FeedbackReceived' && (e.payload as Record<string, unknown>)['capture_id'] === body.data.capture_id)).toBe(true);
   });
 

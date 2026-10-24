@@ -5,6 +5,7 @@
 // 演示项目为人类执行者任务（K0 单用户），因此不需要在册 Agent 能力声明。
 
 import type { PgEventStore } from '../../../src/kernel/event-store-pg.ts';
+import { asProjectId } from '../../../src/kernel/events.ts';
 import type { ProjectionService } from '../projection/service.ts';
 
 /** 与 server/src/app.ts 的 DEFAULT_PROJECT_ID 同源。 */
@@ -120,7 +121,7 @@ export async function seedDemo(input: {
   if (!existing) {
     await store.withTransaction(async (tx) => {
       await tx.append({
-        stream_id: project_id,
+        stream_id: asProjectId(project_id),
         type: 'ProjectCreated',
         actor_id,
         actor_kind: 'human',
@@ -130,7 +131,7 @@ export async function seedDemo(input: {
         payload: { name: DEMO_PROJECT.name, policy_id: DEMO_PROJECT.policy_id, created_by: actor_id },
       });
       await tx.append({
-        stream_id: project_id,
+        stream_id: asProjectId(project_id),
         type: 'GoalCreated',
         actor_id,
         actor_kind: 'human',
@@ -148,7 +149,7 @@ export async function seedDemo(input: {
   } else if (existing.name !== DEMO_PROJECT.name) {
     // 允许把项目名改为演示项目名（幂等：同一 key 同内容不重复入账）
     await store.append({
-      stream_id: project_id,
+      stream_id: asProjectId(project_id),
       type: 'ProjectCreated',
       actor_id,
       actor_kind: 'human',
@@ -167,7 +168,7 @@ export async function seedDemo(input: {
     if (snapshot.tasks.some((t) => t.task_id === seed.task_id)) continue;
     createdTasks += 1;
     const base = {
-      stream_id: project_id,
+      stream_id: asProjectId(project_id),
       actor_id,
       actor_kind: 'human' as const,
       causation_id: null,
@@ -224,6 +225,7 @@ export async function seedDemo(input: {
         type: 'TaskLifecycleChanged',
         entity: 'task',
         idempotency_key: key('lc-defined'),
+        trigger_event_id: key('trigger-task-defined'),
         from: 'captured',
         to: 'defined',
         facts: { hasTitle: true, assigneeKind: 'human', contractStructured: seed.criteria.length > 0 },
@@ -237,8 +239,15 @@ export async function seedDemo(input: {
         type: 'TaskLifecycleChanged',
         entity: 'task',
         idempotency_key: key('lc-ready'),
+        trigger_event_id: key('trigger-task-ready'),
         from: 'defined',
         to: 'ready',
+        facts: {
+          dependenciesSatisfied: true,
+          dataInputsAvailable: true,
+          capabilityAvailable: true,
+          policyAllows: true,
+        },
         payload: { task_id: seed.task_id },
       });
       if (seed.stage === 'ready') return;
@@ -277,8 +286,10 @@ export async function seedDemo(input: {
         type: 'TaskLifecycleChanged',
         entity: 'task',
         idempotency_key: key('lc-active'),
+        trigger_event_id: key('trigger-run-created'),
         from: 'ready',
         to: 'active',
+        facts: { runDispatched: seed.run !== undefined && seed.run !== 'none' },
         payload: { task_id: seed.task_id },
       });
       if (seed.stage === 'active') return;
@@ -303,17 +314,13 @@ export async function seedDemo(input: {
           type: 'TaskLifecycleChanged',
           entity: 'task',
           idempotency_key: key('lc-canceled'),
+          trigger_event_id: key('trigger-cancel-requested'),
           from: 'active',
           to: 'canceled',
           facts: { allRunsTerminal: true },
           payload: { task_id: seed.task_id },
         });
-        await tx.append({
-          ...base,
-          type: 'TaskCanceled',
-          idempotency_key: key('canceled'),
-          payload: { task_id: seed.task_id, reason: seed.cancel_reason ?? 'seed_canceled' },
-        });
+        // TaskCanceled 由内核 appendStateTransition 的 REQ-RUN-6 收尾同事务落库（F2），此处不重复补发
         return;
       }
 
@@ -387,6 +394,7 @@ export async function seedDemo(input: {
         type: 'TaskLifecycleChanged',
         entity: 'task',
         idempotency_key: key('lc-awaiting'),
+        trigger_event_id: key('trigger-run-succeeded'),
         from: 'active',
         to: 'awaiting_acceptance',
         payload: { task_id: seed.task_id, outcome_id },
@@ -419,6 +427,7 @@ export async function seedDemo(input: {
         type: 'TaskLifecycleChanged',
         entity: 'task',
         idempotency_key: key('lc-accepted'),
+        trigger_event_id: key('trigger-acceptance-recorded'),
         from: 'awaiting_acceptance',
         to: 'accepted',
         facts: { acceptanceVerdict: 'accepted' },
@@ -455,7 +464,7 @@ async function seedDegradedFixture(input: {
   if (snapshot.proposals.some((p) => p.proposal_id === DEGRADED_PROPOSAL_ID)) return;
 
   const base = {
-    stream_id: DEGRADED_PROJECT_ID,
+    stream_id: asProjectId(DEGRADED_PROJECT_ID),
     actor_id,
     actor_kind: 'human' as const,
     causation_id: null,
@@ -524,6 +533,6 @@ async function seedDegradedFixture(input: {
 
 async function ingest(store: PgEventStore, projection: ProjectionService, project_id: string): Promise<void> {
   const current = projection.version();
-  const events = await store.readStream(project_id, 1);
+  const events = await store.readStream(asProjectId(project_id), 1);
   projection.ingest(events.filter((e) => e.global_seq > current));
 }

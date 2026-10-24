@@ -95,7 +95,16 @@ export function computeAvailableActions(
   }
 
   if (task.lifecycle === 'defined' && task.wait_state === 'none' && !task.duplicate_suspect) {
-    const check = lifecycleAction(task, 'ready', {});
+    // REQ-SCH-1 全公式：wait/duplicate 两项已由本函数的门槛条件给出；
+    // 依赖/数据/能力/策略在 K0 投影口径下无建模阻塞（命令层执行时由内核流派生复核）
+    const check = lifecycleAction(task, 'ready', {
+      waitStateNone: true,
+      duplicateSuspectFalse: true,
+      dependenciesSatisfied: true,
+      dataInputsAvailable: true,
+      capabilityAvailable: true,
+      policyAllows: true,
+    });
     if (check.ok) {
       actions.push({
         id: 'next_lifecycle',
@@ -107,7 +116,8 @@ export function computeAvailableActions(
   }
 
   if (task.lifecycle === 'ready' && task.wait_state === 'none' && !live) {
-    const check = lifecycleAction(task, 'active', {});
+    // 该动作即派发：命令层先建 Run 再迁移，runDispatched 由动作本身满足
+    const check = lifecycleAction(task, 'active', { runDispatched: true });
     if (check.ok) {
       actions.push({
         id: 'next_lifecycle',
@@ -156,22 +166,11 @@ export function computeAvailableActions(
     }
   }
 
-  // 取消：REQ-RUN-6③ 全部 Run 达终态才正式 canceled
-  if (task.cancel_requested_by === null) {
-    const cancelFacts: GuardFacts =
-      task.lifecycle === 'active' || task.lifecycle === 'awaiting_acceptance'
-        ? { allRunsTerminal: !live }
-        : {};
-    const check = lifecycleAction(task, 'canceled', cancelFacts);
-    if (check.ok) {
-      actions.push({
-        id: 'cancel_task',
-        label: live ? '记取消意图' : '取消任务',
-        next: { type: 'task_lifecycle', from: task.lifecycle, to: 'canceled', guard: 'allowed', facts_needed: live ? [] : [] },
-        command_type: 'task_cancel',
-      });
-    }
-  }
+  // 取消不在展示层提供动作（跨线复审 MINOR-1）：原 cancel_task 分支以
+  // cancel_requested_by === null 为进入条件、guard 却要求 cancellationRequested=true，
+  // 而 cancelFacts 从不提供该 fact——该分支在任何状态下都不可达（死代码），已删除。
+  // 取消入口是 task_cancel 命令本身（命令即落意图，见 commands.ts 的 taskCancel），
+  // 正式收尾由内核 finalizeTaskCancellation 完成；available_actions 不展示 cancel。
 
   // wait_state 人工解除（§3.1：非终态可叠加/解除；device 等待归入 blocked）。
   // K0 命令词表（FIX-ROUND-1 R-1）里没有 wait_state_change：内部动作不对外暴露，

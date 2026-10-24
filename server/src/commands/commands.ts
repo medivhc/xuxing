@@ -9,7 +9,7 @@
 import { ulid } from 'ulid';
 import type { PgEventStore, PgEventStoreTx } from '../../../src/kernel/event-store-pg.ts';
 import { IdempotencyKeyConflictError } from '../../../src/kernel/event-store-pg.ts';
-import type { EventEnvelope } from '../../../src/kernel/events.ts';
+import { asProjectId, type EventEnvelope, type ProjectId } from '../../../src/kernel/events.ts';
 import { guardWaitStateChange } from '../../../src/kernel/transition-guard.ts';
 import type { AcceptanceCriterion, CriterionResult, ProjectionSnapshot, TaskRecord } from '../projection/projection.ts';
 import { activeHumanRun, computeAvailableActions, COMMAND_TYPES, type CommandType } from '../projection/actions.ts';
@@ -244,7 +244,7 @@ async function acceptProposal(
   const emitted: EmittedEvent[] = [];
   const correlation_id = newCorrelationId();
   const base = {
-    stream_id: proposal.project_id,
+    stream_id: asProjectId(proposal.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
     causation_id: null,
@@ -308,6 +308,7 @@ async function acceptProposal(
       type: 'TaskLifecycleChanged',
       entity: 'task',
       idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc1`,
+      trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc1:trigger`,
       from: 'captured',
       to: 'defined',
       facts: {
@@ -339,7 +340,7 @@ async function acceptProposal(
 }
 
 function receipt(
-  base: { stream_id: string; actor_id: string; actor_kind: 'human' | 'agent' | 'system'; causation_id: string | null; correlation_id: string },
+  base: { stream_id: ProjectId; actor_id: string; actor_kind: 'human' | 'agent' | 'system'; causation_id: string | null; correlation_id: string },
   client_submit_id: string,
   command: CommandType,
   requestPayload: Record<string, unknown>,
@@ -380,7 +381,7 @@ async function rejectProposal(
   const reason = typeof payload.reason === 'string' ? payload.reason : 'user_rejected';
   const emitted: EmittedEvent[] = [];
   const base = {
-    stream_id: proposal.project_id,
+    stream_id: asProjectId(proposal.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
     causation_id: null,
@@ -438,7 +439,7 @@ async function taskAdvance(
 
   const emitted: EmittedEvent[] = [];
   const base = {
-    stream_id: task.project_id,
+    stream_id: asProjectId(task.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
     causation_id: null,
@@ -494,13 +495,30 @@ async function taskAdvance(
       }));
     }
 
+    // guard facts 与投影动作判定同源：captured→defined 用任务本体事实；
+    // defined→ready 补 REQ-SCH-1 全公式（wait/duplicate 已由流派生并在上方复核）；
+    // ready→active 的 runDispatched 由本命令先建 Run 满足
+    const advanceFacts =
+      from === 'captured' && to === 'defined'
+        ? {
+            hasTitle: task.title.trim().length > 0,
+            assigneeKind: task.assignee_kind,
+            contractStructured: task.acceptance_criteria.length > 0,
+          }
+        : from === 'defined' && to === 'ready'
+          ? { dependenciesSatisfied: true, dataInputsAvailable: true, capabilityAvailable: true, policyAllows: true }
+          : from === 'ready' && to === 'active'
+            ? { runDispatched: true }
+            : {};
     addEmitted(emitted, (await tx.appendStateTransition({
       ...base,
       type: 'TaskLifecycleChanged',
       entity: 'task',
       idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc`,
+      trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc:trigger`,
       from,
       to,
+      facts: advanceFacts,
       payload: { task_id },
     })).event);
 
@@ -557,7 +575,7 @@ async function feedbackSubmit(
   const outcome_id = `out_${ulid()}`;
   const emitted: EmittedEvent[] = [];
   const base = {
-    stream_id: task.project_id,
+    stream_id: asProjectId(task.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
     causation_id: null,
@@ -629,6 +647,7 @@ async function feedbackSubmit(
       type: 'TaskLifecycleChanged',
       entity: 'task',
       idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc`,
+      trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc:trigger`,
       from: 'active',
       to: 'awaiting_acceptance',
       payload: { task_id, outcome_id },
@@ -747,7 +766,7 @@ async function acceptanceRecord(
   const acceptance_id = `acc_${ulid()}`;
   const emitted: EmittedEvent[] = [];
   const base = {
-    stream_id: task.project_id,
+    stream_id: asProjectId(task.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
     causation_id: null,
@@ -800,6 +819,7 @@ async function acceptanceRecord(
       type: 'TaskLifecycleChanged',
       entity: 'task',
       idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc`,
+      trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc:trigger`,
       from: task.lifecycle,
       to: action.next!.to,
       facts: { acceptanceVerdict: derived, needsReexecution: true, allRunsTerminal: true },
@@ -840,9 +860,10 @@ async function taskCancel(
   const task = snapshot.tasks.find((t) => t.task_id === task_id);
   if (!task) throw new CommandDeniedError(`任务 ${task_id} 不存在`, { reason: 'task_not_found' });
 
-  const actions = computeAvailableActions(task, snapshot, actor.actor_id);
-  const cancel = actions.find((a) => a.id === 'cancel_task');
-  if (!cancel || !cancel.next) {
+  // 取消命令本身就是 REQ-RUN-6 的第一步（落意图）：新 guard 语义下 cancel_task 动作
+  // 要意图已落才出现（见 projection/actions.ts），用动作复核作命令门会自锁；
+  // 故此处以终态判定为门，正式迁移仍由内核在落意图后以流派生 facts 复核。
+  if (task.lifecycle === 'accepted' || task.lifecycle === 'canceled') {
     throw new CommandDeniedError(`任务 ${task_id} 当前不可取消（lifecycle=${task.lifecycle}）`, {
       reason: 'not_in_available_actions',
       task_id,
@@ -856,10 +877,10 @@ async function taskCancel(
   // human_light Run 取消无确认环节，直接置 canceled（REQ-RUN-6②）
   const blocking = liveRuns.filter((r) => r.run_kind !== 'human_light');
   // 对账未结（存在非 human_light 在跑 Run）→ 只记取消意图，不正式置 canceled
-  const lifecycleTarget: string | null = blocking.length > 0 ? null : cancel.next.to;
+  const lifecycleTarget: string | null = blocking.length > 0 ? null : 'canceled';
   const emitted: EmittedEvent[] = [];
   const base = {
-    stream_id: task.project_id,
+    stream_id: asProjectId(task.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
     causation_id: null,
@@ -867,12 +888,16 @@ async function taskCancel(
   };
 
   await ctx.store.withTransaction(async (tx) => {
-    addEmitted(emitted, await tx.append({
-      ...base,
-      type: 'TaskCancelRequested',
-      idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:cancel-requested`,
-      payload: { task_id, requested_by: actor.actor_id, reason: typeof payload.reason === 'string' ? payload.reason : 'user_canceled' },
-    }));
+    // 重复落意图去重（跨线复审 MINOR-3）：意图已在账时不再重复 append TaskCancelRequested
+    // （幂等键随 submit id 变、靠它去重不住）；后续收尾/等待逻辑照常按当前快照推进。
+    if (task.cancel_requested_by === null) {
+      addEmitted(emitted, await tx.append({
+        ...base,
+        type: 'TaskCancelRequested',
+        idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:cancel-requested`,
+        payload: { task_id, requested_by: actor.actor_id, reason: typeof payload.reason === 'string' ? payload.reason : 'user_canceled' },
+      }));
+    }
 
     for (const run of liveRuns.filter((r) => r.run_kind === 'human_light')) {
       addEmitted(emitted, await tx.append({
@@ -900,22 +925,26 @@ async function taskCancel(
           payload: { task_id, from: task.wait_state, to: 'none', reason: 'task_canceled (INV-11)' },
         }));
       }
-      addEmitted(emitted, (await tx.appendStateTransition({
+      const transition = await tx.appendStateTransition({
         ...base,
         type: 'TaskLifecycleChanged',
         entity: 'task',
         idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc`,
+        trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc:trigger`,
         from: task.lifecycle,
         to: 'canceled',
         facts: { allRunsTerminal: true },
         payload: { task_id },
-      })).event);
-      addEmitted(emitted, await tx.append({
-        ...base,
-        type: 'TaskCanceled',
-        idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:canceled`,
-        payload: { task_id, reason: 'task_canceled' },
-      }));
+      });
+      addEmitted(emitted, transition.event);
+      // MAJOR-1（跨线复审）：迁入 canceled 时内核已在同事务落 TaskCanceled（F2 收尾），
+      // 命令层不得再手动补发（否则流内重复 2 条）；把内核收尾事件并入 emitted，响应口径不变。
+      const taskCanceledEventId = transition.closure?.task_canceled_event_id ?? null;
+      if (taskCanceledEventId !== null) {
+        const stream = await tx.readStream(asProjectId(task.project_id), 1);
+        const taskCanceled = stream.find((e) => e.id === taskCanceledEventId);
+        if (taskCanceled) addEmitted(emitted, taskCanceled);
+      }
     }
 
     addEmitted(emitted, await tx.append(receipt(base, client_submit_id, 'task_cancel', payload, {
