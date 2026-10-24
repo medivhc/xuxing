@@ -1,5 +1,10 @@
 // 事件目录 v1 —— 与冻结 spec K0-SPEC v1.0 §4 逐字对应（封闭集，新增类型须走 spec 修订）。
 // 本文件由 spec §4 目录生成，勿手工增删类型名。
+//
+// K1 修订增补（K1-SPEC v0.4 §1.2/§4.2/§4.4 为修订依据，已登记仓库
+// docs/interaction-contract.md 的 K1 附则）：
+// - NodeRegistered / NodeOffline：节点注册与离线（$system 保留流，INV-12 增补）；
+// - RunSideEffectRecorded：节点回报的副作用记录（REQ-RUN-4 分界依据）。
 
 export const EVENT_TYPES = [
   'ProjectCreated',
@@ -55,6 +60,10 @@ export const EVENT_TYPES = [
   'WaitConditionCanceled',
   'FeedbackInterpretationFailed',
   'LatestAcceptedPointerMoved',
+  // K1 增补（见文件头修订注记）
+  'NodeRegistered',
+  'NodeOffline',
+  'RunSideEffectRecorded',
 ] as const;
 
 export type EventType = (typeof EVENT_TYPES)[number];

@@ -283,8 +283,8 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
         await expect(page).toHaveURL(/#\/actions$/);
         const uiRow = actionRow(page, taskId);
         await expect(uiRow).toBeVisible();
-        await expect(uiRow.getByTestId(TID.actionTaskTitle)).toHaveText(row.title);
-        await expect(uiRow.getByTestId(TID.taskLifecycle)).toHaveText(row.lifecycle);
+        await expect(uiRow.getByTestId(TID.actionTaskTitle)).toHaveText(row.title!);
+        await expect(uiRow.getByTestId(TID.taskLifecycle)).toHaveText(row.lifecycle!);
       }
     });
 

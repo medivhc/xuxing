@@ -238,6 +238,25 @@ export function findAction(actions: ActionsData, taskId: string): ActionItem | u
   return actions.items.find((row) => row.task_id === taskId);
 }
 
+/** K1-A：My Actions 里的 decision 条目（按 decision_id）。 */
+export function findDecisionAction(actions: ActionsData, decisionId: string): ActionItem | undefined {
+  return actions.items.find((row) => row.kind === 'decision' && row.decision_id === decisionId);
+}
+
+/** K1-B：节点列表（GET /api/nodes，用户面）。 */
+export interface NodeView {
+  node_id: string;
+  display_name: string;
+  executor_kinds: string[];
+  max_side_effect_level: string;
+  status: string;
+  active_runs: number;
+}
+
+export function getNodes(request: APIRequestContext): Promise<{ nodes: NodeView[] }> {
+  return getData<{ nodes: NodeView[] }>(request, '/api/nodes');
+}
+
 /** Home 里某个项目的摘要。 */
 export function projectSummary(home: HomeData, projectId: string): HomeProjectSummary {
   const summary = home.projects.find((project) => project.project_id === projectId);

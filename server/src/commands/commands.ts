@@ -11,7 +11,15 @@ import type { PgEventStore, PgEventStoreTx } from '../../../src/kernel/event-sto
 import { IdempotencyKeyConflictError } from '../../../src/kernel/event-store-pg.ts';
 import { asProjectId, type EventEnvelope, type ProjectId } from '../../../src/kernel/events.ts';
 import { guardWaitStateChange } from '../../../src/kernel/transition-guard.ts';
-import type { AcceptanceCriterion, CriterionResult, ProjectionSnapshot, TaskRecord } from '../projection/projection.ts';
+import type {
+  AcceptanceCriterion,
+  CriterionResult,
+  DecisionRecord,
+  DecisionWakeCondition,
+  ProjectionSnapshot,
+  ProposalRecord,
+  TaskRecord,
+} from '../projection/projection.ts';
 import { activeHumanRun, computeAvailableActions, COMMAND_TYPES, type CommandType } from '../projection/actions.ts';
 import { availableCommands } from '../api/views.ts';
 import type { ProjectionService } from '../projection/service.ts';
@@ -40,6 +48,26 @@ export class CommandValidationError extends Error {
   constructor(message: string, detail: Record<string, unknown> = {}) {
     super(message);
     this.name = 'CommandValidationError';
+    this.detail = detail;
+  }
+}
+
+/** K1 §3.5：actor 不合规（如裁决命令的非人类 actor）→ HTTP 403。 */
+export class CommandForbiddenError extends Error {
+  readonly detail: Record<string, unknown>;
+  constructor(message: string, detail: Record<string, unknown>) {
+    super(message);
+    this.name = 'CommandForbiddenError';
+    this.detail = detail;
+  }
+}
+
+/** K1 §3.5：目标实体不存在 → HTTP 404。 */
+export class CommandNotFoundError extends Error {
+  readonly detail: Record<string, unknown>;
+  constructor(message: string, detail: Record<string, unknown>) {
+    super(message);
+    this.name = 'CommandNotFoundError';
     this.detail = detail;
   }
 }
@@ -155,10 +183,12 @@ export async function runCommand(
       return acceptanceRecord(ctx, payload, client_submit_id, input.actor);
     case 'task_cancel':
       return taskCancel(ctx, payload, client_submit_id, input.actor);
+    case 'resolve_decision':
+      return resolveDecision(ctx, payload, client_submit_id, input.actor);
     default:
       throw new CommandValidationError(`不支持的命令 type：${String(input.type)}`, {
         field: 'type',
-        allowed: ['proposal_accept', 'proposal_reject', 'task_advance', 'feedback_submit', 'acceptance_record', 'task_cancel'],
+        allowed: ['proposal_accept', 'proposal_reject', 'task_advance', 'feedback_submit', 'acceptance_record', 'task_cancel', 'resolve_decision'],
       });
   }
 }
@@ -216,6 +246,126 @@ function newCorrelationId(): string {
 // 各命令实现
 // ---------------------------------------------------------------------------
 
+type EventBase = {
+  stream_id: ProjectId;
+  actor_id: string;
+  actor_kind: CommandActor['actor_kind'];
+  causation_id: string | null;
+  correlation_id: string;
+};
+
+/**
+ * capture_task 型 PlanChange 的应用（任务物化）：TaskCaptured → AssignmentCreated
+ * → TaskDefined → captured→defined → PlanChangeApplied。
+ * acceptProposal 与 K1-A 的 resolve_decision / deferred 唤起共用同一落图路径，
+ * 保证「应用」的事件形态只有一个实现（keyPrefix 区分幂等域）。
+ * 返回新建 Task 的 id。
+ */
+async function materializeCaptureTaskChange(
+  tx: PgEventStoreTx,
+  base: EventBase,
+  proposal: ProposalRecord,
+  keyPrefix: string,
+  appliedCommand: string,
+  now: string,
+  emitted: EmittedEvent[],
+): Promise<string> {
+  const details = proposal.details;
+  if (details.kind !== 'capture_task') {
+    throw new CommandDeniedError('提议明细不匹配', { reason: 'details_mismatch' });
+  }
+  const task_id = `task_${ulid()}`;
+  const contractRev = 1;
+
+  addEmitted(emitted, await tx.append({
+    ...base,
+    type: 'TaskCaptured',
+    idempotency_key: `${keyPrefix}:captured`,
+    payload: {
+      task_id,
+      title: details.task.title,
+      description: details.task.description,
+      assignee_kind: details.task.assignee_kind,
+      goal_id: null,
+      capture_id: proposal.capture_id,
+      proposal_id: proposal.proposal_id,
+      acceptance_criteria: details.task.acceptance_criteria,
+      plan_rev_introduced: proposal.base_plan_rev,
+    },
+  }));
+
+  // REQ-ASG-1：人类在 UI/API 显式指派（(a) 路径）
+  addEmitted(emitted, await tx.append({
+    ...base,
+    type: 'AssignmentCreated',
+    idempotency_key: `${keyPrefix}:assigned`,
+    payload: {
+      assignment_id: `asg_${ulid()}`,
+      task_id,
+      actor_id: base.actor_id,
+      actor_kind: details.task.assignee_kind,
+      role: 'executor',
+      scope_note: '',
+      assigned_by: base.actor_id,
+    },
+  }));
+
+  addEmitted(emitted, await tx.append({
+    ...base,
+    type: 'TaskDefined',
+    idempotency_key: `${keyPrefix}:defined`,
+    payload: {
+      task_id,
+      title: details.task.title,
+      description: details.task.description,
+      contract_rev: contractRev,
+      acceptance_criteria: details.task.acceptance_criteria,
+      source_proposal_id: proposal.proposal_id,
+    },
+  }));
+
+  // captured → defined：守卫用 hasTitle / assigneeKind / contractStructured
+  addEmitted(emitted, (await tx.appendStateTransition({
+    ...base,
+    type: 'TaskLifecycleChanged',
+    entity: 'task',
+    idempotency_key: `${keyPrefix}:lc1`,
+    trigger_event_id: `${keyPrefix}:lc1:trigger`,
+    from: 'captured',
+    to: 'defined',
+    facts: {
+      hasTitle: details.task.title.trim().length > 0,
+      assigneeKind: details.task.assignee_kind,
+      contractStructured: details.task.acceptance_criteria.length > 0,
+    },
+    payload: { task_id },
+  })).event);
+
+  addEmitted(emitted, await tx.append({
+    ...base,
+    type: 'PlanChangeApplied',
+    idempotency_key: `${keyPrefix}:applied`,
+    payload: {
+      change_id: proposal.proposal_id,
+      command: appliedCommand,
+      task_id,
+      base_plan_rev: proposal.base_plan_rev,
+      applied_at: now,
+    },
+  }));
+
+  return task_id;
+}
+
+/**
+ * 当前计划版本（REQ-PC-1 的 base 复核口径）：服务端没有独立 rev 计数器，
+ * 以「1 + 已应用 PlanChange 数」为可判定口径——与种子/捕获流的
+ * base_plan_rev=1 起点对齐（首个变更以 rev 1 为 base，应用后 rev 进 2）。
+ */
+export function currentPlanRev(snapshot: ProjectionSnapshot, project_id: string): number {
+  return 1 + snapshot.proposals.filter((p) => p.project_id === project_id && p.status === 'applied').length;
+}
+
 async function acceptProposal(
   ctx: CommandContext,
   payload: Record<string, unknown>,
@@ -240,97 +390,74 @@ async function acceptProposal(
     });
   }
 
-  const task_id = `task_${ulid()}`;
+  // K1-A §3.4 approved_modified 路径：新 Change 以 supersedes_change_id 指向
+  // 旧 needs_decision Change 时，同事务把旧 Change 置 rejected
+  // （superseded_by_decision）并把其关联 Decision 置 approved_modified。
+  const supersedes_change_id = typeof payload.supersedes_change_id === 'string' ? payload.supersedes_change_id : null;
+  let superseded: ProposalRecord | null = null;
+  let supersededDecision: DecisionRecord | null = null;
+  let decisionReason: string | null = null;
+  if (supersedes_change_id !== null) {
+    superseded = snapshot.proposals.find((p) => p.proposal_id === supersedes_change_id) ?? null;
+    if (!superseded || superseded.status !== 'needs_decision') {
+      throw new CommandDeniedError(`被取代的变更 ${supersedes_change_id} 不存在或不在 needs_decision 状态`, {
+        reason: 'supersede_target_not_needs_decision',
+        supersedes_change_id,
+        status: superseded?.status ?? null,
+      });
+    }
+    decisionReason = typeof payload.decision_reason === 'string' ? payload.decision_reason : null;
+    if (decisionReason === null || decisionReason.trim() === '') {
+      throw new CommandValidationError('approved_modified 路径必须带 decision_reason 说明修改点', {
+        reason: 'schema_invalid',
+        field: 'decision_reason',
+      });
+    }
+    supersededDecision =
+      snapshot.decisions.find(
+        (d) => d.status === 'pending' && d.subject_ref.kind === 'plan_change' && d.subject_ref.id === supersedes_change_id,
+      ) ?? null;
+  }
+
   const emitted: EmittedEvent[] = [];
-  const correlation_id = newCorrelationId();
-  const base = {
+  const base: EventBase = {
     stream_id: asProjectId(proposal.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
     causation_id: null,
-    correlation_id,
+    correlation_id: newCorrelationId(),
   };
-  const details = proposal.details;
-  if (details.kind !== 'capture_task') throw new CommandDeniedError('提议明细不匹配', { reason: 'details_mismatch' });
-  const contractRev = 1;
+  const keyPrefix = receiptIdempotencyKey(client_submit_id);
+  let task_id = '';
 
   await ctx.store.withTransaction(async (tx) => {
-    addEmitted(emitted, await tx.append({
-      ...base,
-      type: 'TaskCaptured',
-      idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:captured`,
-      payload: {
-        task_id,
-        title: details.task.title,
-        description: details.task.description,
-        assignee_kind: details.task.assignee_kind,
-        goal_id: null,
-        capture_id: proposal.capture_id,
-        proposal_id: proposal.proposal_id,
-        acceptance_criteria: details.task.acceptance_criteria,
-        plan_rev_introduced: proposal.base_plan_rev,
-      },
-    }));
+    task_id = await materializeCaptureTaskChange(tx, base, proposal, keyPrefix, 'proposal_accept', now, emitted);
 
-    // REQ-ASG-1：人类在 UI/API 显式指派（(a) 路径）
-    addEmitted(emitted, await tx.append({
-      ...base,
-      type: 'AssignmentCreated',
-      idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:assigned`,
-      payload: {
-        assignment_id: `asg_${ulid()}`,
-        task_id,
-        actor_id: actor.actor_id,
-        actor_kind: details.task.assignee_kind,
-        role: 'executor',
-        scope_note: '',
-        assigned_by: actor.actor_id,
-      },
-    }));
-
-    addEmitted(emitted, await tx.append({
-      ...base,
-      type: 'TaskDefined',
-      idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:defined`,
-      payload: {
-        task_id,
-        title: details.task.title,
-        description: details.task.description,
-        contract_rev: contractRev,
-        acceptance_criteria: details.task.acceptance_criteria,
-        source_proposal_id: proposal.proposal_id,
-      },
-    }));
-
-    // captured → defined：守卫用 hasTitle / assigneeKind / contractStructured
-    addEmitted(emitted, (await tx.appendStateTransition({
-      ...base,
-      type: 'TaskLifecycleChanged',
-      entity: 'task',
-      idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc1`,
-      trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc1:trigger`,
-      from: 'captured',
-      to: 'defined',
-      facts: {
-        hasTitle: details.task.title.trim().length > 0,
-        assigneeKind: details.task.assignee_kind,
-        contractStructured: details.task.acceptance_criteria.length > 0,
-      },
-      payload: { task_id },
-    })).event);
-
-    addEmitted(emitted, await tx.append({
-      ...base,
-      type: 'PlanChangeApplied',
-      idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:applied`,
-      payload: {
-        change_id: proposal.proposal_id,
-        command: 'proposal_accept',
-        task_id,
-        base_plan_rev: proposal.base_plan_rev,
-        applied_at: ctx.clock().toISOString(),
-      },
-    }));
+    if (superseded !== null) {
+      addEmitted(emitted, await tx.append({
+        ...base,
+        type: 'PlanChangeStatusChanged',
+        idempotency_key: `${keyPrefix}:superseded`,
+        payload: { change_id: superseded.proposal_id, status: 'rejected', reason: 'superseded_by_decision', superseded_by: proposal.proposal_id },
+      }));
+      if (supersededDecision !== null) {
+        addEmitted(emitted, await tx.append({
+          ...base,
+          type: 'DecisionResolved',
+          idempotency_key: `${keyPrefix}:superseded-resolved`,
+          payload: {
+            decision_id: supersededDecision.decision_id,
+            project_id: supersededDecision.project_id,
+            verdict: 'approved_modified',
+            reason: decisionReason,
+            decided_by: actor.actor_id,
+            subject_ref: supersededDecision.subject_ref,
+            resolved_at: now,
+            superseded_by_change_id: proposal.proposal_id,
+          },
+        }));
+      }
+    }
 
     addEmitted(emitted, await tx.append(receipt(base, client_submit_id, 'proposal_accept', payload, { proposal_id, task_id, project_id: proposal.project_id }, now)));
   });
@@ -438,7 +565,7 @@ async function taskAdvance(
   }
 
   const emitted: EmittedEvent[] = [];
-  const base = {
+  const base: EventBase = {
     stream_id: asProjectId(task.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
@@ -446,8 +573,22 @@ async function taskAdvance(
     correlation_id: newCorrelationId(),
   };
   const from = task.lifecycle;
+  const keyPrefix = receiptIdempotencyKey(client_submit_id);
+  let dispatchedRunId: string | null = null;
+  // K1-B 重新派发：active 的 agent 任务无在飞 Run 时，advance 只新建 Run、不迁移。
+  const isRedispatch = from === 'active' && to === 'active';
 
   await ctx.store.withTransaction(async (tx) => {
+    if (isRedispatch) {
+      if (task.assignee_kind !== 'agent') {
+        throw new CommandDeniedError(`任务 ${task_id} 不是 agent 任务，不可重新派发`, {
+          reason: 'not_in_available_actions',
+          task_id,
+        });
+      }
+      dispatchedRunId = await createExecutorRun(tx, base, task, snapshot, `${keyPrefix}:run`, payload, actor, emitted);
+    }
+
     if (from === 'defined' && to === 'ready') {
       // ready 判定（REQ-SCH-1 的可判定子集）：wait_state=none ∧ 非疑似重复 ∧ 能力可用（人类在册）
       const liveWait = snapshot.wait_conditions.filter((wc) => wc.task_id === task_id && wc.status === 'active');
@@ -460,7 +601,13 @@ async function taskAdvance(
       }
     }
 
-    if (from === 'ready' && to === 'active') {
+    if (from === 'ready' && to === 'active' && task.assignee_kind === 'agent') {
+      // K1-B 派发：agent 执行者 → executor Run（created → queued），由节点经
+      // 长轮询领取（§4）；Task 随迁移进 active，Run 等待节点 ack/started。
+      dispatchedRunId = await createExecutorRun(tx, base, task, snapshot, `${keyPrefix}:run`, payload, actor, emitted);
+    }
+
+    if (from === 'ready' && to === 'active' && task.assignee_kind !== 'agent') {
       // 派发：人类执行者 → human_light Run（REQ-HUM-1：无租约、无心跳，created → running）
       const run_id = `run_${ulid()}`;
       addEmitted(emitted, await tx.append({
@@ -510,23 +657,119 @@ async function taskAdvance(
           : from === 'ready' && to === 'active'
             ? { runDispatched: true }
             : {};
-    addEmitted(emitted, (await tx.appendStateTransition({
-      ...base,
-      type: 'TaskLifecycleChanged',
-      entity: 'task',
-      idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc`,
-      trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc:trigger`,
+    if (!isRedispatch) {
+      addEmitted(emitted, (await tx.appendStateTransition({
+        ...base,
+        type: 'TaskLifecycleChanged',
+        entity: 'task',
+        idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc`,
+        trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc:trigger`,
+        from,
+        to,
+        facts: advanceFacts,
+        payload: { task_id },
+      })).event);
+    }
+
+    addEmitted(emitted, await tx.append(receipt(base, client_submit_id, 'task_advance', payload, {
+      task_id,
       from,
       to,
-      facts: advanceFacts,
-      payload: { task_id },
-    })).event);
-
-    addEmitted(emitted, await tx.append(receipt(base, client_submit_id, 'task_advance', payload, { task_id, from, to, project_id: task.project_id }, now)));
+      project_id: task.project_id,
+      ...(dispatchedRunId !== null ? { run_id: dispatchedRunId } : {}),
+      ...(isRedispatch ? { redispatched: true } : {}),
+    }, now)));
   });
 
   await ingestProject(ctx, task.project_id);
-  return finishCommand(ctx, 'task_advance', client_submit_id, emitted, { task_id, from, to, project_id: task.project_id });
+  return finishCommand(ctx, 'task_advance', client_submit_id, emitted, {
+    task_id,
+    from,
+    to,
+    project_id: task.project_id,
+    ...(dispatchedRunId !== null ? { run_id: dispatchedRunId } : {}),
+    ...(isRedispatch ? { redispatched: true } : {}),
+  });
+}
+
+/**
+ * K1-B：新建 executor Run（AssignmentCreated → RunCreated → RunQueued）。
+ * executor_kind / side_effect_level 可由命令 payload 覆盖（缺省
+ * agent_hands_shell / L1）；input_snapshot 携带任务书与可选 command，
+ * 节点据此执行（§4.1 信封由 dispatcher 从 RunCreated 事件组装）。
+ */
+async function createExecutorRun(
+  tx: PgEventStoreTx,
+  base: EventBase,
+  task: TaskRecord,
+  snapshot: ProjectionSnapshot,
+  keyPrefix: string,
+  payload: Record<string, unknown>,
+  actor: CommandActor,
+  emitted: EmittedEvent[],
+): Promise<string> {
+  const run_id = `run_${ulid()}`;
+  const assignment_id = `asg_${ulid()}`;
+  const executor_kind =
+    typeof payload.executor_kind === 'string' && payload.executor_kind.trim() !== ''
+      ? payload.executor_kind
+      : 'agent_hands_shell';
+  const side_effect_level =
+    typeof payload.side_effect_level === 'string' && ['L0', 'L1', 'L2', 'L3'].includes(payload.side_effect_level)
+      ? payload.side_effect_level
+      : 'L1';
+
+  addEmitted(emitted, await tx.append({
+    ...base,
+    type: 'AssignmentCreated',
+    idempotency_key: `${keyPrefix}:assigned`,
+    payload: {
+      assignment_id,
+      task_id: task.task_id,
+      actor_id: actor.actor_id,
+      actor_kind: 'agent',
+      role: 'executor',
+      scope_note: '',
+      assigned_by: actor.actor_id,
+    },
+  }));
+
+  addEmitted(emitted, await tx.append({
+    ...base,
+    type: 'RunCreated',
+    idempotency_key: `${keyPrefix}:created`,
+    payload: {
+      run_id,
+      task_id: task.task_id,
+      run_kind: 'executor',
+      assignment_id,
+      actor_id: actor.actor_id,
+      actor_version: 'k1',
+      executor_kind,
+      side_effect_level,
+      task_rev: 1,
+      contract_rev: task.current_contract_rev,
+      plan_rev: task.plan_rev_introduced,
+      input_snapshot: {
+        contract: { rev: task.current_contract_rev, acceptance_criteria: task.acceptance_criteria },
+        task: { task_id: task.task_id, title: task.title, description: task.description },
+        command: typeof payload.command === 'string' ? payload.command : null,
+        note_side_effect: typeof payload.note_side_effect === 'string' ? payload.note_side_effect : null,
+        assembled_by: 'kernel_assembler',
+      },
+      policy_snapshot: { policy_id: snapshot.projects.find((p) => p.project_id === task.project_id)?.policy_id ?? null },
+      idempotency_key: `${keyPrefix}:run`,
+    },
+  }));
+
+  addEmitted(emitted, await tx.append({
+    ...base,
+    type: 'RunQueued',
+    idempotency_key: `${keyPrefix}:queued`,
+    payload: { run_id, executor_kind, side_effect_level },
+  }));
+
+  return run_id;
 }
 
 /**
@@ -964,6 +1207,603 @@ async function taskCancel(
     awaiting_run_termination: blocking.map((r) => r.run_id),
     project_id: task.project_id,
   });
+}
+
+/**
+ * resolve_decision（K1-A §3.2）：人类裁决一条 pending Decision。
+ * 处理顺序固定：actor（非 human → 403）→ 存在性（404）→ 状态（expired →
+ * 409 decision_expired；已裁决 → 409 terminal_state 带当前状态）→ 入参
+ * （400 schema_invalid 字段级）→ 落盘。落盘 = DecisionResolved（唯一审计
+ * 记录）+ §3.4 效果，同事务。幂等由 runCommand 的回执层先行处理（重放
+ * 返回首次结果、零新事件），故本函数只处理首次执行。
+ */
+async function resolveDecision(
+  ctx: CommandContext,
+  payload: Record<string, unknown>,
+  client_submit_id: string,
+  actor: CommandActor,
+): Promise<CommandExecution> {
+  const now = ctx.clock().toISOString();
+  if (actor.actor_kind !== 'human') {
+    throw new CommandForbiddenError('裁决是人类-only 动作', {
+      reason: 'actor_not_human',
+      actor_kind: actor.actor_kind,
+    });
+  }
+  const decision_id = requireString(payload, 'decision_id');
+  const snapshot = ctx.projection.snapshot();
+  const decision = snapshot.decisions.find((d) => d.decision_id === decision_id);
+  if (!decision) {
+    throw new CommandNotFoundError(`Decision ${decision_id} 不存在`, { reason: 'not_found', decision_id });
+  }
+  if (decision.status === 'expired') {
+    throw new CommandDeniedError(`Decision ${decision_id} 已过期，裁决不产生任何效果`, {
+      reason: 'decision_expired',
+      decision_id,
+      status: decision.status,
+      decided_by: decision.decided_by,
+      decided_at: decision.decided_at,
+    });
+  }
+  if (decision.status !== 'pending') {
+    throw new CommandDeniedError(`Decision ${decision_id} 已裁决（status=${decision.status}）`, {
+      reason: 'terminal_state',
+      decision_id,
+      status: decision.status,
+      decided_by: decision.decided_by,
+      decided_at: decision.decided_at,
+    });
+  }
+
+  const verdict = payload.verdict;
+  if (verdict !== 'approved' && verdict !== 'rejected' && verdict !== 'deferred') {
+    throw new CommandValidationError('verdict 必须是 approved / rejected / deferred（approved_modified 不走本命令）', {
+      reason: 'schema_invalid',
+      field: 'verdict',
+    });
+  }
+  const reason = typeof payload.reason === 'string' ? payload.reason : null;
+  if (verdict === 'rejected' && (reason === null || reason.trim() === '')) {
+    throw new CommandValidationError('verdict=rejected 时 reason 必填非空', { reason: 'schema_invalid', field: 'reason' });
+  }
+  const wake = verdict === 'deferred' ? parseWakeCondition(payload.wake_condition) : null;
+
+  const subjectKind = decision.subject_ref.kind;
+  if (!['plan_change', 'run_reconciliation', 'duplicate_suspect'].includes(subjectKind)) {
+    throw new CommandDeniedError(`subject 类型 ${subjectKind} 在 K1 无已写明的裁决出路`, {
+      reason: 'subject_not_resolvable_in_k1',
+      decision_id,
+      subject_kind: subjectKind,
+    });
+  }
+
+  // subject 前置校验（效果落盘前完成，失败零事件）
+  let change: ProposalRecord | null = null;
+  let runTask: TaskRecord | null = null;
+  let runState: string | null = null;
+  let suspectTask: TaskRecord | null = null;
+  if (subjectKind === 'plan_change') {
+    change = snapshot.proposals.find((p) => p.proposal_id === decision.subject_ref.id) ?? null;
+    if (!change) {
+      throw new CommandDeniedError(`Decision ${decision_id} 指向的 PlanChange ${decision.subject_ref.id} 不存在`, {
+        reason: 'subject_not_resolvable_in_k1',
+        decision_id,
+        subject_kind: subjectKind,
+      });
+    }
+  }
+  let disposition: 'executed' | 'not_executed' | 'cancel_run' | null = null;
+  if (subjectKind === 'run_reconciliation') {
+    const run = snapshot.runs.find((r) => r.run_id === decision.subject_ref.id);
+    if (!run) {
+      throw new CommandDeniedError(`Decision ${decision_id} 指向的 Run ${decision.subject_ref.id} 不存在`, {
+        reason: 'subject_not_resolvable_in_k1',
+        decision_id,
+        subject_kind: subjectKind,
+      });
+    }
+    runState = run.state;
+    runTask = snapshot.tasks.find((t) => t.task_id === run.task_id) ?? null;
+    // m-03：disposition 的 400 字段校验先于 Run 状态前置——组合错误
+    // （Run 已非 indeterminate 且 disposition 缺失）先报 400 schema_invalid，
+    // 与 §3.5 的校验口径一致（单点行为不变）。
+    if (verdict === 'approved') {
+      const d = payload.disposition;
+      if (d !== 'executed' && d !== 'not_executed' && d !== 'cancel_run') {
+        throw new CommandValidationError('Run 对账 verdict=approved 时 disposition 必填且必须是 executed / not_executed / cancel_run', {
+          reason: 'schema_invalid',
+          field: 'disposition',
+        });
+      }
+      disposition = d;
+    }
+    if (verdict === 'approved' && run.state !== 'indeterminate') {
+      throw new CommandDeniedError(`Run ${run.run_id} 当前状态为 ${run.state}，不处于待对账（indeterminate）`, {
+        reason: 'precondition_unmet',
+        decision_id,
+        run_id: run.run_id,
+        run_state: run.state,
+      });
+    }
+  }
+  if (subjectKind === 'duplicate_suspect') {
+    suspectTask = snapshot.tasks.find((t) => t.task_id === decision.subject_ref.id) ?? null;
+    if (!suspectTask) {
+      throw new CommandDeniedError(`Decision ${decision_id} 指向的 Task ${decision.subject_ref.id} 不存在`, {
+        reason: 'subject_not_resolvable_in_k1',
+        decision_id,
+        subject_kind: subjectKind,
+      });
+    }
+    if (verdict !== 'deferred' && !suspectTask.duplicate_suspect) {
+      throw new CommandDeniedError(`Task ${suspectTask.task_id} 已不在疑似重复状态`, {
+        reason: 'precondition_unmet',
+        decision_id,
+        task_id: suspectTask.task_id,
+      });
+    }
+  }
+
+  // executed 处置需先经 Outcome Interpreter 提议（事务外，网络调用不进事务）
+  let outcomeDraft: Awaited<ReturnType<Proposer['interpretFeedback']>> | null = null;
+  if (subjectKind === 'run_reconciliation' && disposition === 'executed' && runTask !== null) {
+    outcomeDraft = await ctx.proposer.interpretFeedback({
+      taskTitle: runTask.title,
+      feedback: decision.question,
+      criteria: runTask.acceptance_criteria,
+    });
+  }
+
+  const emitted: EmittedEvent[] = [];
+  const base: EventBase = {
+    stream_id: asProjectId(decision.project_id),
+    actor_id: actor.actor_id,
+    actor_kind: actor.actor_kind,
+    causation_id: null,
+    correlation_id: newCorrelationId(),
+  };
+  const keyPrefix = receiptIdempotencyKey(client_submit_id);
+  const subject: Record<string, unknown> = {
+    decision_id,
+    project_id: decision.project_id,
+    verdict,
+    subject_ref: decision.subject_ref,
+  };
+
+  await ctx.store.withTransaction(async (tx) => {
+    // §3.3：DecisionResolved 是裁决事实的唯一审计记录，先行落盘。
+    const resolved = await tx.append({
+      ...base,
+      type: 'DecisionResolved',
+      idempotency_key: `${keyPrefix}:resolved`,
+      payload: {
+        decision_id,
+        project_id: decision.project_id,
+        verdict,
+        reason,
+        decided_by: actor.actor_id,
+        subject_ref: decision.subject_ref,
+        resolved_at: now,
+        ...(wake !== null ? { wake_condition: wake } : {}),
+        ...(disposition !== null ? { disposition } : {}),
+      },
+    });
+    addEmitted(emitted, resolved);
+
+    if (subjectKind === 'plan_change' && change !== null) {
+      await applyDecisionToPlanChange(tx, base, keyPrefix, decision, change, verdict, snapshot, now, emitted, subject);
+    }
+    if (subjectKind === 'run_reconciliation' && disposition !== null && runTask !== null) {
+      await applyDecisionToRunReconciliation(
+        tx, base, keyPrefix, decision, runTask, verdict, disposition, outcomeDraft, resolved.id, snapshot, now, emitted, subject,
+      );
+    }
+    if (subjectKind === 'duplicate_suspect' && suspectTask !== null) {
+      await applyDecisionToDuplicate(tx, base, keyPrefix, decision, suspectTask, verdict, snapshot, actor, now, emitted, subject);
+    }
+
+    addEmitted(emitted, await tx.append(receipt(base, client_submit_id, 'resolve_decision', payload, subject, now)));
+  });
+
+  await ingestProject(ctx, decision.project_id);
+  return finishCommand(ctx, 'resolve_decision', client_submit_id, emitted, subject);
+}
+
+/** deferred 的唤起条件校验（§3.2：必填；at_time 须带 at，on_event 须带 event_type）。 */
+function parseWakeCondition(value: unknown): DecisionWakeCondition {
+  const invalid = (): CommandValidationError =>
+    new CommandValidationError('verdict=deferred 时 wake_condition 必填：{kind:"at_time", at} 或 {kind:"on_event", event_type}', {
+      reason: 'schema_invalid',
+      field: 'wake_condition',
+    });
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw invalid();
+  const record = value as Record<string, unknown>;
+  if (record.kind === 'at_time') {
+    if (typeof record.at !== 'string' || Number.isNaN(Date.parse(record.at))) throw invalid();
+    return { kind: 'at_time', at: record.at, event_type: null };
+  }
+  if (record.kind === 'on_event') {
+    if (typeof record.event_type !== 'string' || record.event_type.trim() === '') throw invalid();
+    return { kind: 'on_event', at: null, event_type: record.event_type };
+  }
+  throw invalid();
+}
+
+/** PlanChange 应用（§3.4 approved）：capture_task 走任务物化，其余 kind 走通用应用；均补 PlanRevisionCreated。 */
+export async function applyPlanChangeForDecision(
+  tx: PgEventStoreTx,
+  base: EventBase,
+  keyPrefix: string,
+  change: ProposalRecord,
+  appliedCommand: string,
+  currentRev: number,
+  now: string,
+  emitted: EmittedEvent[],
+): Promise<string | null> {
+  let taskId: string | null = null;
+  if (change.kind === 'capture_task' && change.details.kind === 'capture_task') {
+    taskId = await materializeCaptureTaskChange(tx, base, change, keyPrefix, appliedCommand, now, emitted);
+  } else {
+    addEmitted(emitted, await tx.append({
+      ...base,
+      type: 'PlanChangeApplied',
+      idempotency_key: `${keyPrefix}:applied`,
+      payload: { change_id: change.proposal_id, command: appliedCommand, applied_at: now },
+    }));
+  }
+  addEmitted(emitted, await tx.append({
+    ...base,
+    type: 'PlanRevisionCreated',
+    idempotency_key: `${keyPrefix}:revision`,
+    payload: { change_id: change.proposal_id, plan_rev: currentRev + 1, base_plan_rev: change.base_plan_rev, ops: change.ops },
+  }));
+  return taskId;
+}
+
+/** §3.4 PlanChange 行：approved 重走 REQ-PC-1 base 复核；rejected 置 decision_rejected；deferred 无即时效果。 */
+async function applyDecisionToPlanChange(
+  tx: PgEventStoreTx,
+  base: EventBase,
+  keyPrefix: string,
+  decision: DecisionRecord,
+  change: ProposalRecord,
+  verdict: 'approved' | 'rejected' | 'deferred',
+  snapshot: ProjectionSnapshot,
+  now: string,
+  emitted: EmittedEvent[],
+  subject: Record<string, unknown>,
+): Promise<void> {
+  if (verdict === 'rejected') {
+    addEmitted(emitted, await tx.append({
+      ...base,
+      type: 'PlanChangeStatusChanged',
+      idempotency_key: `${keyPrefix}:change-rejected`,
+      payload: { change_id: change.proposal_id, status: 'rejected', reason: 'decision_rejected' },
+    }));
+    return;
+  }
+  if (verdict !== 'approved') return;
+
+  const currentRev = currentPlanRev(snapshot, decision.project_id);
+  if (change.base_plan_rev !== currentRev) {
+    // base_rev_conflict 不是命令失败：生成新 pending Decision，原样维持 needs_decision（§3.5）。
+    const followUpId = `dec_${ulid()}`;
+    addEmitted(emitted, await tx.append({
+      ...base,
+      type: 'DecisionCreated',
+      idempotency_key: `${keyPrefix}:follow-up`,
+      payload: {
+        decision_id: followUpId,
+        subject_ref: { kind: 'plan_change', id: change.proposal_id },
+        question: `计划变更 ${change.proposal_id} 的基线版本已变化（base_rev_conflict：申报 base=${change.base_plan_rev}，当前=${currentRev}），请基于当前版本重新裁决`,
+        recommendation: '基于当前计划版本重新审阅该变更后再次裁决',
+        alternatives: [],
+        evidence_refs: [`base_rev:${change.base_plan_rev}`, `current_rev:${currentRev}`],
+        follow_up_of: decision.decision_id,
+        created_by: 'system',
+      },
+    }));
+    subject.follow_up_decision_id = followUpId;
+    return;
+  }
+
+  const taskId = await applyPlanChangeForDecision(tx, base, keyPrefix, change, 'resolve_decision', currentRev, now, emitted);
+  subject.applied_task_id = taskId;
+  subject.plan_rev = currentRev + 1;
+}
+
+/** §3.4 Run 对账行：按 disposition 补录 Outcome 流 / 置 failed / 置 canceled 并推进挂起取消。 */
+async function applyDecisionToRunReconciliation(
+  tx: PgEventStoreTx,
+  base: EventBase,
+  keyPrefix: string,
+  decision: DecisionRecord,
+  task: TaskRecord,
+  verdict: 'approved' | 'rejected' | 'deferred',
+  disposition: 'executed' | 'not_executed' | 'cancel_run' | null,
+  outcomeDraft: Awaited<ReturnType<Proposer['interpretFeedback']>> | null,
+  resolvedEventId: string,
+  snapshot: ProjectionSnapshot,
+  now: string,
+  emitted: EmittedEvent[],
+  subject: Record<string, unknown>,
+): Promise<void> {
+  if (verdict !== 'approved' || disposition === null) return; // rejected/deferred：维持 indeterminate，无效果事件
+  const run_id = decision.subject_ref.id;
+
+  if (disposition === 'executed') {
+    if (outcomeDraft === null) throw new Error('executed 处置缺少 Outcome 提议（内部错误）');
+    const { draft, meta } = outcomeDraft;
+    const outcome_id = `out_${ulid()}`;
+    addEmitted(emitted, await tx.append({
+      ...base,
+      type: 'OutcomeRecorded',
+      idempotency_key: `${keyPrefix}:outcome`,
+      payload: {
+        outcome_id,
+        task_id: task.task_id,
+        run_id,
+        feedback_id: null,
+        conclusion_kind: draft.conclusion_kind,
+        info_obtained: draft.info_obtained,
+        certainty: draft.certainty,
+        evidence_sufficiency: draft.evidence_sufficiency,
+        blockers: draft.blockers,
+        followup_suggestions: draft.followup_suggestions,
+        interpreted_by: meta.degraded ? 'outcome_interpreter:fallback' : `outcome_interpreter:${meta.model}`,
+        proposal_id: `pc_dec_${decision.decision_id}`,
+        reconciled_decision_id: decision.decision_id,
+      },
+    }));
+    addEmitted(emitted, (await tx.appendStateTransition({
+      ...base,
+      type: 'RunSucceeded',
+      entity: 'run',
+      idempotency_key: `${keyPrefix}:run-succeeded`,
+      trigger_event_id: resolvedEventId,
+      from: 'indeterminate',
+      to: 'succeeded',
+      facts: { reconciliation: 'completed' },
+      payload: { run_id, outcome_id },
+    })).event);
+    if (task.lifecycle === 'active') {
+      addEmitted(emitted, (await tx.appendStateTransition({
+        ...base,
+        type: 'TaskLifecycleChanged',
+        entity: 'task',
+        idempotency_key: `${keyPrefix}:lc`,
+        trigger_event_id: resolvedEventId,
+        from: 'active',
+        to: 'awaiting_acceptance',
+        facts: { runOutcomeRecorded: true },
+        payload: { task_id: task.task_id, outcome_id },
+      })).event);
+    }
+    subject.outcome_id = outcome_id;
+    return;
+  }
+
+  if (disposition === 'not_executed') {
+    addEmitted(emitted, (await tx.appendStateTransition({
+      ...base,
+      type: 'RunFailed',
+      entity: 'run',
+      idempotency_key: `${keyPrefix}:run-failed`,
+      trigger_event_id: resolvedEventId,
+      from: 'indeterminate',
+      to: 'failed',
+      facts: { reconciliation: 'not_executed' },
+      payload: { run_id, reason: 'reconciled_not_executed' },
+    })).event);
+    return;
+  }
+
+  // cancel_run：Run 置 canceled；若该 Task 有挂起的取消意图且其余 Run 全终态，推进 REQ-RUN-6 第③步。
+  addEmitted(emitted, (await tx.appendStateTransition({
+    ...base,
+    type: 'RunCanceled',
+    entity: 'run',
+    idempotency_key: `${keyPrefix}:run-canceled`,
+    trigger_event_id: resolvedEventId,
+    from: 'indeterminate',
+    to: 'canceled',
+    facts: { reconciliationConcluded: true },
+    payload: { run_id, reason: 'reconciled_cancel_run' },
+  })).event);
+  if (task.cancel_requested_by !== null && task.lifecycle !== 'accepted' && task.lifecycle !== 'canceled') {
+    const othersLive = snapshot.runs.some(
+      (r) =>
+        r.task_id === task.task_id &&
+        r.run_id !== run_id &&
+        ['created', 'queued', 'leased', 'running', 'indeterminate'].includes(r.state),
+    );
+    if (!othersLive) {
+      for (const wc of snapshot.wait_conditions.filter((w) => w.task_id === task.task_id && w.status === 'active')) {
+        addEmitted(emitted, await tx.append({
+          ...base,
+          type: 'WaitConditionCanceled',
+          idempotency_key: `${keyPrefix}:wc-${wc.wait_condition_id}`,
+          payload: { wait_condition_id: wc.wait_condition_id, task_id: task.task_id, reason: 'task_canceled' },
+        }));
+      }
+      if (task.wait_state !== 'none') {
+        addEmitted(emitted, await tx.append({
+          ...base,
+          type: 'TaskWaitStateChanged',
+          idempotency_key: `${keyPrefix}:ws`,
+          payload: { task_id: task.task_id, from: task.wait_state, to: 'none', reason: 'task_canceled (INV-11)' },
+        }));
+      }
+      const transition = await tx.appendStateTransition({
+        ...base,
+        type: 'TaskLifecycleChanged',
+        entity: 'task',
+        idempotency_key: `${keyPrefix}:lc`,
+        trigger_event_id: resolvedEventId,
+        from: task.lifecycle,
+        to: 'canceled',
+        facts: { allRunsTerminal: true },
+        payload: { task_id: task.task_id },
+      });
+      addEmitted(emitted, transition.event);
+      const taskCanceledEventId = transition.closure?.task_canceled_event_id ?? null;
+      if (taskCanceledEventId !== null) {
+        const stream = await tx.readStream(asProjectId(task.project_id), 1);
+        const taskCanceled = stream.find((e) => e.id === taskCanceledEventId);
+        if (taskCanceled) addEmitted(emitted, taskCanceled);
+      }
+      subject.task_canceled = true;
+    }
+  }
+}
+
+/** §3.4 疑似重复行：approved 级联取消（REQ-RUN-6，原因 duplicate_merged）；rejected 放行恢复。 */
+async function applyDecisionToDuplicate(
+  tx: PgEventStoreTx,
+  base: EventBase,
+  keyPrefix: string,
+  decision: DecisionRecord,
+  task: TaskRecord,
+  verdict: 'approved' | 'rejected' | 'deferred',
+  snapshot: ProjectionSnapshot,
+  actor: CommandActor,
+  now: string,
+  emitted: EmittedEvent[],
+  subject: Record<string, unknown>,
+): Promise<void> {
+  if (verdict === 'deferred') return; // 维持挂起 + 唤起条件（已在 DecisionResolved 落账）
+  if (verdict === 'rejected') {
+    addEmitted(emitted, await tx.append({
+      ...base,
+      type: 'TaskDuplicateResolved',
+      idempotency_key: `${keyPrefix}:duplicate-resolved`,
+      payload: { task_id: task.task_id, duplicate_of: decision.duplicate_of, resolved_by: actor.actor_id },
+    }));
+    return;
+  }
+
+  // approved = 确认重复并合并
+  const liveRuns = snapshot.runs.filter(
+    (r) => r.task_id === task.task_id && ['created', 'queued', 'leased', 'running'].includes(r.state),
+  );
+  const blocking = liveRuns.filter((r) => r.run_kind !== 'human_light');
+  if (task.cancel_requested_by === null) {
+    addEmitted(emitted, await tx.append({
+      ...base,
+      type: 'TaskCancelRequested',
+      idempotency_key: `${keyPrefix}:cancel-requested`,
+      payload: { task_id: task.task_id, requested_by: actor.actor_id, reason: 'duplicate_merged', duplicate_of: decision.duplicate_of },
+    }));
+  }
+  for (const run of liveRuns.filter((r) => r.run_kind === 'human_light')) {
+    addEmitted(emitted, await tx.append({
+      ...base,
+      type: 'RunCanceled',
+      idempotency_key: `${keyPrefix}:run-${run.run_id}`,
+      payload: { run_id: run.run_id, reason: 'duplicate_merged' },
+    }));
+  }
+  if (blocking.length > 0) {
+    // executor Run 在飞：只落取消意图，正式取消等 Run 终态后由取消链推进（如实标注，不假装已合并）。
+    subject.cascade = 'awaiting_run_termination';
+    subject.awaiting_run_termination = blocking.map((r) => r.run_id);
+    return;
+  }
+  const activeWaits = snapshot.wait_conditions.filter((w) => w.task_id === task.task_id && w.status === 'active');
+  for (const wc of activeWaits) {
+    addEmitted(emitted, await tx.append({
+      ...base,
+      type: 'WaitConditionCanceled',
+      idempotency_key: `${keyPrefix}:wc-${wc.wait_condition_id}`,
+      payload: { wait_condition_id: wc.wait_condition_id, task_id: task.task_id, reason: 'duplicate_merged' },
+    }));
+  }
+  if (task.wait_state !== 'none') {
+    addEmitted(emitted, await tx.append({
+      ...base,
+      type: 'TaskWaitStateChanged',
+      idempotency_key: `${keyPrefix}:ws`,
+      payload: { task_id: task.task_id, from: task.wait_state, to: 'none', reason: 'duplicate_merged' },
+    }));
+  }
+  const transition = await tx.appendStateTransition({
+    ...base,
+    type: 'TaskLifecycleChanged',
+    entity: 'task',
+    idempotency_key: `${keyPrefix}:lc`,
+    trigger_event_id: `${keyPrefix}:lc:trigger`,
+    from: task.lifecycle,
+    to: 'canceled',
+    facts: { allRunsTerminal: true },
+    payload: { task_id: task.task_id, reason: 'duplicate_merged', duplicate_of: decision.duplicate_of },
+  });
+  addEmitted(emitted, transition.event);
+  const taskCanceledEventId = transition.closure?.task_canceled_event_id ?? null;
+  if (taskCanceledEventId !== null) {
+    const stream = await tx.readStream(asProjectId(task.project_id), 1);
+    const taskCanceled = stream.find((e) => e.id === taskCanceledEventId);
+    if (taskCanceled) addEmitted(emitted, taskCanceled);
+  }
+  subject.cascade = 'completed';
+  subject.merged_into = decision.duplicate_of;
+
+  // §3.4 / REQ-DD-2：被疑 Task 的未决事项以 PlanChange 并入目标 Task——
+  // 同事务生成一条以目标 Task 为 subject 的 PlanChange：ops 机器可读地
+  // 枚举被带走的未决事项（活跃等待条件逐条 + 验收标准），details 以
+  // wait_condition 形状指向被合并 Task；client_proposal_id 与响应
+  // subject.merged_change_id 使其在 DecisionResolved 审计链上可溯。
+  // 仅在级联真正完成时生成（在飞 Run 未终态时不假装已合并）。
+  const targetTaskId = decision.duplicate_of;
+  if (typeof targetTaskId === 'string' && targetTaskId !== '') {
+    const mergedChangeId = `pc_${ulid()}`;
+    addEmitted(emitted, await tx.append({
+      ...base,
+      type: 'PlanChangeProposed',
+      idempotency_key: `${keyPrefix}:merge-change`,
+      payload: {
+        change_id: mergedChangeId,
+        client_proposal_id: `merge:${decision.decision_id}`,
+        kind: 'wait_condition',
+        capture_id: null,
+        task_id: targetTaskId,
+        base_plan_rev: currentPlanRev(snapshot, task.project_id),
+        ops: [
+          { op: 'merge_task', from_task_id: task.task_id, into_task_id: targetTaskId, decision_id: decision.decision_id },
+          ...activeWaits.map((wc) => ({
+            op: 'carry_wait_condition',
+            wait_condition_id: wc.wait_condition_id,
+            kind: wc.kind,
+            target_ref: wc.target_ref,
+          })),
+          ...(task.acceptance_criteria.length > 0
+            ? [{ op: 'carry_acceptance_criteria', criteria: task.acceptance_criteria }]
+            : []),
+        ],
+        risk_level: 'L0',
+        rationale: `疑似重复合并（Decision ${decision.decision_id} 裁决）：被疑 Task ${task.task_id} 的未决事项并入目标 Task ${targetTaskId}`,
+        assumptions: [],
+        proposer: {
+          source: 'fallback',
+          model: null,
+          degraded: true,
+          degraded_reason: 'duplicate_merged：裁决驱动的系统并入，非模型提议',
+          latency_ms: null,
+        },
+        details: {
+          kind: 'wait_condition',
+          task_id: targetTaskId,
+          wait: {
+            kind: 'dependency',
+            target_ref: task.task_id,
+            reason: `duplicate_merged：未决事项自被合并 Task ${task.task_id} 并入（清单见 ops）`,
+          },
+        },
+        proposed_at: now,
+      },
+    }));
+    subject.merged_change_id = mergedChangeId;
+    subject.carried_wait_conditions = activeWaits.map((wc) => wc.wait_condition_id);
+  }
 }
 
 // ---------------------------------------------------------------------------

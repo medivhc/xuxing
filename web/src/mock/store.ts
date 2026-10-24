@@ -259,9 +259,8 @@ export class MockStore {
         project_id: decision.project_id,
         decision_id: decision.decision_id,
         rank: (rank += 1),
-        // resolve_decision 无服务端对应、动作入口已下线（FIX-ROUND-1 R-1）：
-        // 决策仍作为 attention 呈现，但不再广告任何可执行动作。
-        available_actions: [],
+        // K1-A：resolve_decision 已进 canonical 词表，attention 广告该动作。
+        available_actions: ['resolve_decision'],
         created_at: decision.created_at,
       });
     }
@@ -296,19 +295,45 @@ export class MockStore {
   }
 
   actionsProjection(): MyActionsProjection {
-    // 真形状对齐（FIX-ROUND-4）：服务端 myActionItems 只产任务项——扁平
-    // {task_id, project_id, project_name, title, lifecycle, wait_state,
-    // next_action, available_actions, updated_global_seq}，且只收
-    // available_actions 非空者。此前 mock 在此发明 kind/decision/rank 形状，
-    // 页面按 mock 形状消费、与真投影脱节（ACTIONS-EMPTY-1024）。
-    // 决策不经此投影：mock 决策仍只在 home attention 呈现（与真服务端一致）。
+    // K1 §3.6 形状（与真服务端 myActionItems 对齐）：扁平联合条目，
+    // decision 在前、rank 顺序编号。mock 的 Decision 是独立演示实体，
+    // subject_ref 以 plan_change:<decision_id> 近似（图效果以真服务端为准）。
+    // task 条目保持 FIX-ROUND-4 对齐的真投影口径：只收 wait_state=none 且
+    // available_actions 非空者，next_action 用命令标签（不再发明 decision 占位卡）。
     const items: MyActionsProjection['items'] = [];
+    for (const decision of this.decisions.values()) {
+      if (decision.status !== 'pending') continue;
+      items.push({
+        kind: 'decision',
+        item_id: `decision:${decision.decision_id}`,
+        rank: 0,
+        task_id: null,
+        project_id: decision.project_id,
+        project_name: this.project.name,
+        title: null,
+        lifecycle: null,
+        wait_state: null,
+        next_action: '裁决此决策',
+        available_actions: ['resolve_decision'],
+        updated_global_seq: decision.updated_global_seq,
+        decision_id: decision.decision_id,
+        subject_ref: { kind: 'plan_change', id: decision.decision_id },
+        question: decision.question,
+        recommendation: decision.recommendation,
+        alternatives: decision.alternatives,
+        evidence_refs: decision.evidence_refs,
+        created_at: decision.created_at,
+      });
+    }
     for (const task of this.tasks.values()) {
       if (!MY_ACTIONS_LIFECYCLES.has(task.lifecycle)) continue;
       if (task.wait_state !== 'none') continue;
       const actions = taskActions(task);
       if (actions.length === 0) continue;
       items.push({
+        kind: 'task',
+        item_id: `task:${task.task_id}`,
+        rank: 0,
         task_id: task.task_id,
         project_id: SEED_PROJECT_ID,
         project_name: this.project.name,
@@ -318,9 +343,18 @@ export class MockStore {
         next_action: NEXT_ACTION_LABELS[actions[0]!] ?? '',
         available_actions: actions,
         updated_global_seq: task.updated_global_seq,
+        decision_id: null,
+        subject_ref: null,
+        question: null,
+        recommendation: null,
+        alternatives: [],
+        evidence_refs: [],
+        created_at: null,
       });
     }
-    items.sort((a, b) => a.updated_global_seq - b.updated_global_seq);
+    items.forEach((item, i) => {
+      item.rank = i + 1;
+    });
     return { ...this.projectionMeta(), actor_id: MOCK_HUMAN_ACTOR, items };
   }
 

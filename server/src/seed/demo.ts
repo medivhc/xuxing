@@ -21,6 +21,16 @@ export const DEGRADED_PROJECT_ID = 'proj-degraded';
 export const DEGRADED_PROPOSAL_ID = 'prop-degraded-1';
 export const DEGRADED_GOAL_ID = 'goal-degraded-1';
 
+/**
+ * K1-A 决策夹具（K1-SPEC §3.6 / J1）：两条 needs_decision 的 PlanChange +
+ * 各自关联的 pending Decision。与 R-7② 同项目（proj-degraded），供
+ * resolve_decision 旅程与 My Actions decision 条目演示/测试按 id 直达。
+ */
+export const K1_DECISION_CHANGE_ID = 'prop-degraded-decision';
+export const K1_DECISION_ID = 'dec-degraded-1';
+export const K1_DECISION_CHANGE2_ID = 'prop-degraded-decision-2';
+export const K1_DECISION2_ID = 'dec-degraded-2';
+
 export const DEMO_PROJECT = {
   project_id: DEFAULT_PROJECT_ID,
   name: '续行演示 · 客户方案落地',
@@ -444,6 +454,9 @@ export async function seedDemo(input: {
   // 只是一条已落账的 degraded 提议：断开 magpie 时同样可达，界面只需读投影就能演示"这不是智能产出"。
   await seedDegradedFixture({ store, projection, actor_id });
 
+  // K1-A 决策夹具：needs_decision PlanChange + pending Decision（§3.6 收录口径）。
+  await seedK1DecisionFixtures({ store, projection, actor_id });
+
   return {
     project_id,
     created: existing === undefined,
@@ -526,6 +539,110 @@ async function seedDegradedFixture(input: {
         seeded: true,
       },
     });
+  });
+
+  await ingest(store, projection, DEGRADED_PROJECT_ID);
+}
+
+/**
+ * K1-A 决策夹具：两条 PlanChange 走 REQ-PC-3 口径置 needs_decision，并各产生
+ * 一条 pending Decision（subject_ref 指向 Change）。base_plan_rev=1 与
+ * currentPlanRev 口径对齐（该项目尚无已应用变更 → 当前 rev=1），批准可直达应用。
+ */
+async function seedK1DecisionFixtures(input: {
+  store: PgEventStore;
+  projection: ProjectionService;
+  actor_id: string;
+}): Promise<void> {
+  const { store, projection, actor_id } = input;
+  const snapshot = projection.snapshot();
+  if (snapshot.decisions.some((d) => d.decision_id === K1_DECISION_ID)) return;
+
+  const base = {
+    stream_id: asProjectId(DEGRADED_PROJECT_ID),
+    actor_id,
+    actor_kind: 'human' as const,
+    causation_id: null,
+    correlation_id: `seed-${DEGRADED_PROJECT_ID}-k1`,
+  };
+  const key = (suffix: string) => `seed:${DEGRADED_PROJECT_ID}:k1:${suffix}`;
+
+  const fixtures = [
+    {
+      change_id: K1_DECISION_CHANGE_ID,
+      decision_id: K1_DECISION_ID,
+      title: '整理客户回访清单',
+      description: '按最近三次沟通记录整理回访清单并标注优先级（种子预置的待裁决变更）。',
+      question: '是否把「整理客户回访清单」加入当前计划？该变更由降级草稿产生，需人工确认范围。',
+      recommendation: '建议批准：回访清单是后续报价跟进的前置。',
+    },
+    {
+      change_id: K1_DECISION_CHANGE2_ID,
+      decision_id: K1_DECISION2_ID,
+      title: '归档旧版合同模板',
+      description: '把旧版合同模板移入归档目录（种子预置的待裁决变更）。',
+      question: '是否把「归档旧版合同模板」加入当前计划？',
+      recommendation: '建议拒绝：旧版模板仍在法务复核中，暂不应归档。',
+    },
+  ];
+
+  await store.withTransaction(async (tx) => {
+    for (const fixture of fixtures) {
+      await tx.append({
+        ...base,
+        type: 'PlanChangeProposed',
+        idempotency_key: key(`${fixture.change_id}:proposal`),
+        payload: {
+          change_id: fixture.change_id,
+          client_proposal_id: `cap-${fixture.change_id}`,
+          kind: 'capture_task',
+          capture_id: `cap-${fixture.change_id}`,
+          task_id: null,
+          base_plan_rev: 1,
+          ops: [{ op: 'add_task' }],
+          risk_level: 'L1',
+          rationale: '种子预置：该变更需人工裁决（REQ-PC-3）',
+          assumptions: ['裁决前不产生任何任务图变化'],
+          proposer: {
+            source: 'fallback',
+            model: null,
+            degraded: true,
+            degraded_reason: 'not_configured',
+            latency_ms: null,
+          },
+          details: {
+            task: {
+              title: fixture.title,
+              description: fixture.description,
+              assignee_kind: 'human',
+              acceptance_criteria: [{ criterion_ref: 'c1', text: '事项已完成并留有可核对记录', auto: false }],
+            },
+          },
+          proposed_at: null,
+          seeded: true,
+        },
+      });
+      await tx.append({
+        ...base,
+        type: 'PlanChangeStatusChanged',
+        idempotency_key: key(`${fixture.change_id}:needs-decision`),
+        payload: { change_id: fixture.change_id, status: 'needs_decision', reason: 'risk_requires_decision' },
+      });
+      await tx.append({
+        ...base,
+        type: 'DecisionCreated',
+        idempotency_key: key(`${fixture.decision_id}:created`),
+        payload: {
+          decision_id: fixture.decision_id,
+          subject_ref: { kind: 'plan_change', id: fixture.change_id },
+          question: fixture.question,
+          recommendation: fixture.recommendation,
+          alternatives: ['批准并应用', '拒绝该变更', '暂缓，等待更多信息'],
+          evidence_refs: [`change:${fixture.change_id}`],
+          created_by: 'system',
+        },
+      });
+    }
   });
 
   await ingest(store, projection, DEGRADED_PROJECT_ID);

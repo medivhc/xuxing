@@ -105,25 +105,35 @@ export interface MyActionsProjection extends ProjectionMeta {
   items: ActionItem[];
 }
 
-// 形状以服务端 server/src/api/views.ts 的 ActionItem / myActionItems 为准
-// （FIX-ROUND-4 对齐真投影，与 tests/journeys/contract.mts 同定义）。
-// 此前本节按 mock 形状写：item_id/kind/task|decision 联合、rank、decision
-// 包装、blocked_reason——真投影一样都没有，已部署「待我处理」页把每条任务
-// 都误判为 decision 行、只渲染下线占位卡（ACTIONS-EMPTY-1024）。真投影是
-// 扁平任务列表：只有任务、只有标题/项目名/下一步标签，不发明投影字段。
-// 决策待办不经此端点（服务端 myActionItems 只产任务）：决策在 Home
-// attention 呈现并跳项目页（FIX-ROUND-3 裁决；resolve_decision 仍属 K1 缺口）。
+/**
+ * My Actions 条目（形状以服务端 server/src/api/views.ts 的 ActionItem 为准，
+ * K1 §3.6 定版）：封闭联合 kind ∈ {task, decision}。task 条目是 K0 扁平字段
+ * （title/project_name/lifecycle/wait_state/next_action，与 FIX-ROUND-4 对齐的
+ * 真投影字段同源）；decision 条目带 subject_ref/question/recommendation/
+ * alternatives/evidence_refs/created_at，available_actions 恒为
+ * ["resolve_decision"]。rank 由服务端统一计算，前端只渲染不自算。
+ */
 export interface ActionItem {
-  task_id: string;
+  kind: 'task' | 'decision';
+  item_id: string;
+  rank: number;
+  task_id: string | null;
   project_id: string;
   project_name: string;
-  title: string;
-  lifecycle: TaskLifecycle;
-  wait_state: TaskWaitState;
+  title: string | null;
+  lifecycle: TaskLifecycle | null;
+  wait_state: TaskWaitState | null;
   /** 内核给出的下一步标签（给用户看的文案，不是 command_type） */
   next_action: string;
   available_actions: string[];
   updated_global_seq: number;
+  decision_id: string | null;
+  subject_ref: { kind: string; id: string } | null;
+  question: string | null;
+  recommendation: string | null;
+  alternatives: string[];
+  evidence_refs: string[];
+  created_at: string | null;
 }
 
 // ---------- Project（GET /api/projects/:projectId） ----------
@@ -315,7 +325,8 @@ export type CommandType =
   | 'task_advance'
   | 'feedback_submit'
   | 'acceptance_record'
-  | 'task_cancel';
+  | 'task_cancel'
+  | 'resolve_decision';
 
 /** canonical 词表全量（单一来源：mock 校验命令体形状以此为准）。 */
 export const CANONICAL_COMMAND_TYPES: readonly CommandType[] = [
@@ -325,6 +336,7 @@ export const CANONICAL_COMMAND_TYPES: readonly CommandType[] = [
   'feedback_submit',
   'acceptance_record',
   'task_cancel',
+  'resolve_decision',
 ];
 
 export interface CommandRequest {
@@ -361,4 +373,6 @@ export interface HealthResponse {
   /** 数据库连接态（如 'ok'）；K0 界面未消费，仅客户端保留端点封装。 */
   db: string;
   projection_version: number;
+  /** K1-C：用户面访问控制是否启用（入口门据此决定是否先行拦截）。 */
+  auth_enabled?: boolean;
 }

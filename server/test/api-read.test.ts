@@ -128,14 +128,20 @@ describe('§4 HTTP 契约：投影类端点', () => {
     const home = await jsonOf(await api(booted, '/api/home'));
     expect(home.data.projects.some((p: any) => p.project_id === 'proj-degraded')).toBe(true);
     expect(home.data.proposals.degraded).toBeGreaterThanOrEqual(1);
-    // 待决提议必须进 attention（decision_pending），形状与契约 §2.2 一致
-    const pending = home.data.attention.find(
+    // K1 口径：attention 的 decision_pending 只由 Decision 实体派生；
+    // prop-degraded-1 是普通待决提议（无关联 Decision），不得再派生条目。
+    const fromProposal = home.data.attention.find(
       (a: any) => a.kind === 'decision_pending' && a.decision_id === 'prop-degraded-1',
     );
+    expect(fromProposal).toBeUndefined();
+    // K1 决策夹具的 Decision 必须进 attention，动作是 resolve_decision。
+    const pending = home.data.attention.find(
+      (a: any) => a.kind === 'decision_pending' && a.decision_id === 'dec-degraded-1',
+    );
     expect(pending).toMatchObject({
-      attention_id: 'attention:decision_pending:prop-degraded-1',
+      attention_id: 'attention:decision_pending:dec-degraded-1',
       project_id: 'proj-degraded',
-      available_actions: ['proposal_accept', 'proposal_reject'],
+      available_actions: ['resolve_decision'],
     });
     expect(typeof pending.rank).toBe('number');
     expect(typeof pending.created_at).toBe('string');
