@@ -15,7 +15,7 @@ D1 云端内核 + 本地执行节点 · D2 内核 TypeScript · D3 K0/K1 不引�
 
 ## 阶段
 
-- **K0 脊柱**（进行中）：Event Store + Task/Run/Feedback/Outcome/Acceptance + PlanChange 校验 + 单个代码 Agent 适配器 + 人类执行者 + Web 四入口最小形态 + 副作用 L0/L1。领域 spec 已冻结 v1.0（2026-10-21，三轮 contract-review APPROVED，见 `spec/FREEZE-LOG.md`）；脚手架已建（src/kernel 事件目录 53 类型与 spec §4 逐字对应、领域类型、EventStore 接口、G1 测试骨架）。develop 第一批已落：Event Store 的 PG 实现（`src/kernel/event-store-pg.ts`）+ 迁移矩阵校验器（`src/kernel/transition-guard.ts`），C2/C5 以真 PostgreSQL 16 容器验收。
+- **K0 脊柱**（进行中）：Event Store + Task/Run/Feedback/Outcome/Acceptance + PlanChange 校验 + 单个代码 Agent 适配器 + 人类执行者 + Web 四入口最小形态 + 副作用 L0/L1。领域 spec 已冻结 v1.0（2026-10-21，三轮 contract-review APPROVED，见 `spec/FREEZE-LOG.md`）。develop 第一批：Event Store 的 PG 实现（`src/kernel/event-store-pg.ts`）+ 迁移矩阵校验器（`src/kernel/transition-guard.ts`），C2/C5 以真 PostgreSQL 16 容器验收。develop 第二批：批量追加（`appendBatch`）、Run 事件命令层守卫（`run-events.ts`）、事务作用域/COMMIT 真实性硬化、增量消费水位（`tailing`，水位落库 + 投递幂等）、Scheduler 定时器（REQ-SCH-3）与 Acceptance 重算（REQ-ACC-3）机制。
 - K1 可信 / K2 协作 / K3 积累：见技术方案 §2.12
 
 ## 开发
@@ -30,9 +30,9 @@ npm test          # 自动确保 PG 容器；docker 不可用会大声失败，�
 npm run db:down   # 清理测试容器（容器本身可复用，无需每次重建）
 ```
 
-## 事件存储（Batch 1）用法
+## 事件存储（Batch 1/2）用法
 
-`stream_id = project_id`（spec §4；传 task_id 不会报错，但会建出错误的流）。`migrate(pool)` 需自己调用一次（幂等）；`createPgEventStore(pool)` 不自带迁移。
+`stream_id = project_id`（spec §4；传 task_id 不会报错，但会建出错误的流，`assertProjectStreamId` 会拒绝主体 id 撞值）。`migrate(pool)` 需自己调用一次（幂等）；`createPgEventStore(pool)` 不自带迁移。流的第一条事件必须是 `ProjectCreated`（其余事件写新流会被 `ProjectCreatedRequiredError` 拒绝）。
 
 ```ts
 import { createPgEventStore, migrate } from './src/kernel/event-store-pg.js';
@@ -57,18 +57,52 @@ await store.appendStateTransition({
   payload: { task_id: taskId }, from: 'ready', to: 'active',
 });
 
-// ③ INV-11 accepted/canceled：收尾动作必须与 lifecycle 迁移同事务（withTransaction）。
-//    fn 抛错 → 整体回滚，零事件落库。
-const { guard } = await store.withTransaction(async (tx) => {
-  await tx.append({ /* WaitConditionCanceled */ });
-  await tx.append({ /* TaskWaitStateChanged: waiting_on_person → none */ });
-  return tx.appendStateTransition({ /* awaiting_acceptance → accepted */ });
+// ③ INV-11 accepted：收尾动作 + lifecycle 迁移放进同一个 appendBatch（同事务、同链、原子）。
+//    任一事件失败 → 整批回滚、零事件落库；顺序即 spec §3.1 的收尾顺序。
+const { events } = await store.appendBatch([
+  {
+    stream_id: projectId, type: 'WaitConditionCanceled',
+    actor_id, actor_kind: 'system', causation_id: null, correlation_id: corr,
+    idempotency_key: `${transitionKey}:wc:${waitConditionId}`,
+    payload: { wait_condition_id: waitConditionId, task_id: taskId, reason: 'task_accepted' },
+  },
+  {
+    stream_id: projectId, type: 'TaskWaitStateChanged',
+    actor_id, actor_kind: 'system', causation_id: null, correlation_id: corr,
+    idempotency_key: `${transitionKey}:ws`,
+    payload: {
+      task_id: taskId, from: 'waiting_on_person', to: 'none',
+      reason: 'task_accepted', actor_id, actor_kind: 'system',
+    },
+  },
+  {
+    stream_id: projectId, type: 'TaskLifecycleChanged', entity: 'task',
+    from: 'awaiting_acceptance', to: 'accepted',
+    facts: { acceptanceVerdict: 'accepted' },
+    actor_id, actor_kind: 'system', causation_id: null, correlation_id: corr,
+    idempotency_key: `${transitionKey}:lc`,
+    payload: { task_id: taskId, trigger_event_id: acceptanceId },
+  },
+]);
+// events 恰为 3 条（WaitConditionCanceled → TaskWaitStateChanged → TaskLifecycleChanged）。
+// 收尾事件已在批次内显式写出，内核不会再补发第二份。
+
+// ④ 增量消费（S5）：水位落库 + 投递幂等键，进程重启后从水位继续。
+const batch = await store.fetchAfterWatermark({ consumer_id: 'projection:home', limit: 200 });
+for (const event of batch.events) applyToProjection(event); // 投影由消费方实现
+await store.commitDeliveries({
+  consumer_id: 'projection:home',
+  last_global_seq: batch.watermark,               // 安全水位：不越过未提交事件
+  event_ids: batch.events.map((event) => event.id), // 重复提交不会重复入账
 });
-// guard.required_effects = ['cancel_active_wait_conditions', 'reset_wait_state_none']
 
 const check = await store.verifyChain(projectId);
 // 不存在的 stream：{ ok: false, stream_exists: false, reason: '流不存在：…（stream_not_found）' }
-// 链头（event_streams.last_hash/last_seq）被改乱：ok=false，定位到断点
+// 链头（event_streams.last_hash/last_seq）被改乱：ok=false，broken_in='stream_head'，定位到断点
+const streams = await store.listStreams(); // 运维巡检：每个流的 last_seq / event_count / last_hash
 ```
 
-写路径就绪范围：`append` / `appendStateTransition` / `withTransaction`（含 accepted/canceled 的 INV-11 收尾）。跨事务批量 `appendBatch`、增量订阅水位保护仍留 Batch 2；当前无生产命令层调用点。
+状态迁移还可以走 `withTransaction(async (tx) => …)` 手写多事件事务；但事务内必须只用 `tx`，
+用外层 store 写会立刻抛 `TransactionScopeError`（旧行为是等自己的锁而挂起）。
+
+写路径就绪范围：`append` / `appendBatch` / `appendStateTransition` / `withTransaction` / 增量消费水位（`fetchAfterWatermark` + `commitDeliveries`）。Run 状态迁移在命令层统一经 `appendRunCreated` / `appendRunTransition`（审计测试见 `tests/run-dispatch-audit.test.ts`）；`src/kernel/scheduler.ts`（REQ-SCH-3）与 `src/kernel/acceptance.ts`（REQ-ACC-3）已提供机制与测试夹具，生产调度循环与投影消费者仍留后续批次接线。
