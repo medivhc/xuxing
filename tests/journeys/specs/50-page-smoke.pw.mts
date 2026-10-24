@@ -14,6 +14,8 @@
 // FIX-ROUND-3 扩充（CLICK-AUDIT 复盘）：
 // - 首页断言补 computed-style：Tailwind 工具类曾整批未生成（CSS 入口缺
 //   @tailwind），文本断言全过、页面却是裸 HTML——样式必须直接验产物效果；
+// - FIX-ROUND-4 新增待我处理页真形状渲染：任务项曾被误判为 decision 行
+//   只出下线占位卡（ACTIONS-EMPTY-1024），断言任务项标题/动作按钮在场。
 // - 新增项目页/提议页两条真形状渲染：两页曾按 mock 形状读真投影而崩
 //   （acceptance_status / proposed 包装层），种子数据驱动、不依赖 magpie。
 
@@ -232,6 +234,47 @@ test('页面级冒烟：提议页按真形状渲染（details.task 草案与判�
   await expect(
     page.getByText(new RegExp(`验收判据（${proposal.data.details.task!.acceptance_criteria.length} 条）`)),
   ).toBeVisible();
+
+  expect(pageErrors).toEqual([]);
+});
+
+// ---------- FIX-ROUND-4：待我处理页真形状渲染 ----------
+
+test('页面级冒烟：待我处理页按真形状渲染任务项（标题/项目/动作按钮）', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+  // 真值以 /api/actions 为准：种子应至少有可执行任务项
+  const actionsRes = await page.request.get(`${origin}/api/actions`);
+  expect(actionsRes.ok()).toBeTruthy();
+  const actions = (await actionsRes.json()) as ApiEnvelope<{
+    items: Array<{ task_id: string; title: string; available_actions: string[] }>;
+  }>;
+  expect(actions.data.items.length).toBeGreaterThan(0);
+
+  await page.goto(`${origin}/actions`);
+
+  // 行数与接口逐条一致，且不再出现决策下线占位卡（ACTIONS-EMPTY-1024 的
+  // 呈现层脱节：任务项被误判为 decision 行、任务一条不渲染）
+  await expect(page.getByTestId('my-actions-row')).toHaveCount(actions.data.items.length);
+  await expect(page.getByTestId('decision-action-offline')).toHaveCount(0);
+
+  // 种子任务标题在场（种子 active 任务 task_demo_contact），且接口每条
+  // 任务项的标题都真渲染出来——不只是「页面不崩」
+  await expect(page.getByText('联系张三确认方案')).toBeVisible();
+  for (const item of actions.data.items) {
+    await expect(page.getByText(item.title, { exact: true }).first()).toBeVisible();
+  }
+
+  // 动作按钮在场（以接口真值为准，不硬编码构成）：有 feedback_submit 的
+  // 任务 → 反馈输入与提交按钮；有 task_advance 的任务 → 推进按钮
+  if (actions.data.items.some((i) => i.available_actions.includes('feedback_submit'))) {
+    await expect(page.getByTestId('action-feedback-input').first()).toBeVisible();
+    await expect(page.getByTestId('action-feedback-submit').first()).toBeVisible();
+  }
+  if (actions.data.items.some((i) => i.available_actions.includes('task_advance'))) {
+    await expect(page.getByTestId('action-task-advance').first()).toBeVisible();
+  }
 
   expect(pageErrors).toEqual([]);
 });
