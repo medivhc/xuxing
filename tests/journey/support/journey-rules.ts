@@ -407,6 +407,11 @@ export function computeReady(state: JourneyProjection, task_id: string): ReadyVe
     }
   }
 
+  // 已知缺口（评审 m4 登记）：REQ-SCH-1 的合取式还含「Policy 未拦截」一项，本编码
+  // 未实现 —— K0 里 Policy 拦截只定义在 PlanChange 流水线（REQ-PC-1④ 的权限/风险，
+  // 见 validatePlanChange 的 policy 关口）与预算（REQ-PC-6 恒不拦截、只记账），
+  // Scheduler 侧没有可读的 Policy 拦截状态可消费。待 spec 明示其 Scheduler 侧语义
+  // 后再补，不自造拦截规则（与本文件一贯处理：缺口登记在案、不断言伪造覆盖）。
   return { ready: reasons.length === 0, reasons };
 }
 
@@ -580,6 +585,10 @@ export function validateOutcomeProposal(
   if (!run) return reject('run_not_found', `Run ${draft.run_id} 不存在`);
   if (run.task_id !== draft.task_id) {
     return reject('run_task_mismatch', `Run ${run.run_id} 不属于 Task ${draft.task_id}`);
+  }
+  // REQ-OC-1 来源限定（新 P1-3）：Outcome 只能挂在 run_kind ∈ {executor, human_light} 的 Run 上
+  if (run.run_kind !== 'executor' && run.run_kind !== 'human_light') {
+    return reject('run_kind_not_outcome_source', `Run ${run.run_id} 的 run_kind=${run.run_kind} 不在 {executor, human_light} 内（REQ-OC-1 来源限定）`);
   }
 
   // 引用的 Evidence 必须存在（REQ-OC-1）
