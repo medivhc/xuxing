@@ -178,17 +178,22 @@ describe('INV-6：Evidence 的 source_kind 封闭集与 tool_output 通道封锁
     expect(await countEvents(ctx.pool)).toBe(0);
   });
 
-  it.each([
-    ['非枚举 source_kind', 'top_secret'],
-    ['缺失 source_kind', undefined],
-  ])('负向：%s → ActorValidationError 且零落盘', async (_label, bad) => {
-    const payload: Record<string, unknown> = { ...evidencePayload };
-    if (bad === undefined) delete payload.source_kind;
-    else payload.source_kind = bad;
+  it('负向：source_kind 枚举外值 → ActorValidationError 且零落盘', async () => {
     await expect(
-      store.append(baseInput({ type: 'EvidenceAdded', payload })),
+      store.append(baseInput({
+        type: 'EvidenceAdded',
+        payload: { ...evidencePayload, source_kind: 'top_secret' },
+      })),
     ).rejects.toBeInstanceOf(ActorValidationError);
     expect(await countEvents(ctx.pool)).toBe(0);
+  });
+
+  it('口径：source_kind 缺失不在内核拦截面（必填性由命令层 evidence_add 把关，见 server e2e）', async () => {
+    const payload: Record<string, unknown> = { ...evidencePayload };
+    delete payload.source_kind;
+    const event = await store.append(baseInput({ type: 'EvidenceAdded', payload }));
+    expect(event.type).toBe('EvidenceAdded');
+    expect(await countEvents(ctx.pool)).toBe(1);
   });
 
   it('负向：网关专用入口写非 EvidenceAdded 类型 → ToolOutputChannelError', async () => {

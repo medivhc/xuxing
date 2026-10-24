@@ -1258,11 +1258,11 @@ function prepareAppend(
     }
   }
 
-  // Q12/INV-6：EvidenceAdded 的 source_kind 封闭集 + tool_output 通道封锁。
+  // Q12/INV-6：EvidenceAdded 的 source_kind 枚举外值封锁 + tool_output 通道封锁（缺失不归内核管，必填性由命令层把关）。
   let effectiveInput = input;
   if (input.type === 'EvidenceAdded') {
     const sourceKind = input.payload.source_kind;
-    if (!isEvidenceSourceKind(sourceKind)) {
+    if (sourceKind !== undefined && !isEvidenceSourceKind(sourceKind)) {
       throw new ActorValidationError(
         'EvidenceAdded.payload.source_kind 必须是 user_statement / agent_claim / tool_output / external_doc / device_log 之一（spec §2.5）',
         { field: 'source_kind', reason: 'source_kind_invalid' },
