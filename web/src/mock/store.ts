@@ -37,7 +37,7 @@ import type {
   MockSnapshot,
   MockTaskState,
 } from './types';
-import { MOCK_AGENT_ACTOR } from './types';
+import { MOCK_AGENT_ACTOR, MOCK_HUMAN_ACTOR } from './types';
 
 export interface MockEventRecord {
   seq: number;
@@ -296,51 +296,32 @@ export class MockStore {
   }
 
   actionsProjection(): MyActionsProjection {
+    // 真形状对齐（FIX-ROUND-4）：服务端 myActionItems 只产任务项——扁平
+    // {task_id, project_id, project_name, title, lifecycle, wait_state,
+    // next_action, available_actions, updated_global_seq}，且只收
+    // available_actions 非空者。此前 mock 在此发明 kind/decision/rank 形状，
+    // 页面按 mock 形状消费、与真投影脱节（ACTIONS-EMPTY-1024）。
+    // 决策不经此投影：mock 决策仍只在 home attention 呈现（与真服务端一致）。
     const items: MyActionsProjection['items'] = [];
-    let rank = 0;
-    for (const decision of this.decisions.values()) {
-      if (decision.status !== 'pending') continue;
-      const expired = decision.expires_at !== null && Date.parse(decision.expires_at) < Date.now();
-      items.push({
-        item_id: `decision:${decision.decision_id}`,
-        kind: 'decision',
-        project_id: decision.project_id,
-        decision_id: decision.decision_id,
-        decision: {
-          question: decision.question,
-          recommendation: decision.recommendation,
-          alternatives: decision.alternatives,
-          evidence_refs: decision.evidence_refs,
-          status: expired ? 'expired' : decision.status,
-          expires_at: decision.expires_at,
-        },
-        rank: (rank += 1),
-        // resolve_decision 已下线（FIX-ROUND-1 R-1：服务端命令词表无对应项），
-        // 无论是否过期都不再广告该动作；expired 仍以 blocked_reason 明示。
-        available_actions: [],
-        blocked_reason: expired ? 'decision_expired' : null,
-        updated_global_seq: decision.updated_global_seq,
-      });
-    }
     for (const task of this.tasks.values()) {
       if (!MY_ACTIONS_LIFECYCLES.has(task.lifecycle)) continue;
-      const blocked = task.wait_state !== 'none';
+      if (task.wait_state !== 'none') continue;
+      const actions = taskActions(task);
+      if (actions.length === 0) continue;
       items.push({
-        item_id: `task:${task.task_id}`,
-        kind: 'task',
-        project_id: SEED_PROJECT_ID,
         task_id: task.task_id,
-        task_lifecycle: task.lifecycle,
-        task_wait_state: task.wait_state,
-        active_run: task.active_run ?? undefined,
-        rank: (rank += 1),
-        available_actions: blocked ? [] : taskActions(task),
-        blocked_reason: blocked ? 'wait_state' : null,
+        project_id: SEED_PROJECT_ID,
+        project_name: this.project.name,
+        title: task.title,
+        lifecycle: task.lifecycle,
+        wait_state: task.wait_state,
+        next_action: NEXT_ACTION_LABELS[actions[0]!] ?? '',
+        available_actions: actions,
         updated_global_seq: task.updated_global_seq,
       });
     }
-    items.sort((a, b) => a.rank - b.rank);
-    return { projection_id: 'my_actions', ...this.projectionMeta(), items };
+    items.sort((a, b) => a.updated_global_seq - b.updated_global_seq);
+    return { ...this.projectionMeta(), actor_id: MOCK_HUMAN_ACTOR, items };
   }
 
   projectProjection(projectId: string): ProjectProjection | null {
@@ -502,6 +483,14 @@ export class MockStore {
 /** 任务可用动作：只认内核 available_actions 语义（mock 按生命周期模拟）。
  *  词表为服务端 canonical（FIX-ROUND-1 R-1）：task_advance 一词覆盖开始/完成，
  *  界面按 task_lifecycle 分派渲染具体按钮。 */
+/** next_action 是给用户看的标签（与真服务 ActionItem.next_action 同义），按首个可用命令取文案。 */
+const NEXT_ACTION_LABELS: Record<string, string> = {
+  task_advance: '开始执行（派发 Run）',
+  feedback_submit: '提交执行反馈',
+  task_cancel: '取消任务',
+  acceptance_record: '记录验收',
+};
+
 export function taskActions(task: MockTaskState): string[] {
   if (task.wait_state !== 'none') return [];
   switch (task.lifecycle) {
