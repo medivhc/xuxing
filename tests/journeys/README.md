@@ -221,6 +221,9 @@ backpressure/drain 驱动，测试口径不变（慢连接必须被断开）。
 7. mock 是旅程用参考实现：不实现 Run/Assignment/Policy 全量判定、多 actor 分离、
    任务图边；验收允许执行者本人提交（真服务以 `self_acceptance` 诚实记录）。
 8. 心跳用例要真等约 15s，是整套里最慢的一条。
+9. **`prop-degraded-1` 只能被接受一次**：降级旅程会接受这条种子提议，接受后它变成
+   `applied`，同一库上重跑会停在「提议仍是 proposed」。真服务轮每轮用独立库 + 重新
+   seed（`xuxing_jfix_on` / `xuxing_jfix_off`）；mock 轮每次启动都重建状态，不受影响。
 
 ## 实测
 
@@ -232,6 +235,9 @@ Running 13 tests using 1 worker
   ✓ 40-command-guards    幂等 201→200 / 冲突 409 / 越权 409 / 未知 400 / 缺键 400 / 回执形状
   13 passed
 
-# 真服务轮（JOURNEY_BASE_URL=http://127.0.0.1:8787）
-  见交卷记录：11 passed + 1 skipped（/api/dev/burst 慢消费者）
+# 真服务轮（JOURNEY_BASE_URL=http://127.0.0.1:8787，独立库 + seed 后启动）
+# 轮 A：magpie 配置好（proposer configured=true，多判据提议）
+# 轮 B：magpie 断开（env -u MAGPIE_API_KEY -u MAGPIE_GATEWAY_KEY，fallback 单判据提议）
+  两轮均：12 passed + 1 skipped（30-sse-protocol 的慢消费者，/api/dev/burst 仅 mock）
+  UI 步骤在真服务轮跳过（真服务不含本目录 mock UI 的 testid 契约）
 ```
