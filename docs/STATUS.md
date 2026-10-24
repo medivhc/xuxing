@@ -1,14 +1,13 @@
-based_on: 5bec6544e5cd34bc6b1e9ce658bbf52ee10f7a0b
+based_on: a13589eb023a1c2fb2cf57c014df03660ea4fb1b
 
 # 续行状态（STATUS）
 
 | 项 | 状态 |
 |---|---|
-| 基线 | develop/eventstore-batch1 @ fd0e347 |
-| Batch1 复审 fix 波次 | 两轮进行中 |
-| D9 交互契约 | 已评审，按 D10 裁决修订中 |
-| D9 旅程测试 | 开发中 |
-| 门禁：沙箱测试 | 165 passed / 48 skipped / 5 todo；PG 集成待 CI 复跑 |
-| 门禁：fix 波次自装 PG16 环境 | 251 passed / 0 failed |
+| 基线 | develop/eventstore-batch1 @ 80a09c1（PR #7 已合入） |
+| Batch 1 + Web 四入口 | 已合入 develop 并部署上线（tg.bewith.link） |
+| Batch 2（S1/S3/S4/S5/S6） | 并行轨开发中（feat/eventstore-batch2） |
+| 阶段二（本分支 feat/phase2-static-misc） | 收尾杂项 pF7/pF8 余项全清 + A 案服务端静态自托管，待评审合入 |
+| A 案部署切换 | 代码与步骤已备（server/README 部署形态节），生产切换归部署轨执行 |
 
 决策见 docs/DECISIONS.md
