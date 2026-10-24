@@ -551,8 +551,10 @@ const CONCLUSION_KINDS = ['achieved', 'partial', 'infeasible', 'no_response', 'u
 const CERTAINTY = ['low', 'med', 'high'];
 const EVIDENCE_SUFFICIENCY = ['sufficient', 'insufficient', 'none'];
 
-/** 提出 Outcome 的合法解释器（内核校验：Executor 与人类都不能直接写 Outcome，REQ-OC-1）。 */
-export const D8_INTERPRETERS = ['actor-outcome-interpreter', 'actor-intent-interpreter'] as const;
+/** 提出 Outcome 的合法解释器（REQ-OC-1 写死：Outcome 只能由 Outcome Interpreter 的
+ * 提议经内核校验后生成；Intent Interpreter 按 §2.1 只产 Task 草稿/PlanChange 提议，
+ * 不在此列。Executor 与人类同样不得直接写 Outcome）。 */
+export const D8_INTERPRETERS = ['actor-outcome-interpreter'] as const;
 
 export function validateOutcomeProposal(
   state: JourneyProjection,
