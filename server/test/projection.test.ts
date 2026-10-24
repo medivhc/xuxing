@@ -92,14 +92,14 @@ describe('available_actions：由内核 guard 推出', () => {
   it('captured → 有"定义完成"动作', () => {
     const snap = snapshotWith([ev('TaskCaptured', 'proj-1', { task_id: 't', title: '联系张三', assignee_kind: 'human' })]);
     const actions = computeAvailableActions(snap.tasks[0], snap, 'user-1');
-    expect(actions.map((a) => a.id)).toEqual(['next_lifecycle', 'cancel_task']);
+    expect(actions.map((a) => a.id)).toEqual(['next_lifecycle']);
     expect(actions[0].next).toMatchObject({ from: 'captured', to: 'defined', guard: 'allowed' });
   });
 
   it('无 title 的 captured 任务不给出"定义完成"（内核前置条件拒绝）', () => {
     const snap = snapshotWith([ev('TaskCaptured', 'proj-1', { task_id: 't', title: '   ', assignee_kind: 'human' })]);
-    // 只剩"取消"（captured→canceled 不要求 title），没有"定义完成"
-    expect(computeAvailableActions(snap.tasks[0], snap, 'user-1').map((a) => a.id)).toEqual(['cancel_task']);
+    // 没有"定义完成"；同时未落 TaskCancelRequested 时，guard 也不给 cancel_task（取消意图前置）
+    expect(computeAvailableActions(snap.tasks[0], snap, 'user-1').map((a) => a.id)).toEqual([]);
   });
 
   it('active 且有人类 Run → 出现"提交执行反馈"，ready 属于 MyActions', () => {
@@ -167,7 +167,7 @@ describe('available_actions：由内核 guard 推出', () => {
       ev('TaskLifecycleChanged', 'proj-1', { task_id: 't', from: 'active', to: 'awaiting_acceptance' }),
     ]);
     const commands = availableCommands(computeAvailableActions(snap.tasks[0], snap, 'user-1'));
-    expect(commands).toEqual(['acceptance_record', 'task_cancel']);
+    expect(commands).toEqual(['acceptance_record']);
     for (const command of commands) expect(COMMAND_TYPES).toContain(command);
   });
 });
