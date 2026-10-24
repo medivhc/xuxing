@@ -6,10 +6,11 @@ import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import { queryKeys } from '../api/queryKeys';
-import type { AttentionItem, TaskLifecycle } from '../api/types';
+import type { AttentionItem } from '../api/types';
 import { formatRelative } from '../lib/time';
 import { EmptyState, ErrorBanner, Skeleton } from '../components/Feedback';
 import { SyncBadge } from '../components/Badge';
+import { ProjectCard } from '../components/ProjectCard';
 
 const ATTENTION_LABEL: Record<AttentionItem['kind'], string> = {
   decision_pending: '待裁决决策',
@@ -20,22 +21,16 @@ const ATTENTION_LABEL: Record<AttentionItem['kind'], string> = {
   cancel_pending: '取消待确认',
 };
 
-const LIFECYCLE_COUNT_ORDER: TaskLifecycle[] = [
-  'captured',
-  'defined',
-  'ready',
-  'active',
-  'awaiting_acceptance',
-  'accepted',
-  'canceled',
-];
-
 function AttentionRow({ item }: { item: AttentionItem }) {
-  const target = item.task_id
-    ? `/projects/${item.project_id}`
-    : item.decision_id
-      ? '/actions'
-      : '/';
+  // decision_pending 落点裁决（FIX-ROUND-3）：resolve_decision 已下线（K1 契约
+  // 缺口），/actions 里没有可操作项，不再把用户往死路引——改跳其所属项目页；
+  // 其余 kind 维持原落点（带 task_id 的跳项目页）。
+  const target =
+    item.kind === 'decision_pending'
+      ? `/projects/${item.project_id}`
+      : item.task_id
+        ? `/projects/${item.project_id}`
+        : '/';
   return (
     <li
       data-testid="home-attention-row"
@@ -104,39 +99,7 @@ export function HomePage() {
 
       <section aria-label="项目" className="grid gap-4 tablet:grid-cols-2">
         {data.projects.map((project) => (
-          <article
-            key={project.project_id}
-            data-testid="home-project-card"
-            className="rounded-m border border-border bg-surface p-5 shadow-1"
-          >
-            <div className="flex items-start justify-between gap-3">
-              <h2 className="text-title-s font-semibold text-text-primary">
-                <Link to={`/projects/${project.project_id}`} className="hover:text-accent">
-                  {project.name}
-                </Link>
-              </h2>
-              {project.last_activity_at ? (
-                <span className="shrink-0 text-caption text-text-tertiary">
-                  {formatRelative(project.last_activity_at)}
-                </span>
-              ) : null}
-            </div>
-            {project.goal_statement ? (
-              <p className="mt-2 text-body-s text-text-secondary">{project.goal_statement}</p>
-            ) : (
-              <p className="mt-2 text-body-s text-text-tertiary">未设定目标</p>
-            )}
-            <dl className="mt-3 flex flex-wrap gap-x-4 gap-y-1">
-              {LIFECYCLE_COUNT_ORDER.map((lifecycle) => (
-                <div key={lifecycle} className="flex items-center gap-1 text-caption">
-                  <dt className="text-text-tertiary">{lifecycle}</dt>
-                  <dd className="font-medium tabular-nums text-text-primary">
-                    {project.task_counts[lifecycle] ?? 0}
-                  </dd>
-                </div>
-              ))}
-            </dl>
-          </article>
+          <ProjectCard key={project.project_id} project={project} />
         ))}
       </section>
 

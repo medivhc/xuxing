@@ -37,6 +37,7 @@ import type {
   MockSnapshot,
   MockTaskState,
 } from './types';
+import { MOCK_AGENT_ACTOR } from './types';
 
 export interface MockEventRecord {
   seq: number;
@@ -350,103 +351,133 @@ export class MockStore {
     return {
       projection_id: 'project',
       ...this.projectionMeta(),
-      // R-8 键集：{project, goal, tasks, acceptance_status, graph, pending_proposals}
-      project: { project_id: this.project.project_id, name: this.project.name },
-      goal: this.project.goal,
+      // 键集与真 ProjectView 一致（FIX-ROUND-3）：{project, goal, tasks,
+      // acceptance_status, graph, pending_proposals}
+      project: {
+        project_id: this.project.project_id,
+        name: this.project.name,
+        policy_id: 'policy-seed',
+        created_by: 'seed',
+      },
+      goal: this.project.goal
+        ? { goal_id: `${this.project.project_id}-goal`, ...this.project.goal }
+        : null,
       tasks,
       acceptance_status: this.acceptanceStatus(tasks),
       graph: {
-        root_task_id: 'task-seed-1',
         nodes: [
-          { task_id: 'task-seed-1', title: '整理发布检查清单', lifecycle: 'active' },
-          { task_id: 'task-seed-3', title: '回顾上周阻塞项', lifecycle: 'captured' },
+          { id: 'task-seed-1', title: '整理发布检查清单', lifecycle: 'active' },
+          { id: 'task-seed-3', title: '回顾上周阻塞项', lifecycle: 'captured' },
         ],
-        edges: [
-          {
-            edge_id: 'edge-seed-1',
-            from_task: 'task-seed-1',
-            to_task: 'task-seed-3',
-            kind: 'depends_on',
-          },
-        ],
+        edges: [{ from: 'task-seed-1', to: 'task-seed-3', kind: 'depends_on' }],
       },
       // 只列 pending 提议；task_id 在接受后由服务端新发（R-11），此处不携带
       pending_proposals: [...this.proposals.values()]
         .filter((p) => p.project_id === this.project.project_id && p.status === 'pending')
         .map((p) => ({
           proposal_id: p.proposal_id,
-          capture_id: p.capture_id,
-          summary: p.summary,
+          kind: 'capture_task',
+          status: 'proposed',
+          degraded: p.degraded,
+          rationale: p.summary,
           created_at: p.created_at,
-          available_actions: proposalActions(p),
         })),
     };
   }
 
-  /** 项目级验收摘要（R-8）：口径为 mock 模拟内核计算，前端只呈现。 */
+  /** 项目级验收计数（FIX-ROUND-3 对齐真 ProjectView）：mock 模拟服务端统计。 */
   private acceptanceStatus(tasks: ProjectTaskRow[]): ProjectAcceptanceStatus {
     return {
-      awaiting_task_ids: tasks
-        .filter((t) => t.lifecycle === 'awaiting_acceptance')
-        .map((t) => t.task_id),
-      recorded_count: tasks.filter((t) => t.acceptance_summary.verdict !== null).length,
-      outstanding: tasks
-        .filter(
-          (t) =>
-            t.acceptance_summary.verdict === 'partially_accepted' &&
-            t.acceptance_summary.pending_criteria.length > 0,
-        )
-        .map((t) => ({
+      accepted: tasks.filter((t) => t.lifecycle === 'accepted').length,
+      awaiting: tasks.filter((t) => t.lifecycle === 'awaiting_acceptance').length,
+      rejected: tasks.filter((t) => t.acceptance?.verdict === 'rejected').length,
+      total: tasks.length,
+      criterion_summary: tasks.flatMap((t) =>
+        (t.acceptance?.criterion_results ?? []).map((r) => ({
           task_id: t.task_id,
-          title: t.title,
-          pending_criteria: t.acceptance_summary.pending_criteria,
+          criterion_ref: r.criterion_ref,
+          verdict: r.verdict,
         })),
+      ),
     };
   }
 
   private toTaskRow(task: MockTaskState): ProjectTaskRow {
-    const recorded = new Set(task.criterion_results.map((r) => r.criterion_ref));
-    const pending = task.acceptance_criteria
-      .filter((c) => !recorded.has(c.criterion_ref))
-      .map((c) => c.criterion_ref);
     return {
       task_id: task.task_id,
+      project_id: this.project.project_id,
       title: task.title,
+      description: task.description,
       lifecycle: task.lifecycle,
       wait_state: task.wait_state,
+      assignee_kind: task.assignee?.actor_kind ?? 'human',
+      assigned_by: null,
       duplicate_suspect: task.duplicate_suspect,
+      capture_id: null,
+      proposal_id: null,
       current_contract_rev: task.current_contract_rev,
-      assignee: task.assignee,
-      active_run: task.active_run,
       last_outcome_id: task.last_outcome_id,
-      acceptance_summary: {
-        verdict: task.acceptance?.verdict ?? null,
-        pending_criteria: pending,
-      },
+      feedback_count: 0,
+      cancel_requested: false,
+      acceptance_criteria: task.acceptance_criteria,
+      acceptance: task.acceptance
+        ? {
+            acceptance_id: task.acceptance.acceptance_id,
+            verdict: task.acceptance.verdict,
+            criterion_results: task.acceptance.criterion_results,
+            created_at: task.acceptance.created_at,
+          }
+        : null,
+      active_wait_conditions: [],
       available_actions: taskActions(task),
       updated_global_seq: task.updated_global_seq,
-      // [web 层补充] 逐判据表单所需（契约投影清单未列，服务端未提供时 UI 降级）
-      acceptance_criteria: task.acceptance_criteria,
-      criterion_results: task.criterion_results,
-      acceptance: task.acceptance,
     };
   }
 
   proposalProjection(proposalId: string): ProposalProjection | null {
     const proposal = this.proposals.get(proposalId);
     if (!proposal) return null;
+    // 状态词映射到真词汇（FIX-ROUND-3）：pending→proposed、accepted→applied、
+    // rejected→rejected、expired→needs_decision（mock 内部词保留，仅投影层译）
+    const status =
+      proposal.status === 'pending'
+        ? 'proposed'
+        : proposal.status === 'accepted'
+          ? 'applied'
+          : proposal.status === 'rejected'
+            ? 'rejected'
+            : 'needs_decision';
     return {
       projection_id: 'proposal',
       ...this.projectionMeta(),
       proposal_id: proposal.proposal_id,
-      capture_id: proposal.capture_id,
       project_id: proposal.project_id,
+      kind: 'capture_task',
+      status,
+      status_reason: null,
+      capture_id: proposal.capture_id,
+      task_id: null,
+      rationale: proposal.summary,
+      assumptions: [],
+      risk_level: 'low',
       degraded: proposal.degraded,
-      degraded_reason: proposal.degraded_reason,
-      status: proposal.status,
+      proposer: {
+        source: proposal.degraded ? 'fallback' : 'model',
+        model: null,
+        degraded: proposal.degraded,
+        degraded_reason: proposal.degraded_reason,
+        latency_ms: null,
+      },
+      details: {
+        kind: 'capture_task',
+        task: {
+          title: proposal.proposed.title,
+          description: proposal.proposed.description,
+          assignee_kind: proposal.proposed.assignee_hint === MOCK_AGENT_ACTOR ? 'agent' : 'human',
+          acceptance_criteria: proposal.proposed.acceptance_criteria,
+        },
+      },
       created_at: proposal.created_at,
-      summary: proposal.summary,
-      proposed: proposal.proposed,
       available_actions: proposalActions(proposal),
     };
   }

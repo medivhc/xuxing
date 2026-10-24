@@ -41,8 +41,8 @@ export function seedTasks(): MockTaskState[] {
       active_run: { run_id: 'run-seed-1', state: 'running', run_kind: 'executor' },
       last_outcome_id: null,
       acceptance_criteria: [
-        { criterion_ref: 'task-seed-1/c1', text: '清单覆盖构建、测试、发布三步', kind: 'manual' },
-        { criterion_ref: 'task-seed-1/c2', text: '每项均有负责人与回滚口令', kind: 'manual' },
+        { criterion_ref: 'task-seed-1/c1', text: '清单覆盖构建、测试、发布三步', auto: false },
+        { criterion_ref: 'task-seed-1/c2', text: '每项均有负责人与回滚口令', auto: false },
       ],
       criterion_results: [],
       acceptance: null,
@@ -61,9 +61,9 @@ export function seedTasks(): MockTaskState[] {
       active_run: null,
       last_outcome_id: 'outcome-seed-2',
       acceptance_criteria: [
-        { criterion_ref: 'task-seed-2/c1', text: '四入口路由与契约一致', kind: 'manual' },
-        { criterion_ref: 'task-seed-2/c2', text: '命令入口只走 POST /api/commands', kind: 'manual' },
-        { criterion_ref: 'task-seed-2/c3', text: 'SSE 三纪律可观测（订阅先行/游标自理/35s 看护）', kind: 'auto' },
+        { criterion_ref: 'task-seed-2/c1', text: '四入口路由与契约一致', auto: false },
+        { criterion_ref: 'task-seed-2/c2', text: '命令入口只走 POST /api/commands', auto: false },
+        { criterion_ref: 'task-seed-2/c3', text: 'SSE 三纪律可观测（订阅先行/游标自理/35s 看护）', auto: true },
       ],
       // 已记录一条判论（部分验收），其余待补 —— 用于验证 partially_accepted 呈现
       criterion_results: [

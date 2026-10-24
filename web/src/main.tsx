@@ -6,6 +6,7 @@ import App from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { createAppRuntime } from './app/runtime';
 import { installMockFetch, isMockEnabled } from './mock/install';
+import './styles/index.css';
 import './styles/tokens.css';
 
 // mock 开关（任务书）：VITE_API_MOCK=1 时安装 fetch 拦截；关闭则直连真实 /api。
