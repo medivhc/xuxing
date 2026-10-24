@@ -74,8 +74,8 @@ export async function migrateNodeTables(pool: Pool): Promise<void> {
 
 /** pg 驱动把 TIMESTAMPTZ 读成 Date；统一归一为 ISO 字符串（事件 payload
  * 只接受 plain 值，Date 会被内核规范化拒绝）。 */
-function normalizeRow<T extends Record<string, unknown>>(row: T): T {
-  const out: Record<string, unknown> = { ...row };
+function normalizeRow<T>(row: T): T {
+  const out: Record<string, unknown> = { ...(row as Record<string, unknown>) };
   for (const [k, v] of Object.entries(out)) {
     if (v instanceof Date) out[k] = v.toISOString();
   }
