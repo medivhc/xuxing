@@ -66,7 +66,6 @@ export interface AcceptanceRecomputeResult {
 function transitionFor(
   from: TaskLifecycle,
   to: TaskLifecycle,
-  verdict: AcceptanceVerdict | null,
 ): AcceptanceTransitionProposal | null {
   if (from === to) return null;
 
@@ -85,7 +84,6 @@ function transitionFor(
     return { from, to, facts: { acceptanceSuperseded: true } };
   }
   // 其余目标不是 Acceptance 重算能产生的；不编造迁移。
-  void verdict;
   return null;
 }
 
@@ -93,7 +91,7 @@ function transitionFor(
 export function recomputeAcceptance(input: AcceptanceRecomputeInput): AcceptanceRecomputeResult {
   const superseded = new Set(input.superseded);
   const ordered = [...input.acceptances]
-    .filter((acceptance) => acceptance.task_id !== '' && !superseded.has(acceptance.acceptance_id))
+    .filter((acceptance) => !superseded.has(acceptance.acceptance_id))
     .sort((a, b) => a.order - b.order);
   const effective = ordered.length > 0 ? ordered[ordered.length - 1] : null;
 
@@ -108,7 +106,7 @@ export function recomputeAcceptance(input: AcceptanceRecomputeInput): Acceptance
       target_lifecycle: target,
       pending_criteria: [],
       violations: [],
-      transition: transitionFor(input.task_lifecycle, target, null),
+      transition: transitionFor(input.task_lifecycle, target),
     };
   }
 
@@ -164,7 +162,7 @@ export function recomputeAcceptance(input: AcceptanceRecomputeInput): Acceptance
     target_lifecycle: target,
     pending_criteria,
     violations,
-    transition: transitionFor(input.task_lifecycle, target, effective.verdict),
+    transition: transitionFor(input.task_lifecycle, target),
   };
 }
 
@@ -223,6 +221,14 @@ export async function deriveAcceptanceInput(
 
   for (const event of events) {
     const payload = payloadRecord(event.payload);
+
+    // AcceptanceSuperseded 的 payload 只带 acceptance_id / superseded_by，没有 task_id；
+    // 必须在按 Task 过滤之前收集，否则 supersede 链永远不会生效。
+    if (event.type === 'AcceptanceSuperseded') {
+      if (typeof payload.acceptance_id === 'string') superseded.push(payload.acceptance_id);
+      continue;
+    }
+
     if (payload.task_id !== task_id) continue;
 
     switch (event.type) {
@@ -249,9 +255,6 @@ export async function deriveAcceptanceInput(
             order: event.seq,
           });
         }
-        break;
-      case 'AcceptanceSuperseded':
-        if (typeof payload.acceptance_id === 'string') superseded.push(payload.acceptance_id);
         break;
       default:
         break;

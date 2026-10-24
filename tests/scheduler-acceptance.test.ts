@@ -426,6 +426,46 @@ describe('S6-② Acceptance 重算（REQ-ACC-3）', () => {
     expect(await currentLifecycle()).toBe('defined');
   });
 
+  it('命令入口：AcceptanceSuperseded 后取最新有效记录（supersede 链生效）', async () => {
+    await seedTaskAtAwaitingAcceptance();
+    await recordAcceptance({
+      acceptance_id: 'acc-old',
+      verdict: 'accepted',
+      criteria: [
+        { criterion_ref: 'c1', verdict: 'passed' },
+        { criterion_ref: 'c2', verdict: 'passed' },
+      ],
+    });
+    await store.append(base({
+      type: 'AcceptanceSuperseded',
+      payload: { acceptance_id: 'acc-old', superseded_by: 'acc-new', reason: 'contract_changed' },
+    }));
+    await recordAcceptance({
+      acceptance_id: 'acc-new',
+      verdict: 'rejected',
+      criteria: [
+        { criterion_ref: 'c1', verdict: 'failed' },
+        { criterion_ref: 'c2', verdict: 'failed' },
+      ],
+      supersedes_id: 'acc-old',
+    });
+
+    const { result, event } = await recomputeTaskAcceptance(store, {
+      stream_id: STREAM,
+      task_id: TASK_ID,
+      contract_criteria: criteria,
+      actor_id: 'actor-kernel',
+      actor_kind: 'system',
+      correlation_id: 'corr-s6',
+      causation_id: 'acc-new',
+    });
+
+    expect(result.effective_acceptance_id).toBe('acc-new');
+    expect(result.target_lifecycle).toBe('defined');
+    expect(event?.type).toBe('TaskLifecycleChanged');
+    expect(await currentLifecycle()).toBe('defined');
+  });
+
   it('命令入口：partially_accepted 停在 awaiting_acceptance，待补集来自 failed 判据', async () => {
     await seedTaskAtAwaitingAcceptance();
     await recordAcceptance({

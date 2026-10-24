@@ -40,6 +40,14 @@ import { createPgEventStore, migrate } from './src/kernel/event-store-pg.js';
 await migrate(pool);
 const store = createPgEventStore(pool);
 
+// ⓪ 建项目流：流的第一条事件必须是 ProjectCreated（spec §4 / INV-12）
+await store.append({
+  stream_id: projectId, type: 'ProjectCreated',
+  actor_id, actor_kind: 'human', causation_id: null, correlation_id: corr,
+  idempotency_key: projectCreatedKey,
+  payload: { name: '示例项目', created_by: actor },
+});
+
 // ① 普通事件：payload 形状由事件类型决定
 await store.append({
   stream_id: projectId, type: 'TaskCaptured',
