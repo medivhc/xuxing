@@ -6,10 +6,36 @@ on:
   pull_request:
     branches: [main, master, develop/**]
 
+# ============================================================================
+# 门禁构成（2026-10-24 两次公网盲区后补齐）：
+#   ① 服务端不托管静态文件、真实页面渲染从未被验 → journeys 的 spec50 页面级
+#      冒烟（真服务 + 真实 web/dist + 真浏览器断言不白屏）进 CI；
+#   ② /api/home 缺 attention 等形状字段、前端读到即崩 → 投影键集单测在
+#      server:test / 根 npm test 内，随全量测试进 CI。
+# 边界（不进 CI，留在部署门）：真 magpie 轮与真服务 degraded 轮依赖用户 PC
+# 在线与网关 caller key（不进 CI secrets），由部署前真服务两轮实跑覆盖。
+# docs-check 在独立 workflow（docs.yml），本文件不重复。
+# ============================================================================
+
 jobs:
   test:
     runs-on: ubuntu-latest
-
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: xuxing_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    env:
+      # 仓库测试口径：根与 server 测试共用 XUXING_TEST_PG_URL（默认 55432/xuxing_test）
+      XUXING_TEST_PG_URL: postgres://postgres:postgres@127.0.0.1:55432/xuxing_test
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -20,18 +46,122 @@ jobs:
           node-version: "24"
           cache: npm
 
-      - name: Install dependencies
+      - name: Install root dependencies
         run: npm ci
 
-      - name: Type check
+      - name: Install server dependencies
+        # 根 vitest 会收集 server/test/**，其 import（hono 等）按 server/node_modules
+        # 解析；缺这一步正是本 workflow 此前长期红的根因（Failed to load url hono）。
+        run: npm --prefix server ci
+
+      - name: Type check (root)
         run: npm run typecheck
 
-      - name: Start PostgreSQL test container
-        run: npm run db:up
+      - name: Type check (server)
+        run: npm run server:typecheck
 
-      - name: Run tests
+      - name: Run tests (root suite)
         run: npm test
 
-      - name: Clean up test container
-        if: always()
-        run: npm run db:down
+      - name: Run server tests
+        run: npm run server:test
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install web dependencies
+        # 不用 ci：web 的 package-lock.json 按 web/.gitignore 不入库（沙盒镜像会
+        # 改写 resolved 为镜像地址），CI 用官方 registry 现场 install 生成。
+        run: npm --prefix web install --no-audit --no-fund
+
+      - name: Build web (tsc --noEmit + vite build)
+        run: npm --prefix web run build
+
+  journeys:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # spec50 真服务轮：服务端默认 XUXING_PG_URL=127.0.0.1:55432/xuxing
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: xuxing
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install root + server dependencies
+        run: |
+          npm ci
+          npm --prefix server ci
+
+      - name: Build web dist (spec50 前置)
+        run: |
+          npm --prefix web install --no-audit --no-fund
+          npm --prefix web run build
+
+      - name: Install journeys dependencies
+        working-directory: tests/journeys
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        working-directory: tests/journeys
+        run: npx playwright install --with-deps chromium
+
+      - name: Journeys typecheck
+        working-directory: tests/journeys
+        run: npm run typecheck
+
+      - name: Journeys mock round (spec50 在 mock 模式自跳过)
+        working-directory: tests/journeys
+        run: npm test
+
+      - name: Seed demo data (spec50 真服务前置，种子须先于服务启动，R-12)
+        run: npm run seed:demo
+
+      - name: Boot real server in background
+        run: |
+          nohup npm run server > /tmp/xuxing-server.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8787/api/health > /dev/null; then
+              echo "server healthy after ${i} tries"
+              break
+            fi
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:8787/api/health
+
+      - name: Page smoke against real server (spec50)
+        working-directory: tests/journeys
+        env:
+          JOURNEY_BASE_URL: http://127.0.0.1:8787
+        run: npx playwright test specs/50-page-smoke.pw.mts
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: journeys-server-log
+          path: /tmp/xuxing-server.log
+          if-no-files-found: ignore
