@@ -317,7 +317,7 @@ function renderProposal(proposal) {
     h('h2', {}, '拟生成任务'),
     h('div', { class: 'list' }, [taskCard]),
     h('div', { class: 'row', style: 'margin-top:14px' }, buttons),
-    proposal.status === 'accepted'
+    proposal.status === 'applied'
       ? h('p', {}, h('a', { testid: 'proposal-link-actions', href: '#/actions' }, '去 My Actions 处理已生成的任务 →'))
       : null,
   );

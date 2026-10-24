@@ -211,13 +211,16 @@ backpressure/drain 驱动，测试口径不变（慢连接必须被断开）。
    `degraded_reason`，降级信息只经提议投影与 `notice` 帧表达；`duplicate_suspect`、
    `beyond_wait` 等 spec 可选字段真服务未输出。旅程不据此断言。
 2. **`/api/actions` 的 `next_action` 是中文标签**，不是命令串；判定可用动作一律看
-   `available_actions`。
-3. **`acceptance_status.rejected` 不含 `partially_accepted`**（见「旅程口径」）。
-4. **`/api/dev/burst` 不存在于真服务**，慢消费者用例真服务轮跳过（见上）。
-5. **health 无 `streams`** 字段，连接数只能通过「第 N+1 条被 503」间接观测。
-6. mock 是旅程用参考实现：不实现 Run/Assignment/Policy 全量判定、多 actor 分离、
+   `available_actions`。执行中的任务只挂 `feedback_submit`：`task_cancel` 受
+   `allRunsTerminal` 约束（`server/src/projection/actions.ts`），要等在跑 Run 收尾后才出现。
+3. **提议接受后投影状态是 `applied`**（`PlanChangeApplied`），不是 `accepted`；
+   `accepted` 只用于任务生命周期与验收 verdict。
+4. **`acceptance_status.rejected` 不含 `partially_accepted`**（见「旅程口径」）。
+5. **`/api/dev/burst` 不存在于真服务**，慢消费者用例真服务轮跳过（见上）。
+6. **health 无 `streams`** 字段，连接数只能通过「第 N+1 条被 503」间接观测。
+7. mock 是旅程用参考实现：不实现 Run/Assignment/Policy 全量判定、多 actor 分离、
    任务图边；验收允许执行者本人提交（真服务以 `self_acceptance` 诚实记录）。
-7. 心跳用例要真等约 15s，是整套里最慢的一条。
+8. 心跳用例要真等约 15s，是整套里最慢的一条。
 
 ## 实测
 

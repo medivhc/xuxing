@@ -256,7 +256,8 @@ export interface ProposalData extends ProjectionMeta {
   proposal_id: string;
   project_id: string;
   kind: string;
-  status: 'proposed' | 'accepted' | 'rejected';
+  /** 真服务口径：接受落地写 `applied`（PlanChangeApplied），拒绝写 `rejected`。 */
+  status: 'proposed' | 'applied' | 'rejected' | 'needs_decision';
   status_reason: string | null;
   capture_id: string | null;
   /** 提议接受前恒为 null：任务 id 只由服务端在 proposal_accept 后发号（R-11）。 */

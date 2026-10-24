@@ -183,8 +183,10 @@ export function availableActionsFor(task: TaskRecord, actorId: string): CommandT
     case 'ready':
       return ['task_advance', 'task_cancel'];
     case 'active':
-      // cancel_task 与内核一致地保留在执行中（REQ-RUN-6：执行中也能记取消意图）
-      return ['feedback_submit', 'task_cancel'];    case 'awaiting_acceptance':
+      // 真服务口径（server/src/projection/actions.ts）：执行中还挂着 Run 时取消受
+      // allRunsTerminal 约束，task_cancel 不出现在 available_actions 里。
+      return ['feedback_submit'];
+    case 'awaiting_acceptance':
       // R-10：验收动作就在这条上，任务留在 My Actions 直到验收落账
       return ['acceptance_record', 'task_cancel'];
     default:
@@ -374,7 +376,7 @@ export class JourneyState {
       case 'PlanChangeApplied': {
         const proposal = this.proposals.get(String(payload.change_id));
         if (!proposal) throw new Error(`PlanChangeApplied without proposal: ${String(payload.change_id)}`);
-        proposal.status = 'accepted';
+        proposal.status = 'applied';
         proposal.assigned_task_id = (payload.task_id as string | null) ?? proposal.assigned_task_id;
         break;
       }

@@ -129,8 +129,8 @@ test.describe('D9 降级旅程（degraded 明示 + 全链路可走通）', () =>
 
       const proposal = await waitForProjection(
         () => getProposal(request, DEGRADED.proposalId),
-        (value) => value.status === 'accepted',
-        '降级提议进入 accepted',
+        (value) => value.status === 'applied',
+        '降级提议进入 applied',
       );
       versions.push(proposal.projection_version);
       expect(proposal.degraded).toBe(true);

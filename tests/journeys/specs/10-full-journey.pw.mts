@@ -104,10 +104,9 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
       expect(seedRows.map((row) => row.task_id).sort()).toEqual(
         ['task_demo_contact', 'task_demo_contract', 'task_demo_quote'].sort(),
       );
-      expect(findAction(actions, 'task_demo_contact')?.available_actions).toEqual([
-        'feedback_submit',
-        'task_cancel',
-      ]);
+      // 真服务口径（server/src/projection/actions.ts）：执行中的任务只要还有在跑的 Run，
+      // task_cancel 就受 allRunsTerminal 约束不出现在 available_actions 里。
+      expect(findAction(actions, 'task_demo_contact')?.available_actions).toEqual(['feedback_submit']);
       expect(findAction(actions, 'task_demo_quote')?.available_actions).toEqual(['task_advance', 'task_cancel']);
       expect(findAction(actions, 'task_demo_contract')?.available_actions).toEqual([
         'task_advance',
@@ -205,7 +204,7 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
         taskId = envelope.data.subject.task_id;
         expect(taskId).toBeTruthy();
 
-        await expect(page.getByTestId(TID.proposalStatus)).toHaveText('accepted');
+        await expect(page.getByTestId(TID.proposalStatus)).toHaveText('applied');
         await expect(page.getByTestId(TID.proposalLinkActions)).toBeVisible();
       } else {
         const accepted = expectCreatedCommand(
@@ -221,8 +220,8 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
 
       const proposal = await waitForProjection(
         () => getProposal(request, proposalId),
-        (value) => value.status === 'accepted' && value.available_actions.length === 0,
-        '提议进入 accepted 且 available_actions 清空',
+        (value) => value.status === 'applied' && value.available_actions.length === 0,
+        '提议进入 applied 且 available_actions 清空',
       );
       versions.push(proposal.projection_version);
 
