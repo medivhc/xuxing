@@ -14,6 +14,7 @@ import type {
   HomeProjection,
   LagState,
   MyActionsProjection,
+  ProjectAcceptanceStatus,
   ProjectProjection,
   ProjectTaskRow,
   ProposalProjection,
@@ -343,18 +344,18 @@ export class MockStore {
 
   projectProjection(projectId: string): ProjectProjection | null {
     if (projectId !== this.project.project_id) return null;
+    const tasks = [...this.tasks.values()]
+      .sort((a, b) => a.updated_global_seq - b.updated_global_seq)
+      .map((task) => this.toTaskRow(task));
     return {
       projection_id: 'project',
       ...this.projectionMeta(),
-      project_id: this.project.project_id,
-      name: this.project.name,
+      // R-8 键集：{project, goal, tasks, acceptance_status, graph, pending_proposals}
+      project: { project_id: this.project.project_id, name: this.project.name },
       goal: this.project.goal,
-      plan_rev: this.project.plan_rev,
-      plan_history: this.project.plan_history,
-      tasks: [...this.tasks.values()]
-        .sort((a, b) => a.updated_global_seq - b.updated_global_seq)
-        .map((task) => this.toTaskRow(task)),
-      focused_subgraph: {
+      tasks,
+      acceptance_status: this.acceptanceStatus(tasks),
+      graph: {
         root_task_id: 'task-seed-1',
         nodes: [
           { task_id: 'task-seed-1', title: '整理发布检查清单', lifecycle: 'active' },
@@ -369,6 +370,37 @@ export class MockStore {
           },
         ],
       },
+      // 只列 pending 提议；task_id 在接受后由服务端新发（R-11），此处不携带
+      pending_proposals: [...this.proposals.values()]
+        .filter((p) => p.project_id === this.project.project_id && p.status === 'pending')
+        .map((p) => ({
+          proposal_id: p.proposal_id,
+          capture_id: p.capture_id,
+          summary: p.summary,
+          created_at: p.created_at,
+          available_actions: proposalActions(p),
+        })),
+    };
+  }
+
+  /** 项目级验收摘要（R-8）：口径为 mock 模拟内核计算，前端只呈现。 */
+  private acceptanceStatus(tasks: ProjectTaskRow[]): ProjectAcceptanceStatus {
+    return {
+      awaiting_task_ids: tasks
+        .filter((t) => t.lifecycle === 'awaiting_acceptance')
+        .map((t) => t.task_id),
+      recorded_count: tasks.filter((t) => t.acceptance_summary.verdict !== null).length,
+      outstanding: tasks
+        .filter(
+          (t) =>
+            t.acceptance_summary.verdict === 'partially_accepted' &&
+            t.acceptance_summary.pending_criteria.length > 0,
+        )
+        .map((t) => ({
+          task_id: t.task_id,
+          title: t.title,
+          pending_criteria: t.acceptance_summary.pending_criteria,
+        })),
     };
   }
 
