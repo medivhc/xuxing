@@ -1,24 +1,24 @@
 import { randomUUID } from 'node:crypto';
 import type {
+  AcceptanceCriterion,
   AcceptanceVerdict,
-  ActionRow,
-  ActionsProjection,
-  CaptureResponse,
-  CommandReceipt,
-  CommandResponse,
+  ActionItem,
+  ActionsData,
+  CaptureData,
+  CommandResultData,
   CommandType,
-  Criterion,
   CriterionResult,
-  HomeProjection,
-  ProjectProjection,
-  ProjectTaskNode,
-  ProposalProjection,
-  ProposedTask,
+  HomeData,
+  HomeProjectSummary,
+  ProjectData,
+  ProjectTaskRow,
+  ProposalData,
+  ProposalDraft,
   StreamEventFrame,
 } from '../contract.mts';
 import { COMMAND_TYPES } from '../contract.mts';
 import { CURRENT_ACTOR_ID, DEMO, DEGRADED } from '../journeys.config.mts';
-import { ApiError, badRequest, forbidden, notFound, terminalState } from './errors.mts';
+import { badRequest, conflict, notFound } from './errors.mts';
 
 // ============================================================================
 // mock 的领域存储：append-only 事件日志 + 由事件 apply 出来的最小实体集。
@@ -26,32 +26,36 @@ import { ApiError, badRequest, forbidden, notFound, terminalState } from './erro
 // 纪律对应：
 //   - 投影只从事件 apply 得到（home/project/actions/proposal 都是纯读）；
 //   - 每个投影带 projection_version = 已并入的最大全局 seq；
-//   - 命令先过 available_actions 复核，再追加事件；
-//   - client_submit_id 幂等：同 id 重放不追加事件，回首次回执。
+//   - 事件 kind = 内核封闭目录的 PascalCase 领域事件名（FIX-ROUND-1 R-9）；
+//   - 命令词表 / available_actions 是 canonical command_type 字符串（R-1）；
+//   - 命令首次成功 201 + data.replayed=false，幂等重放 200 + data.replayed=true（R-6）；
+//   - 种子与真服务 R-7 种子契约同名同形（proj_demo_oq05 / proj-degraded / prop-degraded-1）；
+//   - 提议只带 draft，不预告 task_id（R-11）：任务 id 只在 proposal_accept 时由 mock 发号。
 //
-// 这是**测试用 mock**，不实现 Run/Assignment/Policy，也不做 actor 分离
-// （record_acceptance 允许完成任务的那个人提交）。真服务集成由车道 A/B 替换。
+// 这是**测试用 mock**：只建模本旅程需要的那部分内核语义（生命周期迁移 + 逐判据验收），
+// 不实现 Run/Assignment/Policy 的完整判定。真服务集成时整套 mock 不会被拉起。
 // ============================================================================
 
 export interface EventRecord {
   seq: number;
+  /** 内核事件类型（PascalCase 领域事件名，R-9） */
   kind: string;
-  type: string;
   project_id: string;
   entity_id: string;
-  summary: string;
-  degraded: boolean;
   occurred_at: string;
   payload: Record<string, unknown>;
 }
 
 interface ProjectRecord {
   project_id: string;
-  title: string;
+  name: string;
+  policy_id: string;
+  created_by: string;
   goal_id: string;
-  goal_text: string;
-  goal_status: 'draft' | 'in_progress' | 'achieved';
-  plan_rev: number;
+  goal_statement: string;
+  goal_success: string;
+  goal_stop: string;
+  goal_status: string;
   created_at: string;
   updated_at: string;
 }
@@ -60,37 +64,38 @@ interface TaskRecord {
   task_id: string;
   project_id: string;
   title: string;
-  lifecycle: ProjectTaskNode['lifecycle'];
+  description: string;
+  lifecycle: ProjectTaskRow['lifecycle'];
   wait_state: string;
-  intended_assignee_id: string;
+  assignee_id: string;
   assignee_kind: 'human' | 'agent';
   current_contract_rev: number;
-  criteria: Criterion[];
-  criterion_results: CriterionResult[];
-  degraded: boolean;
-  created_from_proposal: string | null;
-  outcome: ProjectTaskNode['outcome'];
-  last_acceptance: ProjectTaskNode['last_acceptance'];
-  acceptance_seq: number;
-  created_at: string;
-}
-
-interface ProposalRecord extends Omit<ProposalProjection, 'projection_version' | 'available_actions'> {
-  /** 记录 accept/reject 的事件序号，用于排序/诊断。 */
-  decided_seq: number | null;
-}
-
-interface CaptureRecord {
-  capture_id: string;
-  project_id: string;
-  text: string;
+  criteria: AcceptanceCriterion[];
   proposal_id: string | null;
+  capture_id: string | null;
+  last_outcome_id: string | null;
+  feedback_count: number;
+  cancel_requested: boolean;
+  acceptance: {
+    acceptance_id: string;
+    verdict: AcceptanceVerdict;
+    criterion_results: CriterionResult[];
+    created_at: string;
+  } | null;
   created_at: string;
+}
+
+interface ProposalRecord extends Omit<ProposalData, 'projection_version' | 'available_actions' | 'task_id'> {
+  /** 接受提议时由服务端发号（R-11）；提议阶段恒为 null。 */
+  assigned_task_id: string | null;
 }
 
 interface StoredReceipt {
+  /** 首次落账的命令类型（与真服务回执 payload.command 同义） */
+  type: CommandType;
+  /** 请求体指纹（只含 payload，与真服务 request_fingerprint 同口径） */
   fingerprint: string;
-  body: CommandResponse;
+  result: CommandResultData;
 }
 
 export interface ExecuteCommandInput {
@@ -101,50 +106,109 @@ export interface ExecuteCommandInput {
 
 export type EventListener = (event: EventRecord) => void;
 
-const DEFAULT_CRITERIA: Criterion[] = [
-  { criterion_ref: 'c-import-mapped', kind: 'auto', label: '导入映射字段齐全（自动核对）' },
-  { criterion_ref: 'c-dual-track-report', kind: 'manual', label: '双轨对照结论已给出（人工判定）' },
+const TERMINAL: ReadonlySet<TaskRecord['lifecycle']> = new Set(['accepted', 'canceled']);
+
+/** 三个种子里 My Actions 里可见的任务（R-7 种子契约）。 */
+const SEED_TASKS: Array<{
+  task_id: string;
+  title: string;
+  description: string;
+  lifecycle: TaskRecord['lifecycle'];
+  criteria: AcceptanceCriterion[];
+  proposal_id?: string;
+  capture_id?: string;
+  accepted?: boolean;
+  canceled?: boolean;
+  feedback?: string;
+}> = [
+  {
+    task_id: 'task_demo_contact',
+    title: '联系张三确认方案',
+    description: '给张三打电话确认上周讨论的方案细节，并记录对方意见。',
+    lifecycle: 'active',
+    criteria: [{ criterion_ref: 'c1', text: '确认了方案的关键细节（时间、范围、负责人）', auto: false }],
+  },
+  {
+    task_id: 'task_demo_quote',
+    title: '整理报价单',
+    description: '按确认后的方案整理报价单，附上工作量说明。',
+    lifecycle: 'ready',
+    criteria: [
+      { criterion_ref: 'c1', text: '报价单覆盖全部交付项', auto: false },
+      { criterion_ref: 'c2', text: '金额与工作量一致', auto: false },
+    ],
+  },
+  {
+    task_id: 'task_demo_contract',
+    title: '起草合同附件',
+    description: '按已确认的方案与报价起草合同附件。',
+    lifecycle: 'defined',
+    criteria: [{ criterion_ref: 'c1', text: '附件条款与方案一致', auto: false }],
+  },
+  {
+    task_id: 'task_demo_kickoff',
+    title: '确认客户启动会时间',
+    description: '与客户确认启动会时间（已通过种子演示"已完成"状态）。',
+    lifecycle: 'accepted',
+    criteria: [{ criterion_ref: 'c1', text: '已在日历中登记启动会', auto: true }],
+    feedback: '已和客户约定下周二下午三点的启动会，日历已登记。',
+    accepted: true,
+  },
+  {
+    task_id: 'task_demo_archived',
+    title: '复核旧版报价模板',
+    description: '已按客户要求改为使用现行模板，本条作废（种子演示"已取消"状态）。',
+    lifecycle: 'canceled',
+    criteria: [{ criterion_ref: 'c1', text: '模板与现行版本一致', auto: false }],
+    canceled: true,
+  },
 ];
 
-const DEGRADED_CRITERIA: Criterion[] = [
-  { criterion_ref: 'c-leads-export', kind: 'auto', label: '手机端线索导出完整（自动核对）' },
-  { criterion_ref: 'c-leads-dedup', kind: 'manual', label: '重复线索已人工合并（人工判定）' },
-];
-
-const TERMINAL_LIFECYCLES = new Set<TaskRecord['lifecycle']>(['accepted', 'canceled']);
-
-function copyCriteria(criteria: Criterion[]): Criterion[] {
+function copyCriteria(criteria: AcceptanceCriterion[]): AcceptanceCriterion[] {
   return criteria.map((criterion) => ({ ...criterion }));
 }
 
-function copyProposedTasks(tasks: ProposedTask[]): ProposedTask[] {
-  return tasks.map((task) => ({ ...task, criteria: copyCriteria(task.criteria) }));
-}
+/** 现场捕获由 mock 提议给出的判据（与真服务同理：ref 由提议给出，旅程按 projection 取值）。 */
+const CAPTURE_CRITERIA: AcceptanceCriterion[] = [
+  { criterion_ref: 'c-journey-1', text: '导入结果可查询，映射字段齐全', auto: true },
+  { criterion_ref: 'c-journey-2', text: '双轨对照结论已给出（人工判定）', auto: false },
+];
 
-/** 当前 actor 对一条 Task 的可用动作（前端只渲染，服务端复核用同一函数）。 */
+/** 当前 actor 对一条 Task 的可用动作（canonical 词表，服务端复核用同一函数）。 */
 export function availableActionsFor(task: TaskRecord, actorId: string): CommandType[] {
-  if (task.lifecycle === 'defined' && task.wait_state === 'none' && task.intended_assignee_id === actorId) {
-    return ['complete_task'];
+  if (TERMINAL.has(task.lifecycle)) return [];
+  if (task.assignee_id !== actorId) return [];
+  switch (task.lifecycle) {
+    case 'defined':
+    case 'ready':
+      return ['task_advance', 'task_cancel'];
+    case 'active':
+      // cancel_task 与内核一致地保留在执行中（REQ-RUN-6：执行中也能记取消意图）
+      return ['feedback_submit', 'task_cancel'];    case 'awaiting_acceptance':
+      // R-10：验收动作就在这条上，任务留在 My Actions 直到验收落账
+      return ['acceptance_record', 'task_cancel'];
+    default:
+      return [];
   }
-  if (
-    task.lifecycle === 'awaiting_acceptance' &&
-    task.assignee_kind === 'human' &&
-    task.intended_assignee_id === actorId
-  ) {
-    return ['record_acceptance'];
-  }
-  return [];
 }
 
-function proposeActionsFor(proposal: ProposalRecord): CommandType[] {
-  return proposal.status === 'proposed' ? ['accept_proposal', 'reject_proposal'] : [];
+function proposalActionsFor(proposal: ProposalRecord): CommandType[] {
+  return proposal.status === 'proposed' ? ['proposal_accept', 'proposal_reject'] : [];
 }
 
-function computeVerdict(results: CriterionResult[]): AcceptanceVerdict {
-  const passed = results.filter((r) => r.verdict === 'passed').length;
-  if (passed === results.length) return 'accepted';
-  if (passed === 0) return 'rejected';
-  return 'partially_accepted';
+/** 与真服务 ActionItem.next_action 同义：next_action 是**给用户看的标签**，不是 command_type。 */
+const ACTION_LABEL: Record<CommandType, string> = {
+  proposal_accept: '接受提议',
+  proposal_reject: '拒绝提议',
+  task_advance: '推进任务',
+  feedback_submit: '提交执行反馈',
+  acceptance_record: '逐判据验收',
+  task_cancel: '取消任务',
+};
+
+/** 首次命令回执（R-6）：与真服务一致，receipt_event_id 是幂等键本身（事件表 idempotency_key = client_id:<id>）。 */
+function receiptEventId(clientSubmitId: string): string {
+  return `client_id:${clientSubmitId}`;
 }
 
 export class JourneyState {
@@ -152,7 +216,6 @@ export class JourneyState {
   readonly projects = new Map<string, ProjectRecord>();
   readonly tasks = new Map<string, TaskRecord>();
   readonly proposals = new Map<string, ProposalRecord>();
-  readonly captures = new Map<string, CaptureRecord>();
 
   head = 0;
   private readonly receipts = new Map<string, StoredReceipt>();
@@ -167,24 +230,18 @@ export class JourneyState {
   // --------------------------------------------------------------------------
 
   emit(input: {
-    type: string;
     kind: string;
     project_id: string;
     entity_id: string;
-    summary: string;
-    degraded?: boolean;
     payload?: Record<string, unknown>;
+    at?: string;
   }): EventRecord {
-    const occurredAt = new Date().toISOString();
     const event: EventRecord = {
       seq: ++this.head,
       kind: input.kind,
-      type: input.type,
       project_id: input.project_id,
       entity_id: input.entity_id,
-      summary: input.summary,
-      degraded: input.degraded === true,
-      occurred_at: occurredAt,
+      occurred_at: input.at ?? new Date().toISOString(),
       payload: input.payload ?? {},
     };
     this.events.push(event);
@@ -198,15 +255,18 @@ export class JourneyState {
     const project = this.projects.get(event.project_id);
     if (project) project.updated_at = event.occurred_at;
 
-    switch (event.type) {
+    switch (event.kind) {
       case 'ProjectCreated': {
         this.projects.set(event.project_id, {
           project_id: event.project_id,
-          title: String(payload.title ?? event.project_id),
+          name: String(payload.name ?? event.project_id),
+          policy_id: String(payload.policy_id ?? ''),
+          created_by: String(payload.created_by ?? ''),
           goal_id: '',
-          goal_text: '',
-          goal_status: 'draft',
-          plan_rev: 0,
+          goal_statement: '',
+          goal_success: '',
+          goal_stop: '',
+          goal_status: 'active',
           created_at: event.occurred_at,
           updated_at: event.occurred_at,
         });
@@ -215,58 +275,9 @@ export class JourneyState {
       case 'GoalCreated': {
         if (!project) throw new Error(`GoalCreated before ProjectCreated: ${event.project_id}`);
         project.goal_id = String(payload.goal_id);
-        project.goal_text = String(payload.text);
-        break;
-      }
-      case 'FeedbackReceived': {
-        this.captures.set(String(payload.capture_id), {
-          capture_id: String(payload.capture_id),
-          project_id: event.project_id,
-          text: String(payload.text),
-          proposal_id: null,
-          created_at: event.occurred_at,
-        });
-        break;
-      }
-      case 'PlanChangeProposed': {
-        const proposedTasks = copyProposedTasks((payload.proposed_tasks as ProposedTask[]) ?? []);
-        this.proposals.set(String(payload.proposal_id), {
-          proposal_id: String(payload.proposal_id),
-          project_id: event.project_id,
-          capture_id: String(payload.capture_id),
-          status: 'proposed',
-          degraded: payload.degraded === true,
-          degraded_reasons: (payload.degraded_reasons as string[]) ?? [],
-          summary: String(payload.summary ?? ''),
-          rationale: String(payload.rationale ?? ''),
-          proposed_tasks: proposedTasks,
-          created_at: event.occurred_at,
-          decided_at: null,
-          decided_seq: null,
-        });
-        const capture = this.captures.get(String(payload.capture_id));
-        if (capture) capture.proposal_id = String(payload.proposal_id);
-        break;
-      }
-      case 'PlanChangeApplied': {
-        const proposal = this.proposals.get(String(payload.proposal_id));
-        if (!proposal) throw new Error(`PlanChangeApplied without proposal: ${String(payload.proposal_id)}`);
-        proposal.status = 'accepted';
-        proposal.decided_at = event.occurred_at;
-        proposal.decided_seq = event.seq;
-        if (project) project.plan_rev = Number(payload.plan_rev ?? project.plan_rev + 1);
-        break;
-      }
-      case 'PlanChangeRejected': {
-        const proposal = this.proposals.get(String(payload.proposal_id));
-        if (!proposal) throw new Error(`PlanChangeRejected without proposal: ${String(payload.proposal_id)}`);
-        proposal.status = 'rejected';
-        proposal.decided_at = event.occurred_at;
-        proposal.decided_seq = event.seq;
-        break;
-      }
-      case 'PlanRevisionCreated': {
-        if (project) project.plan_rev = Number(payload.plan_rev ?? project.plan_rev);
+        project.goal_statement = String(payload.statement ?? '');
+        project.goal_success = String(payload.success_criteria ?? '');
+        project.goal_stop = String(payload.stop_conditions ?? '');
         break;
       }
       case 'TaskCaptured': {
@@ -274,18 +285,19 @@ export class JourneyState {
           task_id: String(payload.task_id),
           project_id: event.project_id,
           title: String(payload.title ?? ''),
+          description: String(payload.description ?? ''),
           lifecycle: (payload.lifecycle as TaskRecord['lifecycle']) ?? 'defined',
-          wait_state: String(payload.wait_state ?? 'none'),
-          intended_assignee_id: String(payload.assignee_id ?? ''),
+          wait_state: 'none',
+          assignee_id: String(payload.assignee_id ?? ''),
           assignee_kind: (payload.assignee_kind as 'human' | 'agent') ?? 'human',
           current_contract_rev: Number(payload.contract_rev ?? 1),
-          criteria: copyCriteria((payload.criteria as Criterion[]) ?? []),
-          criterion_results: [],
-          degraded: payload.degraded === true,
-          created_from_proposal: (payload.created_from_proposal as string | null) ?? null,
-          outcome: null,
-          last_acceptance: null,
-          acceptance_seq: 0,
+          criteria: copyCriteria((payload.acceptance_criteria as AcceptanceCriterion[]) ?? []),
+          proposal_id: (payload.proposal_id as string | null) ?? null,
+          capture_id: (payload.capture_id as string | null) ?? null,
+          last_outcome_id: null,
+          feedback_count: 0,
+          cancel_requested: false,
+          acceptance: null,
           created_at: event.occurred_at,
         });
         break;
@@ -302,744 +314,820 @@ export class JourneyState {
         task.lifecycle = 'canceled';
         break;
       }
+      case 'FeedbackReceived': {
+        const taskId = payload.task_id;
+        const task = typeof taskId === 'string' ? this.tasks.get(taskId) : undefined;
+        if (task) task.feedback_count += 1;
+        break;
+      }
       case 'OutcomeRecorded': {
         const task = this.tasks.get(String(payload.task_id));
         if (!task) throw new Error(`OutcomeRecorded without task: ${String(payload.task_id)}`);
-        task.outcome = {
-          outcome_id: String(payload.outcome_id),
-          conclusion_kind: String(payload.conclusion_kind ?? 'unknown'),
-          recorded_at: event.occurred_at,
-        };
+        task.last_outcome_id = String(payload.outcome_id);
         break;
       }
       case 'AcceptanceRecorded': {
         const task = this.tasks.get(String(payload.task_id));
         if (!task) throw new Error(`AcceptanceRecorded without task: ${String(payload.task_id)}`);
-        task.criterion_results = (payload.criterion_results as CriterionResult[]).map((result) => ({
-          criterion_ref: result.criterion_ref,
-          verdict: result.verdict,
-          evidence_refs: [...result.evidence_refs],
-        }));
-        task.last_acceptance = {
+        task.acceptance = {
           acceptance_id: String(payload.acceptance_id),
           verdict: payload.verdict as AcceptanceVerdict,
-          recorded_at: event.occurred_at,
+          criterion_results: ((payload.criterion_results as CriterionResult[]) ?? []).map((result) => ({
+            criterion_ref: result.criterion_ref,
+            verdict: result.verdict,
+            evidence_refs: [...result.evidence_refs],
+          })),
+          created_at: event.occurred_at,
         };
-        task.acceptance_seq = event.seq;
         break;
       }
-      case 'GoalStatusChanged': {
-        if (project) project.goal_status = payload.status as ProjectRecord['goal_status'];
+      case 'PlanChangeProposed': {
+        this.proposals.set(String(payload.change_id), {
+          proposal_id: String(payload.change_id),
+          project_id: event.project_id,
+          kind: String(payload.kind ?? 'capture_task'),
+          status: 'proposed',
+          status_reason: null,
+          capture_id: (payload.capture_id as string | null) ?? null,
+          rationale: String(payload.rationale ?? ''),
+          assumptions: (payload.assumptions as string[]) ?? [],
+          risk_level: String(payload.risk_level ?? 'L0'),
+          base_plan_rev: Number(payload.base_plan_rev ?? 0),
+          ops: (payload.ops as unknown[]) ?? [],
+          degraded: ((payload.proposer as { degraded?: boolean } | undefined)?.degraded ?? false) === true,
+          proposer: (payload.proposer as ProposalRecord['proposer']) ?? {
+            source: 'fallback',
+            model: null,
+            degraded: false,
+            degraded_reason: null,
+            latency_ms: null,
+          },
+          details: (payload.details as ProposalRecord['details']) ?? {
+            kind: 'capture_task',
+            task: { title: '', description: '', assignee_kind: 'human', acceptance_criteria: [] },
+          },
+          created_at: String(payload.proposed_at ?? event.occurred_at),
+          assigned_task_id: null,
+        });
         break;
       }
-      case 'DevBurstRecorded': {
-        // mock-only 负载，不派生任何领域状态。
+      case 'PlanChangeApplied': {
+        const proposal = this.proposals.get(String(payload.change_id));
+        if (!proposal) throw new Error(`PlanChangeApplied without proposal: ${String(payload.change_id)}`);
+        proposal.status = 'accepted';
+        proposal.assigned_task_id = (payload.task_id as string | null) ?? proposal.assigned_task_id;
         break;
       }
+      case 'PlanChangeRejected': {
+        const proposal = this.proposals.get(String(payload.change_id));
+        if (!proposal) throw new Error(`PlanChangeRejected without proposal: ${String(payload.change_id)}`);
+        proposal.status = 'rejected';
+        proposal.status_reason = String(payload.reason ?? '');
+        break;
+      }
+      case 'AssignmentCreated':
+      case 'TaskDefined':
+      case 'RunCreated':
+      case 'RunStarted':
+      case 'RunSucceeded':
+      case 'FeedbackInterpreted':
+      case 'TaskCancelRequested':
+      case 'RunCanceled':
+      case 'DevBurstRecorded':
+        // mock-only 负载：这些事件不改本 mock 的投影形状。
+        break;
       default:
-        throw new Error(`mock apply 不认识事件类型：${event.type}`);
+        throw new Error(`mock apply 不认识事件类型：${event.kind}`);
     }
   }
 
   // --------------------------------------------------------------------------
-  // 种子
+  // 种子（R-7：与真服务种子契约同名同形）
   // --------------------------------------------------------------------------
 
-  /** 一个演示项目 + 一条历史任务（已取消，无可用动作），任务图从空开始。 */
   seedDemoProject(): void {
     const projectId = DEMO.projectId;
     this.emit({
-      type: 'ProjectCreated',
-      kind: 'project.created',
+      kind: 'ProjectCreated',
       project_id: projectId,
       entity_id: projectId,
-      summary: '演示项目已创建',
-      payload: { title: 'nx-pipeline 导入与双轨对照' },
+      payload: {
+        name: '续行演示 · 客户方案落地',
+        policy_id: 'policy_demo',
+        created_by: CURRENT_ACTOR_ID,
+      },
     });
     this.emit({
-      type: 'GoalCreated',
-      kind: 'goal.created',
+      kind: 'GoalCreated',
       project_id: projectId,
       entity_id: DEMO.goalId,
-      summary: '目标：把 nx-pipeline 最近一轮 run 导入续行并跑通双轨对照',
       payload: {
         goal_id: DEMO.goalId,
-        text: '把 nx-pipeline 最近一轮 run 导入续行，跑通双轨对照并给出结论',
+        statement: '把「张三方案确认 → 报价 → 合同」这条客户落地链路跑通并完成验收',
+        success_criteria: '每个任务都有可核对反馈，最终验收全部判据通过',
+        stop_conditions: '客户明确终止合作时停止',
       },
     });
-    this.emit({
-      type: 'TaskCaptured',
-      kind: 'task.created',
-      project_id: projectId,
-      entity_id: DEMO.canceledTaskId,
-      summary: '历史任务：旧版导入脚本试跑',
-      payload: {
-        task_id: DEMO.canceledTaskId,
-        title: '旧版导入脚本试跑',
-        assignee_id: 'actor-agent-legacy',
-        assignee_kind: 'agent',
-        contract_rev: 1,
-        criteria: [{ criterion_ref: 'c-legacy-smoke', kind: 'auto', label: '旧脚本冒烟通过' }],
-        created_from_proposal: null,
-        degraded: false,
-      },
-    });
-    this.emit({
-      type: 'TaskCanceled',
-      kind: 'task.canceled',
-      project_id: projectId,
-      entity_id: DEMO.canceledTaskId,
-      summary: '历史任务已取消（改用新导入路径）',
-      payload: { task_id: DEMO.canceledTaskId, reason: '改用新导入路径' },
-    });
+
+    for (const seed of SEED_TASKS) {
+      const base = { project_id: projectId, entity_id: seed.task_id };
+      this.emit({
+        ...base,
+        kind: 'TaskCaptured',
+        payload: {
+          task_id: seed.task_id,
+          title: seed.title,
+          description: seed.description,
+          assignee_id: CURRENT_ACTOR_ID,
+          assignee_kind: 'human',
+          contract_rev: 1,
+          acceptance_criteria: copyCriteria(seed.criteria),
+          proposal_id: seed.proposal_id ?? null,
+          capture_id: seed.capture_id ?? null,
+          lifecycle: 'captured',
+        },
+      });
+      this.emit({ ...base, kind: 'AssignmentCreated', payload: { task_id: seed.task_id } });
+      this.emit({ ...base, kind: 'TaskDefined', payload: { task_id: seed.task_id } });
+      this.transition(seed.task_id, 'captured', 'defined');
+
+      if (seed.lifecycle === 'defined') continue;
+      this.transition(seed.task_id, 'defined', 'ready');
+      if (seed.lifecycle === 'ready') continue;
+
+      this.emit({ ...base, kind: 'RunCreated', payload: { task_id: seed.task_id, run_kind: 'human_light' } });
+      this.emit({ ...base, kind: 'RunStarted', payload: { task_id: seed.task_id } });
+      this.transition(seed.task_id, 'ready', 'active');
+      if (seed.lifecycle === 'active') continue;
+
+      if (seed.canceled === true) {
+        this.emit({ ...base, kind: 'TaskCancelRequested', payload: { task_id: seed.task_id } });
+        this.emit({ ...base, kind: 'RunCanceled', payload: { task_id: seed.task_id } });
+        this.transition(seed.task_id, 'active', 'canceled');
+        this.emit({ ...base, kind: 'TaskCanceled', payload: { task_id: seed.task_id, reason: 'seed' } });
+        continue;
+      }
+
+      const runKey = `seed-${seed.task_id}`;
+      this.emit({
+        ...base,
+        kind: 'FeedbackReceived',
+        payload: {
+          task_id: seed.task_id,
+          run_id: `run-${runKey}`,
+          author_id: CURRENT_ACTOR_ID,
+          raw_content: seed.feedback ?? '',
+        },
+      });
+      this.emit({
+        ...base,
+        kind: 'OutcomeRecorded',
+        payload: { task_id: seed.task_id, outcome_id: `out-${runKey}`, conclusion_kind: 'achieved' },
+      });
+      this.emit({ ...base, kind: 'RunSucceeded', payload: { task_id: seed.task_id } });
+      this.transition(seed.task_id, 'active', 'awaiting_acceptance');
+      if (seed.accepted !== true) continue;
+
+      this.emit({
+        ...base,
+        kind: 'AcceptanceRecorded',
+        payload: {
+          task_id: seed.task_id,
+          acceptance_id: `acc-${runKey}`,
+          verdict: 'accepted',
+          criterion_results: seed.criteria.map((criterion) => ({
+            criterion_ref: criterion.criterion_ref,
+            verdict: 'passed',
+            evidence_refs: [],
+          })),
+        },
+      });
+      this.transition(seed.task_id, 'awaiting_acceptance', 'accepted');
+    }
   }
 
-  /** 降级演示项目：种子中已有一条带 degraded 标记的提议。 */
-  seedDegradedProposal(): void {
+  /** R-7② 降级夹具：proj-degraded + goal-degraded-1 + prop-degraded-1（不预告 task_id）。 */
+  seedDegradedFixture(): void {
     const projectId = DEGRADED.projectId;
     this.emit({
-      type: 'ProjectCreated',
-      kind: 'project.created',
+      kind: 'ProjectCreated',
       project_id: projectId,
       entity_id: projectId,
-      summary: '降级演示项目已创建',
-      payload: { title: '手机端线索导入（降级链路）' },
+      payload: { name: '续行演示 · 降级场景', policy_id: 'policy_demo', created_by: CURRENT_ACTOR_ID },
     });
     this.emit({
-      type: 'GoalCreated',
-      kind: 'goal.created',
+      kind: 'GoalCreated',
       project_id: projectId,
-      entity_id: `${DEGRADED.projectId}-goal`,
-      summary: '目标：把手机端收集的线索导入续行',
+      entity_id: DEGRADED.goalId,
       payload: {
-        goal_id: `${DEGRADED.projectId}-goal`,
-        text: '把手机端收集的线索导入续行并完成去重',
+        goal_id: DEGRADED.goalId,
+        statement: '模型不可达时，系统仍能把捕获的输入记成可审阅的提议',
+        success_criteria: '用户能看到降级明示，并决定接受或拒绝',
+        stop_conditions: '用户拒绝该提议时停止',
       },
     });
     this.emit({
-      type: 'TaskCaptured',
-      kind: 'task.created',
-      project_id: projectId,
-      entity_id: `${DEGRADED.projectId}-legacy`,
-      summary: '历史任务：手工线索表整理',
-      payload: {
-        task_id: `${DEGRADED.projectId}-legacy`,
-        title: '手工线索表整理',
-        assignee_id: 'actor-agent-legacy',
-        assignee_kind: 'agent',
-        contract_rev: 1,
-        criteria: [{ criterion_ref: 'c-legacy-leads', kind: 'manual', label: '手工表已核对' }],
-        created_from_proposal: null,
-        degraded: false,
-      },
-    });
-    this.emit({
-      type: 'TaskCanceled',
-      kind: 'task.canceled',
-      project_id: projectId,
-      entity_id: `${DEGRADED.projectId}-legacy`,
-      summary: '历史任务已取消（转入降级链路）',
-      payload: { task_id: `${DEGRADED.projectId}-legacy`, reason: '转入降级链路' },
-    });
-    this.emit({
-      type: 'FeedbackReceived',
-      kind: 'feedback.captured',
-      project_id: projectId,
-      entity_id: 'cap-degraded-1',
-      summary: '捕获：手机端线索待导入（降级解析）',
-      degraded: true,
-      payload: { capture_id: 'cap-degraded-1', text: '把手机端收集的线索导入续行（降级解析）' },
-    });
-    this.emit({
-      type: 'PlanChangeProposed',
-      kind: 'proposal.created',
+      kind: 'PlanChangeProposed',
       project_id: projectId,
       entity_id: DEGRADED.proposalId,
-      summary: '降级提议：整理手机端线索清单（规则模板 + 人工确认）',
-      degraded: true,
       payload: {
-        proposal_id: DEGRADED.proposalId,
+        change_id: DEGRADED.proposalId,
+        client_proposal_id: 'cap-degraded-1',
+        kind: 'capture_task',
         capture_id: 'cap-degraded-1',
-        summary: '整理手机端线索清单并完成去重',
-        rationale: '意图解析器不可用，按规则模板生成提议；所有动作仍需人工确认。',
-        degraded: true,
-        degraded_reasons: [
-          'intent_interpreter_unavailable:fallback_rule_template',
-          'plan_engine_fallback:no_llm_plan',
-        ],
-        proposed_tasks: [
-          {
-            task_id: DEGRADED.taskId,
-            title: '整理手机端线索清单并合并重复项',
-            assignee_id: CURRENT_ACTOR_ID,
+        task_id: null,
+        base_plan_rev: 1,
+        ops: [{ op: 'add_task' }],
+        risk_level: 'L0',
+        rationale: '模型不可用，按输入文本生成确定性占位草稿（种子预置）',
+        assumptions: ['模型不可用，任务草稿为确定性占位'],
+        proposer: {
+          source: 'fallback',
+          model: null,
+          degraded: true,
+          degraded_reason: 'not_configured',
+          latency_ms: null,
+        },
+        details: {
+          kind: 'capture_task',
+          task: {
+            title: '跟进降级状态下捕获的事项',
+            description: '由种子预置的降级草稿，用于演示"模型不可达时提议层降级"的界面与 API 形态。',
             assignee_kind: 'human',
-            criteria: copyCriteria(DEGRADED_CRITERIA),
+            acceptance_criteria: [{ criterion_ref: 'c1', text: '事项已跟进并留有可核对记录', auto: false }],
           },
-        ],
+        },
+        proposed_at: null,
       },
     });
   }
 
+  private transition(taskId: string, from: string, to: string): EventRecord {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new Error(`transition without task: ${taskId}`);
+    if (task.lifecycle !== from) {
+      throw new Error(`transition ${taskId}: 期望 from=${from}，实际 ${task.lifecycle}`);
+    }
+    return this.emit({
+      kind: 'TaskLifecycleChanged',
+      project_id: task.project_id,
+      entity_id: taskId,
+      payload: { task_id: taskId, from, to },
+    });
+  }
+
   // --------------------------------------------------------------------------
-  // Capture / 提议
+  // Capture（只产提议，不建任务 —— R-11）
   // --------------------------------------------------------------------------
 
-  capture(text: string): CaptureResponse {
+  capture(text: string, projectId = DEMO.projectId): CaptureData {
     if (typeof text !== 'string' || text.trim().length === 0) {
       throw badRequest('capture.text 必须是非空字符串');
     }
-    if (text.length > 2000) throw badRequest('capture.text 超过 2000 字符上限');
+    const project = this.projects.get(projectId);
+    if (!project) throw badRequest(`项目 ${projectId} 不存在`, { field: 'project_id' });
 
     const captureId = `cap-${randomUUID()}`;
-    const proposalId = `prop-${randomUUID()}`;
-    const taskId = `task-${randomUUID()}`;
-    const degraded = /\[degraded\]|降级/i.test(text);
-    const reasons = degraded
-      ? ['capture_marked_degraded', 'intent_interpreter_unavailable:fallback_rule_template']
-      : [];
+    const proposalId = `pc-${randomUUID()}`;
     const title = `整理并提交：${text.trim().slice(0, 48)}`;
+    const draft: ProposalDraft = {
+      title,
+      description: text.trim(),
+      assignee_kind: 'human',
+      acceptance_criteria: copyCriteria(CAPTURE_CRITERIA),
+    };
 
     this.emit({
-      type: 'FeedbackReceived',
-      kind: 'feedback.captured',
-      project_id: DEMO.projectId,
-      entity_id: captureId,
-      summary: `捕获输入：${text.trim().slice(0, 40)}`,
-      degraded,
-      payload: { capture_id: captureId, text: text.trim() },
-    });
-    this.emit({
-      type: 'PlanChangeProposed',
-      kind: 'proposal.created',
-      project_id: DEMO.projectId,
+      kind: 'PlanChangeProposed',
+      project_id: projectId,
       entity_id: proposalId,
-      summary: `智能层产出提议：${title}`,
-      degraded,
       payload: {
-        proposal_id: proposalId,
+        change_id: proposalId,
+        client_proposal_id: captureId,
+        kind: 'capture_task',
         capture_id: captureId,
-        summary: title,
-        rationale: degraded
-          ? '智能层不可用，按规则模板产出提议；提议可接受但标记 degraded。'
-          : '把输入收敛为一条可验收任务，交由当前用户完成并逐判据验收。',
-        degraded,
-        degraded_reasons: reasons,
-        proposed_tasks: [
-          {
-            task_id: taskId,
-            title,
-            assignee_id: CURRENT_ACTOR_ID,
-            assignee_kind: 'human',
-            criteria: copyCriteria(DEFAULT_CRITERIA),
-          },
-        ],
+        task_id: null,
+        base_plan_rev: this.proposalsAll(projectId).length,
+        ops: [{ op: 'add_task' }],
+        risk_level: 'L0',
+        rationale: '把输入收敛为一条可验收任务，交由当前用户完成并逐判据验收。',
+        assumptions: [],
+        proposer: { source: 'model', model: 'mock-intent-interpreter', degraded: false, degraded_reason: null, latency_ms: 1 },
+        details: { kind: 'capture_task', task: draft },
+        proposed_at: new Date().toISOString(),
       },
     });
+    this.emit({
+      kind: 'FeedbackReceived',
+      project_id: projectId,
+      entity_id: captureId,
+      payload: { feedback_id: `fb-${captureId}`, task_id: null, author_id: CURRENT_ACTOR_ID, raw_content: text, capture_id: captureId },
+    });
 
-    return { capture_id: captureId, proposal_id: proposalId, projection_version: this.head };
+    return {
+      projection_version: this.head,
+      capture_id: captureId,
+      proposal_id: proposalId,
+      project_id: projectId,
+      degraded: false,
+      degraded_reason: null,
+      proposer: { source: 'model', model: 'mock-intent-interpreter', latency_ms: 1 },
+      draft,
+      replayed: false,
+      emitted: [{ seq: this.head - 1, kind: 'PlanChangeProposed' }, { seq: this.head, kind: 'FeedbackReceived' }],
+    };
+  }
+
+  private proposalsAll(projectId: string): ProposalRecord[] {
+    return [...this.proposals.values()].filter((proposal) => proposal.project_id === projectId);
   }
 
   // --------------------------------------------------------------------------
   // 命令（统一入口，available_actions 复核 + client_submit_id 幂等）
   // --------------------------------------------------------------------------
 
-  executeCommand(input: ExecuteCommandInput, actorId = CURRENT_ACTOR_ID): CommandResponse {
+  executeCommand(input: ExecuteCommandInput, actorId = CURRENT_ACTOR_ID): CommandResultData {
     if (typeof input.client_submit_id !== 'string' || input.client_submit_id.length === 0) {
-      throw badRequest('client_submit_id 必填（幂等键）');
+      throw badRequest('client_submit_id 必填（幂等键）', { field: 'client_submit_id' });
     }
     if (typeof input.type !== 'string' || input.type.length === 0) {
-      throw badRequest('命令 type 必填');
+      throw badRequest('命令 type 必填', { field: 'type' });
     }
-    const fingerprint = JSON.stringify({ type: input.type, payload: input.payload });
+    // 与真服务同口径：指纹只含 payload（commands.ts 的 fingerprint(requestPayload)），
+    // 回执里另记 command_type —— 同一 id 换命令类型也是 409（幂等键冲突）。
+    const fingerprint = JSON.stringify(input.payload);
     const existing = this.receipts.get(input.client_submit_id);
     if (existing) {
-      if (existing.fingerprint !== fingerprint) {
-        throw new ApiError(409, 'idempotency_conflict', '同一 client_submit_id 被用于不同命令内容', {
-          details: { client_submit_id: input.client_submit_id },
+      if (existing.type !== input.type || existing.fingerprint !== fingerprint) {
+        throw conflict(`client_submit_id=${input.client_submit_id} 已用于不同内容的命令`, {
+          reason: 'idempotency_key_conflict',
+          retryable: false,
         });
       }
-      return {
-        receipt: { ...existing.body.receipt, duplicate: true },
-        projection_version: existing.body.projection_version,
-      };
+      return { ...existing.result, emitted: [], replayed: true };
     }
 
     if (!(COMMAND_TYPES as readonly string[]).includes(input.type)) {
-      throw badRequest(`未知命令 type=${input.type}`, { allowed_types: [...COMMAND_TYPES] });
+      throw badRequest(`不支持的命令 type=${input.type}`, {
+        field: 'type',
+        allowed: [...COMMAND_TYPES],
+      });
     }
     const type = input.type as CommandType;
-    let emitted: EventRecord[];
+    const before = this.head;
+    let subject: Record<string, unknown>;
     switch (type) {
-      case 'accept_proposal':
-        emitted = this.acceptProposal(String(input.payload.proposal_id ?? ''), actorId);
+      case 'proposal_accept':
+        subject = this.acceptProposal(String(input.payload.proposal_id ?? ''), actorId);
         break;
-      case 'reject_proposal':
-        emitted = this.rejectProposal(
-          String(input.payload.proposal_id ?? ''),
-          String(input.payload.reason ?? '用户拒绝提议'),
-        );
+      case 'proposal_reject':
+        subject = this.rejectProposal(String(input.payload.proposal_id ?? ''), String(input.payload.reason ?? '用户拒绝提议'));
         break;
-      case 'complete_task':
-        emitted = this.completeTask(String(input.payload.task_id ?? ''), actorId);
+      case 'task_advance':
+        subject = this.advanceTask(String(input.payload.task_id ?? ''), input.payload.to, actorId);
         break;
-      case 'record_acceptance':
-        emitted = this.recordAcceptance(input.payload, actorId);
+      case 'feedback_submit':
+        subject = this.submitFeedback(String(input.payload.task_id ?? ''), String(input.payload.content ?? ''), actorId);
+        break;
+      case 'acceptance_record':
+        subject = this.recordAcceptance(input.payload, actorId);
+        break;
+      case 'task_cancel':
+        subject = this.cancelTask(String(input.payload.task_id ?? ''), actorId);
         break;
       default:
-        throw badRequest(`未实现的命令 type=${type}`);
+        throw badRequest(`未实现的命令 type=${String(type)}`);
     }
 
-    const body: CommandResponse = {
-      receipt: {
-        client_submit_id: input.client_submit_id,
-        command_type: type,
-        accepted_at: new Date().toISOString(),
-        seq: emitted.length > 0 ? emitted[emitted.length - 1].seq : this.head,
-        projection_version: this.head,
-        duplicate: false,
-      },
+    const emitted = this.events.filter((event) => event.seq > before).map((event) => ({ seq: event.seq, kind: event.kind }));
+    const result: CommandResultData = {
       projection_version: this.head,
+      command_type: type,
+      client_submit_id: input.client_submit_id,
+      replayed: false,
+      emitted,
+      subject,
+      receipt_event_id: receiptEventId(input.client_submit_id),
     };
-    this.receipts.set(input.client_submit_id, { fingerprint, body });
-    return { receipt: { ...body.receipt }, projection_version: body.projection_version };
-  }
-
-  private acceptProposal(proposalId: string, actorId: string): EventRecord[] {
-    const proposal = this.requireProposal(proposalId);
-    const actions = proposeActionsFor(proposal);
-    if (proposal.status !== 'proposed') {
-      throw terminalState(`提议 ${proposalId} 已是 ${proposal.status}，不可再次接受`);
-    }
-    if (!actions.includes('accept_proposal')) {
-      throw forbidden('当前 actor 不可接受该提议：available_actions 不含 accept_proposal', actions);
-    }
-    if (proposal.proposed_tasks.length === 0) {
-      throw badRequest('提议没有可落地的任务');
-    }
-    const project = this.projects.get(proposal.project_id);
-    if (!project) throw notFound(`Project ${proposal.project_id} 不存在`);
-
-    const nextRev = project.plan_rev + 1;
-    const emitted: EventRecord[] = [];
-    emitted.push(
-      this.emit({
-        type: 'PlanChangeApplied',
-        kind: 'proposal.accepted',
-        project_id: proposal.project_id,
-        entity_id: proposal.proposal_id,
-        summary: `提议已接受：${proposal.summary}`,
-        degraded: proposal.degraded,
-        payload: {
-          proposal_id: proposal.proposal_id,
-          accepted_by: actorId,
-          plan_rev: nextRev,
-          degraded: proposal.degraded,
-        },
-      }),
-    );
-    for (const proposed of proposal.proposed_tasks) {
-      emitted.push(
-        this.emit({
-          type: 'TaskCaptured',
-          kind: 'task.created',
-          project_id: proposal.project_id,
-          entity_id: proposed.task_id,
-          summary: `任务生成：${proposed.title}`,
-          degraded: proposal.degraded,
-          payload: {
-            task_id: proposed.task_id,
-            title: proposed.title,
-            assignee_id: proposed.assignee_id,
-            assignee_kind: proposed.assignee_kind,
-            contract_rev: 1,
-            criteria: copyCriteria(proposed.criteria),
-            created_from_proposal: proposal.proposal_id,
-            degraded: proposal.degraded,
-          },
-        }),
-      );
-    }
-    emitted.push(
-      this.emit({
-        type: 'PlanRevisionCreated',
-        kind: 'plan.revised',
-        project_id: proposal.project_id,
-        entity_id: proposal.proposal_id,
-        summary: `计划修订 rev=${nextRev}`,
-        degraded: proposal.degraded,
-        payload: { plan_rev: nextRev },
-      }),
-    );
-    const goalEvent = this.syncGoalStatus(proposal.project_id);
-    if (goalEvent) emitted.push(goalEvent);
-    return emitted;
-  }
-
-  private rejectProposal(proposalId: string, reason: string): EventRecord[] {
-    const proposal = this.requireProposal(proposalId);
-    const actions = proposeActionsFor(proposal);
-    if (proposal.status !== 'proposed') {
-      throw terminalState(`提议 ${proposalId} 已是 ${proposal.status}，不可再次拒绝`);
-    }
-    if (!actions.includes('reject_proposal')) {
-      throw forbidden('当前 actor 不可拒绝该提议：available_actions 不含 reject_proposal', actions);
-    }
-    return [
-      this.emit({
-        type: 'PlanChangeRejected',
-        kind: 'proposal.rejected',
-        project_id: proposal.project_id,
-        entity_id: proposal.proposal_id,
-        summary: `提议已拒绝：${reason}`,
-        degraded: proposal.degraded,
-        payload: { proposal_id: proposal.proposal_id, reason },
-      }),
-    ];
-  }
-
-  private completeTask(taskId: string, actorId: string): EventRecord[] {
-    const task = this.tasks.get(taskId);
-    if (!task) throw notFound(`Task ${taskId} 不存在`);
-    if (TERMINAL_LIFECYCLES.has(task.lifecycle)) {
-      throw terminalState(`Task ${taskId} 已是终态 ${task.lifecycle}`);
-    }
-    const actions = availableActionsFor(task, actorId);
-    if (!actions.includes('complete_task')) {
-      throw forbidden(
-        `当前 actor 不可完成 Task ${taskId}：available_actions=${JSON.stringify(actions)}`,
-        actions,
-      );
-    }
-    const outcomeId = `out-${randomUUID()}`;
-    const emitted: EventRecord[] = [];
-    emitted.push(
-      this.emit({
-        type: 'OutcomeRecorded',
-        kind: 'task.outcome_recorded',
-        project_id: task.project_id,
-        entity_id: task.task_id,
-        summary: `任务产出已入账：${task.title}`,
-        degraded: task.degraded,
-        payload: {
-          outcome_id: outcomeId,
-          task_id: task.task_id,
-          conclusion_kind: 'achieved',
-          recorded_by: actorId,
-        },
-      }),
-    );
-    emitted.push(
-      this.emit({
-        type: 'TaskLifecycleChanged',
-        kind: 'task.awaiting_acceptance',
-        project_id: task.project_id,
-        entity_id: task.task_id,
-        summary: `任务完成，等待验收：${task.title}`,
-        degraded: task.degraded,
-        payload: { task_id: task.task_id, from: task.lifecycle, to: 'awaiting_acceptance' },
-      }),
-    );
-    const goalEvent = this.syncGoalStatus(task.project_id);
-    if (goalEvent) emitted.push(goalEvent);
-    return emitted;
-  }
-
-  private recordAcceptance(payload: Record<string, unknown>, actorId: string): EventRecord[] {
-    const taskId = String(payload.task_id ?? '');
-    const task = this.tasks.get(taskId);
-    if (!task) throw notFound(`Task ${taskId} 不存在`);
-    if (task.lifecycle !== 'awaiting_acceptance') {
-      throw terminalState(`Task ${taskId} 当前 ${task.lifecycle}，不在 awaiting_acceptance，不能验收`);
-    }
-    const actions = availableActionsFor(task, actorId);
-    if (!actions.includes('record_acceptance')) {
-      throw forbidden(
-        `当前 actor 不可验收 Task ${taskId}：available_actions=${JSON.stringify(actions)}`,
-        actions,
-      );
-    }
-
-    const rawResults = payload.criterion_results;
-    if (!Array.isArray(rawResults) || rawResults.length === 0) {
-      throw badRequest('record_acceptance.criterion_results 必须是非空数组');
-    }
-    const results: CriterionResult[] = [];
-    for (const raw of rawResults as Record<string, unknown>[]) {
-      const ref = String(raw.criterion_ref ?? '');
-      const verdict = String(raw.verdict ?? '');
-      if (verdict !== 'passed' && verdict !== 'failed') {
-        throw badRequest(`criterion ${ref} 的 verdict 必须是 passed/failed`);
-      }
-      const evidence = Array.isArray(raw.evidence_refs) ? raw.evidence_refs.map(String) : [];
-      results.push({ criterion_ref: ref, verdict, evidence_refs: evidence });
-    }
-
-    const expectedRefs = task.criteria.map((criterion) => criterion.criterion_ref);
-    const reportedRefs = results.map((result) => result.criterion_ref);
-    const duplicateRefs = reportedRefs.filter((ref, index) => reportedRefs.indexOf(ref) !== index);
-    if (duplicateRefs.length > 0) {
-      throw new ApiError(409, 'duplicate_criterion_ref', `判据重复提交：${duplicateRefs.join(',')}`, {
-        details: { duplicate_refs: duplicateRefs },
-      });
-    }
-    const missing = expectedRefs.filter((ref) => !reportedRefs.includes(ref));
-    if (missing.length > 0) {
-      throw new ApiError(409, 'coverage_incomplete', `验收缺判据：${missing.join(',')}`, {
-        details: { pending_criteria: missing },
-      });
-    }
-    const unknown = reportedRefs.filter((ref) => !expectedRefs.includes(ref));
-    if (unknown.length > 0) {
-      throw new ApiError(409, 'criterion_ref_unknown', `未知判据：${unknown.join(',')}`, {
-        details: { unknown_refs: unknown },
-      });
-    }
-
-    const verdict = computeVerdict(results);
-    const acceptanceId = `acc-${randomUUID()}`;
-    const emitted: EventRecord[] = [];
-    emitted.push(
-      this.emit({
-        type: 'AcceptanceRecorded',
-        kind: 'acceptance.recorded',
-        project_id: task.project_id,
-        entity_id: task.task_id,
-        summary: `验收 ${verdict}：${task.title}`,
-        degraded: task.degraded,
-        payload: {
-          acceptance_id: acceptanceId,
-          task_id: task.task_id,
-          verdict,
-          criterion_results: results,
-          rationale: String(payload.rationale ?? ''),
-          acceptor_id: actorId,
-        },
-      }),
-    );
-
-    const targetLifecycle =
-      verdict === 'accepted' ? 'accepted' : verdict === 'rejected' ? 'defined' : 'awaiting_acceptance';
-    if (targetLifecycle !== task.lifecycle) {
-      emitted.push(
-        this.emit({
-          type: 'TaskLifecycleChanged',
-          kind: targetLifecycle === 'accepted' ? 'task.accepted' : 'task.reopened',
-          project_id: task.project_id,
-          entity_id: task.task_id,
-          summary:
-            targetLifecycle === 'accepted'
-              ? `任务验收通过：${task.title}`
-              : `任务验收未通过，回到 ${targetLifecycle}：${task.title}`,
-          degraded: task.degraded,
-          payload: { task_id: task.task_id, from: task.lifecycle, to: targetLifecycle },
-        }),
-      );
-    }
-    const goalEvent = this.syncGoalStatus(task.project_id);
-    if (goalEvent) emitted.push(goalEvent);
-    return emitted;
-  }
-
-  /** 任务集变化后重算 goal.status；只有变化时才追加 GoalStatusChanged。 */
-  private syncGoalStatus(projectId: string): EventRecord | null {
-    const project = this.projects.get(projectId);
-    if (!project) return null;
-    const active = [...this.tasks.values()].filter(
-      (task) => task.project_id === projectId && task.lifecycle !== 'canceled',
-    );
-    const accepted = active.filter((task) => task.lifecycle === 'accepted').length;
-    const next =
-      active.length === 0 ? 'draft' : accepted === active.length ? 'achieved' : 'in_progress';
-    if (next === project.goal_status) return null;
-    return this.emit({
-      type: 'GoalStatusChanged',
-      kind: 'goal.status_changed',
-      project_id: projectId,
-      entity_id: project.goal_id,
-      summary: `目标状态：${project.goal_status} → ${next}`,
-      payload: { status: next, accepted_tasks: accepted, active_tasks: active.length },
-    });
+    this.receipts.set(input.client_submit_id, { type, fingerprint, result });
+    return result;
   }
 
   private requireProposal(proposalId: string): ProposalRecord {
     const proposal = this.proposals.get(proposalId);
-    if (!proposal) throw notFound(`Proposal ${proposalId} 不存在`);
+    if (!proposal) throw conflict(`提议 ${proposalId} 不存在`, { reason: 'proposal_not_found' });
     return proposal;
   }
 
+  private requireTask(taskId: string): TaskRecord {
+    const task = this.tasks.get(taskId);
+    if (!task) throw conflict(`任务 ${taskId} 不存在`, { reason: 'task_not_found' });
+    return task;
+  }
+
+  private acceptProposal(proposalId: string, actorId: string): Record<string, unknown> {
+    const proposal = this.requireProposal(proposalId);
+    if (proposal.status !== 'proposed') {
+      throw conflict(`提议 ${proposalId} 当前状态为 ${proposal.status}，不可再接受`, {
+        reason: 'proposal_not_proposed',
+        status: proposal.status,
+      });
+    }
+    // R-11：任务 id 在接受的这一刻由服务端发号
+    const taskId = `task-${randomUUID()}`;
+    const draft = proposal.details.task;
+    const base = { project_id: proposal.project_id, entity_id: taskId };
+    this.emit({
+      ...base,
+      kind: 'TaskCaptured',
+      payload: {
+        task_id: taskId,
+        title: draft.title,
+        description: draft.description,
+        assignee_id: actorId,
+        assignee_kind: draft.assignee_kind,
+        contract_rev: 1,
+        acceptance_criteria: copyCriteria(draft.acceptance_criteria),
+        proposal_id: proposal.proposal_id,
+        capture_id: proposal.capture_id,
+        lifecycle: 'captured',
+      },
+    });
+    this.emit({ ...base, kind: 'AssignmentCreated', payload: { task_id: taskId, actor_id: actorId } });
+    this.emit({ ...base, kind: 'TaskDefined', payload: { task_id: taskId } });
+    this.transition(taskId, 'captured', 'defined');
+    this.emit({
+      ...base,
+      kind: 'PlanChangeApplied',
+      entity_id: proposal.proposal_id,
+      payload: { change_id: proposal.proposal_id, task_id: taskId, command: 'proposal_accept' },
+    });
+    return { proposal_id: proposal.proposal_id, task_id: taskId, project_id: proposal.project_id };
+  }
+
+  private rejectProposal(proposalId: string, reason: string): Record<string, unknown> {
+    const proposal = this.requireProposal(proposalId);
+    if (proposal.status !== 'proposed') {
+      throw conflict(`提议 ${proposalId} 当前状态为 ${proposal.status}，不可拒绝`, {
+        reason: 'proposal_not_proposed',
+        status: proposal.status,
+      });
+    }
+    this.emit({
+      kind: 'PlanChangeRejected',
+      project_id: proposal.project_id,
+      entity_id: proposal.proposal_id,
+      payload: { change_id: proposal.proposal_id, reason, rejected_by: CURRENT_ACTOR_ID },
+    });
+    return { proposal_id: proposal.proposal_id, project_id: proposal.project_id };
+  }
+
+  private advanceTask(taskId: string, to: unknown, actorId: string): Record<string, unknown> {
+    const task = this.requireTask(taskId);
+    const actions = availableActionsFor(task, actorId);
+    if (!actions.includes('task_advance')) {
+      throw conflict(`任务 ${taskId} 当前无可用推进动作（lifecycle=${task.lifecycle}）`, {
+        reason: 'not_in_available_actions',
+        task_id: taskId,
+        lifecycle: task.lifecycle,
+        available_actions: actions,
+      });
+    }
+    const next = task.lifecycle === 'defined' ? 'ready' : 'active';
+    if (to !== undefined && to !== next) {
+      throw conflict(`目标状态 ${String(to)} 不在 available_actions 中（期望 ${next}）`, {
+        reason: 'not_in_available_actions',
+        task_id: taskId,
+        requested_to: to,
+        available_to: next,
+      });
+    }
+    if (next === 'active') {
+      this.emit({
+        kind: 'RunCreated',
+        project_id: task.project_id,
+        entity_id: taskId,
+        payload: { task_id: taskId, run_kind: 'human_light', actor_id: actorId },
+      });
+      this.emit({ kind: 'RunStarted', project_id: task.project_id, entity_id: taskId, payload: { task_id: taskId } });
+    }
+    this.transition(taskId, task.lifecycle, next);
+    return { task_id: taskId, from: task.lifecycle === next ? next : null, to: next, project_id: task.project_id };
+  }
+
+  private submitFeedback(taskId: string, content: string, actorId: string): Record<string, unknown> {
+    const task = this.requireTask(taskId);
+    const actions = availableActionsFor(task, actorId);
+    if (!actions.includes('feedback_submit')) {
+      throw conflict(`任务 ${taskId} 当前不接受 ${actorId} 的执行反馈（lifecycle=${task.lifecycle}）`, {
+        reason: 'not_in_available_actions',
+        task_id: taskId,
+        lifecycle: task.lifecycle,
+        available_actions: actions,
+      });
+    }
+    if (content.trim().length === 0) throw badRequest('feedback_submit.content 必填', { field: 'content' });
+    const feedbackId = `fb-${randomUUID()}`;
+    const outcomeId = `out-${randomUUID()}`;
+    const base = { project_id: task.project_id, entity_id: taskId };
+    this.emit({
+      ...base,
+      kind: 'FeedbackReceived',
+      payload: { feedback_id: feedbackId, task_id: taskId, run_id: `run-${taskId}`, author_id: actorId, raw_content: content },
+    });
+    this.emit({
+      ...base,
+      kind: 'FeedbackInterpreted',
+      payload: { feedback_id: feedbackId, task_id: taskId },
+    });
+    this.emit({
+      ...base,
+      kind: 'OutcomeRecorded',
+      payload: { outcome_id: outcomeId, task_id: taskId, feedback_id: feedbackId, conclusion_kind: 'achieved' },
+    });
+    this.emit({ ...base, kind: 'RunSucceeded', payload: { task_id: taskId, outcome_id: outcomeId } });
+    this.transition(taskId, 'active', 'awaiting_acceptance');
+    return { task_id: taskId, feedback_id: feedbackId, outcome_id: outcomeId, project_id: task.project_id };
+  }
+
+  private recordAcceptance(payload: Record<string, unknown>, actorId: string): Record<string, unknown> {
+    const taskId = String(payload.task_id ?? '');
+    const task = this.requireTask(taskId);
+    const actions = availableActionsFor(task, actorId);
+    if (!actions.includes('acceptance_record')) {
+      throw conflict(`任务 ${taskId} 当前不可验收（lifecycle=${task.lifecycle}）`, {
+        reason: 'not_in_available_actions',
+        task_id: taskId,
+        lifecycle: task.lifecycle,
+        available_actions: actions,
+      });
+    }
+
+    const rawResults = payload.criterion_results;
+    if (!Array.isArray(rawResults) || rawResults.length === 0) {
+      throw badRequest('criterion_results 必须是非空数组', { field: 'criterion_results' });
+    }
+    const results: CriterionResult[] = [];
+    const seen = new Set<string>();
+    for (const raw of rawResults as Record<string, unknown>[]) {
+      const ref = String(raw.criterion_ref ?? '');
+      const verdict = String(raw.verdict ?? '');
+      if (!['passed', 'failed', 'not_applicable'].includes(verdict)) {
+        throw badRequest(`criterion ${ref} 的 verdict 非法`, { field: 'criterion_results' });
+      }
+      if (seen.has(ref)) throw badRequest(`criterion_ref ${ref} 重复`, { field: 'criterion_results' });
+      seen.add(ref);
+      if (!task.criteria.some((criterion) => criterion.criterion_ref === ref)) {
+        throw badRequest(`criterion_ref ${ref} 不在当前契约里`, {
+          field: 'criterion_results',
+          allowed: task.criteria.map((criterion) => criterion.criterion_ref),
+        });
+      }
+      results.push({
+        criterion_ref: ref,
+        verdict: verdict as CriterionResult['verdict'],
+        evidence_refs: Array.isArray(raw.evidence_refs) ? raw.evidence_refs.map(String) : [],
+      });
+    }
+    // 覆盖完整性：契约里每条判据都要有结果（内核 REQ-ACC-2①）
+    const missing = task.criteria.map((criterion) => criterion.criterion_ref).filter((ref) => !seen.has(ref));
+    if (missing.length > 0) {
+      throw badRequest('验收缺少判据（覆盖不完整，内核不入账）', {
+        field: 'criterion_results',
+        missing_criteria: missing,
+      });
+    }
+
+    const passed = results.filter((result) => result.verdict !== 'failed').length;
+    const failed = results.filter((result) => result.verdict === 'failed').length;
+    const verdict: AcceptanceVerdict = failed === 0 ? 'accepted' : passed === 0 ? 'rejected' : 'partially_accepted';
+    if (payload.verdict !== undefined && payload.verdict !== verdict) {
+      throw badRequest('顶层 verdict 与逐判据结果不一致', { field: 'verdict', derived: verdict });
+    }
+
+    const acceptanceId = `acc-${randomUUID()}`;
+    this.emit({
+      kind: 'AcceptanceRecorded',
+      project_id: task.project_id,
+      entity_id: taskId,
+      payload: {
+        acceptance_id: acceptanceId,
+        task_id: taskId,
+        verdict,
+        criterion_results: results,
+        rationale: String(payload.rationale ?? ''),
+        acceptor_id: actorId,
+      },
+    });
+    // 内核矩阵：accepted → accepted；rejected → defined；partially_accepted → active（需再执行）
+    const target: TaskRecord['lifecycle'] =
+      verdict === 'accepted' ? 'accepted' : verdict === 'rejected' ? 'defined' : 'active';
+    this.transition(taskId, 'awaiting_acceptance', target);
+    return { task_id: taskId, acceptance_id: acceptanceId, verdict, project_id: task.project_id };
+  }
+
+  private cancelTask(taskId: string, actorId: string): Record<string, unknown> {
+    const task = this.requireTask(taskId);
+    const actions = availableActionsFor(task, actorId);
+    if (!actions.includes('task_cancel')) {
+      throw conflict(`任务 ${taskId} 当前不可取消（lifecycle=${task.lifecycle}）`, {
+        reason: 'not_in_available_actions',
+        task_id: taskId,
+        lifecycle: task.lifecycle,
+        available_actions: actions,
+      });
+    }
+    const from = task.lifecycle;
+    this.emit({ kind: 'TaskCancelRequested', project_id: task.project_id, entity_id: taskId, payload: { task_id: taskId } });
+    this.emit({ kind: 'RunCanceled', project_id: task.project_id, entity_id: taskId, payload: { task_id: taskId } });
+    this.transition(taskId, from, 'canceled');
+    this.emit({ kind: 'TaskCanceled', project_id: task.project_id, entity_id: taskId, payload: { task_id: taskId } });
+    return { task_id: taskId, lifecycle: 'canceled', cancel_requested: true, project_id: task.project_id };
+  }
+
   // --------------------------------------------------------------------------
-  // 投影
+  // 投影（全部只读，R-8 键集）
   // --------------------------------------------------------------------------
 
-  proposalProjection(proposalId: string): ProposalProjection {
+  proposalData(proposalId: string): ProposalData {
     const proposal = this.requireProposal(proposalId);
     return {
       projection_version: this.head,
       proposal_id: proposal.proposal_id,
       project_id: proposal.project_id,
-      capture_id: proposal.capture_id,
+      kind: proposal.kind,
       status: proposal.status,
-      degraded: proposal.degraded,
-      degraded_reasons: [...proposal.degraded_reasons],
-      summary: proposal.summary,
+      status_reason: proposal.status_reason,
+      capture_id: proposal.capture_id,
+      // R-11：提议阶段恒为 null，接受后才挂上服务端发出的 id
+      task_id: proposal.assigned_task_id,
       rationale: proposal.rationale,
-      proposed_tasks: copyProposedTasks(proposal.proposed_tasks),
-      available_actions: proposeActionsFor(proposal),
+      assumptions: [...proposal.assumptions],
+      risk_level: proposal.risk_level,
+      base_plan_rev: proposal.base_plan_rev,
+      ops: proposal.ops,
+      degraded: proposal.degraded,
+      proposer: { ...proposal.proposer },
+      details: {
+        kind: 'capture_task',
+        task: {
+          ...proposal.details.task,
+          acceptance_criteria: copyCriteria(proposal.details.task.acceptance_criteria),
+        },
+      },
       created_at: proposal.created_at,
-      decided_at: proposal.decided_at,
+      available_actions: proposalActionsFor(proposal),
     };
   }
 
-  projectProjection(projectId: string, actorId = CURRENT_ACTOR_ID): ProjectProjection {
+  projectData(projectId: string, actorId = CURRENT_ACTOR_ID): ProjectData {
     const project = this.projects.get(projectId);
-    if (!project) throw notFound(`Project ${projectId} 不存在`);
+    if (!project) throw notFound(`项目 ${projectId} 不存在`);
     const tasks = [...this.tasks.values()]
       .filter((task) => task.project_id === projectId)
       .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.task_id.localeCompare(b.task_id));
 
-    const active = tasks.filter((task) => task.lifecycle !== 'canceled');
-    const accepted = active.filter((task) => task.lifecycle === 'accepted');
-    const awaiting = active.filter((task) => task.lifecycle === 'awaiting_acceptance');
-    const partial = active.filter(
-      (task) => task.last_acceptance?.verdict === 'partially_accepted' && task.lifecycle === 'awaiting_acceptance',
-    );
-    let status: ProjectProjection['acceptance']['status'];
-    if (active.length === 0) status = 'not_started';
-    else if (accepted.length === active.length) status = 'accepted';
-    else if (partial.length > 0) status = 'partially_accepted';
-    else if (accepted.length > 0) status = 'in_progress';
-    else if (awaiting.length > 0) status = 'pending';
-    else status = 'not_started';
-
-    const pendingCriteria: { task_id: string; criterion_ref: string }[] = [];
-    for (const task of active) {
-      for (const result of task.criterion_results) {
-        if (result.verdict === 'failed') {
-          pendingCriteria.push({ task_id: task.task_id, criterion_ref: result.criterion_ref });
-        }
-      }
-    }
-
-    let latestAcceptance: ProjectProjection['acceptance']['last_acceptance'] = null;
-    let latestSeq = -1;
-    for (const task of tasks) {
-      if (task.last_acceptance && task.acceptance_seq > latestSeq) {
-        latestSeq = task.acceptance_seq;
-        latestAcceptance = {
-          acceptance_id: task.last_acceptance.acceptance_id,
+    const criterionSummary = tasks
+      .filter((task) => task.acceptance !== null)
+      .flatMap((task) =>
+        task.acceptance!.criterion_results.map((result) => ({
           task_id: task.task_id,
-          verdict: task.last_acceptance.verdict,
-          recorded_at: task.last_acceptance.recorded_at,
-        };
-      }
-    }
-
-    const nodes: ProjectTaskNode[] = tasks.map((task) => ({
-      task_id: task.task_id,
-      title: task.title,
-      lifecycle: task.lifecycle,
-      wait_state: task.wait_state,
-      intended_assignee_id: task.intended_assignee_id,
-      assignee_kind: task.assignee_kind,
-      current_contract_rev: task.current_contract_rev,
-      criteria: copyCriteria(task.criteria),
-      criterion_results: task.criterion_results.map((result) => ({
-        ...result,
-        evidence_refs: [...result.evidence_refs],
-      })),
-      available_actions: availableActionsFor(task, actorId),
-      degraded: task.degraded,
-      created_from_proposal: task.created_from_proposal,
-      outcome: task.outcome ? { ...task.outcome } : null,
-      last_acceptance: task.last_acceptance ? { ...task.last_acceptance } : null,
-    }));
+          criterion_ref: result.criterion_ref,
+          verdict: result.verdict,
+        })),
+      );
 
     return {
       projection_version: this.head,
-      project_id: project.project_id,
-      title: project.title,
-      plan_rev: project.plan_rev,
-      goal: { goal_id: project.goal_id, text: project.goal_text, status: project.goal_status },
-      task_graph: { nodes, edges: [] },
-      acceptance: {
-        status,
-        accepted_tasks: accepted.length,
-        active_tasks: active.length,
-        total_tasks: tasks.length,
-        canceled_tasks: tasks.length - active.length,
-        awaiting_tasks: awaiting.length,
-        pending_criteria: pendingCriteria,
-        last_acceptance: latestAcceptance,
+      project: {
+        project_id: project.project_id,
+        name: project.name,
+        policy_id: project.policy_id,
+        created_by: project.created_by,
       },
-      provenance: {
-        degraded_proposals: [...this.proposals.values()].filter(
-          (proposal) => proposal.project_id === projectId && proposal.degraded,
-        ).length,
-        degraded_tasks: tasks.filter((task) => task.degraded).length,
+      goal: {
+        goal_id: project.goal_id,
+        statement: project.goal_statement,
+        success_criteria: project.goal_success,
+        stop_conditions: project.goal_stop,
+        status: project.goal_status,
       },
+      tasks: tasks.map((task) => ({
+        task_id: task.task_id,
+        project_id: task.project_id,
+        title: task.title,
+        description: task.description,
+        lifecycle: task.lifecycle,
+        wait_state: task.wait_state,
+        assignee_kind: task.assignee_kind,
+        assigned_by: task.assignee_id,
+        duplicate_suspect: false,
+        capture_id: task.capture_id,
+        proposal_id: task.proposal_id,
+        current_contract_rev: task.current_contract_rev,
+        last_outcome_id: task.last_outcome_id,
+        feedback_count: task.feedback_count,
+        cancel_requested: task.cancel_requested,
+        acceptance_criteria: copyCriteria(task.criteria),
+        acceptance: task.acceptance === null
+          ? null
+          : {
+            ...task.acceptance,
+            criterion_results: task.acceptance.criterion_results.map((result) => ({
+              ...result,
+              evidence_refs: [...result.evidence_refs],
+            })),
+          },
+        active_wait_conditions: [],
+        available_actions: availableActionsFor(task, actorId),
+        updated_global_seq: this.head,
+      })),
+      acceptance_status: {
+        accepted: tasks.filter((task) => task.lifecycle === 'accepted').length,
+        awaiting: tasks.filter((task) => task.lifecycle === 'awaiting_acceptance').length,
+        rejected: tasks.filter((task) => task.acceptance?.verdict === 'rejected').length,
+        total: tasks.length,
+        criterion_summary: criterionSummary,
+      },
+      graph: {
+        nodes: tasks.map((task) => ({ id: task.task_id, title: task.title, lifecycle: task.lifecycle })),
+        edges: [],
+      },
+      pending_proposals: this.proposalsAll(projectId)
+        .filter((proposal) => proposal.status === 'proposed')
+        .map((proposal) => ({
+          proposal_id: proposal.proposal_id,
+          kind: proposal.kind,
+          status: proposal.status,
+          degraded: proposal.degraded,
+          rationale: proposal.rationale,
+          created_at: proposal.created_at,
+        })),
     };
   }
 
-  actionsProjection(actorId = CURRENT_ACTOR_ID): ActionsProjection {
-    const rows: ActionRow[] = [];
-    for (const task of [...this.tasks.values()].sort((a, b) => a.created_at.localeCompare(b.created_at))) {
+  actionsData(actorId = CURRENT_ACTOR_ID): ActionsData {
+    const items: ActionItem[] = [];
+    for (const task of [...this.tasks.values()].sort(
+      (a, b) => a.created_at.localeCompare(b.created_at) || a.task_id.localeCompare(b.task_id),
+    )) {
       const available = availableActionsFor(task, actorId);
       if (available.length === 0) continue;
-      rows.push({
-        action_id: `act-${task.task_id}`,
-        project_id: task.project_id,
+      items.push({
         task_id: task.task_id,
+        project_id: task.project_id,
+        project_name: this.projects.get(task.project_id)?.name ?? task.project_id,
         title: task.title,
         lifecycle: task.lifecycle,
+        wait_state: task.wait_state,
+        next_action: ACTION_LABEL[available[0]],
         available_actions: available,
-        blocked_reasons: [],
-        pending_criteria: task.criterion_results
-          .filter((result) => result.verdict === 'failed')
-          .map((result) => result.criterion_ref),
-        degraded: task.degraded,
+        updated_global_seq: this.head,
       });
     }
-    return { projection_version: this.head, actor_id: actorId, actions: rows };
+    return { projection_version: this.head, actor_id: actorId, items };
   }
 
-  homeProjection(actorId = CURRENT_ACTOR_ID): HomeProjection {
-    const allActions = this.actionsProjection(actorId).actions;
-    const projects = [...this.projects.values()].map((project) => {
-      const projection = this.projectProjection(project.project_id, actorId);
+  homeData(actorId = CURRENT_ACTOR_ID): HomeData {
+    const actions = this.actionsData(actorId).items;
+    const projects: HomeProjectSummary[] = [...this.projects.values()].map((project) => {
+      const data = this.projectData(project.project_id, actorId);
+      const taskCounts: Record<string, number> = {};
+      for (const task of data.tasks) taskCounts[task.lifecycle] = (taskCounts[task.lifecycle] ?? 0) + 1;
       return {
         project_id: project.project_id,
-        title: project.title,
-        goal_text: project.goal_text,
+        name: project.name,
+        goal_statement: project.goal_statement,
         goal_status: project.goal_status,
-        task_summary: {
-          active_tasks: projection.acceptance.active_tasks,
-          accepted_tasks: projection.acceptance.accepted_tasks,
-          awaiting_acceptance: projection.acceptance.awaiting_tasks,
-          canceled_tasks: projection.acceptance.canceled_tasks,
-        },
-        acceptance_status: projection.acceptance.status,
-        pending_actions_count: allActions.filter((row) => row.project_id === project.project_id).length,
-        degraded: projection.provenance.degraded_proposals > 0,
-        updated_at: project.updated_at,
+        task_counts: taskCounts,
+        total_tasks: data.tasks.length,
+        accepted_tasks: data.acceptance_status.accepted,
+        last_event_at: project.updated_at,
       };
     });
+    const pendingProposals = [...this.proposals.values()].filter((proposal) => proposal.status === 'proposed');
     return {
       projection_version: this.head,
-      pending_actions_count: allActions.length,
+      actor_id: actorId,
       projects,
+      my_actions_count: actions.length,
       recent_activity: this.events
-        .filter((event) => event.type !== 'DevBurstRecorded')
-        .slice(-12)
+        .filter((event) => event.kind !== 'DevBurstRecorded')
+        .slice()
         .reverse()
+        .slice(0, 20)
         .map((event) => ({
           seq: event.seq,
           kind: event.kind,
-          type: event.type,
           project_id: event.project_id,
-          summary: event.summary,
-          degraded: event.degraded,
+          task_id: (event.payload.task_id as string | null) ?? null,
           occurred_at: event.occurred_at,
+          summary: `${event.kind}${event.entity_id ? `（${event.entity_id.slice(0, 12)}）` : ''}`,
         })),
+      proposals: {
+        pending: pendingProposals.length,
+        degraded: pendingProposals.filter((proposal) => proposal.degraded).length,
+      },
     };
   }
 
@@ -1049,13 +1137,13 @@ export class JourneyState {
 
   streamFrame(event: EventRecord): StreamEventFrame {
     return {
+      projection_version: this.head,
       seq: event.seq,
       kind: event.kind,
-      type: event.type,
+      stream_id: event.project_id,
       project_id: event.project_id,
-      entity_id: event.entity_id,
-      summary: event.summary,
-      degraded: event.degraded,
+      task_id: (event.payload.task_id as string | null) ?? null,
+      proposal_id: (event.payload.change_id as string | null) ?? null,
       occurred_at: event.occurred_at,
     };
   }
@@ -1063,14 +1151,12 @@ export class JourneyState {
   /** mock-only：制造一段连续事件，用于背压/慢消费者测试。 */
   emitBurst(count: number, projectId = DEMO.projectId): number {
     const capped = Math.max(1, Math.min(count, 5000));
-    for (let i = 0; i < capped; i += 1) {
+    for (let index = 0; index < capped; index += 1) {
       this.emit({
-        type: 'DevBurstRecorded',
-        kind: 'dev.burst',
+        kind: 'DevBurstRecorded',
         project_id: projectId,
         entity_id: `burst-${this.head + 1}`,
-        summary: `背压测试事件 #${i + 1}`,
-        payload: { index: i },
+        payload: { index },
       });
     }
     return capped;
