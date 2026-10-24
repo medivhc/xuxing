@@ -1,27 +1,36 @@
-// HTTP API 契约（协调者定版）的 DTO 与封闭枚举。
+// HTTP API 契约（协调者定版，FIX-ROUND-1 裁决 R-1/R-2/R-7/R-8）的 DTO 与封闭枚举。
 //
 // 本文件是 mock 与测试共用的「契约正本」在代码里的映射：
 //   - 只描述 HTTP 响应形状，不描述数据库/内核内部结构；
 //   - 测试断言投影字段时用这里的类型，避免各自手写 any；
-//   - 事件 type 名对齐内核 §4 封闭目录（src/kernel/events.ts），kind 是 SSE 传输层分类。
+//   - 事件 kind 对齐内核封闭目录（src/kernel/events.ts）的 PascalCase 领域事件名。
 //
-// 命名冲突登记：任务指令写「落 FeedbackCaptured」，而内核事件目录只有
-// FeedbackReceived（src/kernel/events.ts）。mock 的 SSE kind 用契约语义
-// feedback.captured，domain type 用内核的 FeedbackReceived —— 两者都保留，
-// 交卷的「契约冲突」一节记录此差异，未擅自改契约或内核。
+// 定版要点：
+//   R-1 命令词表 = proposal_accept / proposal_reject / task_advance /
+//       feedback_submit / acceptance_record / task_cancel；available_actions 是
+//       **canonical command_type 字符串数组**（不是 {id, command_type} 对象数组）。
+//   R-2 全部端点统一信封：成功 {ok:true, data}，失败 {ok:false, error}；客户端一律从
+//       data 里读字段（capture_id / projection_version / limits …）。
+//   R-7 种子契约：演示项目 proj_demo_oq05 / 目标 goal_demo_oq05 / actor user_demo；
+//       降级夹具 proj-degraded + prop-degraded-1；提议不预告 task_id。
+//   R-8 项目视图 data 键集 = {project, goal, tasks, acceptance_status, graph, pending_proposals}。
+//   R-9 SSE 帧 kind = 内核事件 PascalCase（捕获反馈是 FeedbackReceived）。
 
-/** POST /api/commands 允许的命令类型（封闭集）。 */
+/** POST /api/commands 允许的命令类型（封闭集，R-1 定版）。 */
 export const COMMAND_TYPES = [
-  'accept_proposal',
-  'reject_proposal',
-  'complete_task',
-  'record_acceptance',
+  'proposal_accept',
+  'proposal_reject',
+  'task_advance',
+  'feedback_submit',
+  'acceptance_record',
+  'task_cancel',
 ] as const;
 
 export type CommandType = (typeof COMMAND_TYPES)[number];
 
-/** 内核 §3.1 任务生命周期子集（本 mock 只建模旅程需要的那几格）。 */
+/** 内核 §3.1 任务生命周期（投影 `lifecycle` 的取值域）。 */
 export type TaskLifecycle =
+  | 'captured'
   | 'defined'
   | 'ready'
   | 'active'
@@ -29,14 +38,14 @@ export type TaskLifecycle =
   | 'accepted'
   | 'canceled';
 
-export type CriterionKind = 'auto' | 'manual';
-export type CriterionVerdict = 'passed' | 'failed';
+export type CriterionVerdict = 'passed' | 'failed' | 'not_applicable';
 export type AcceptanceVerdict = 'accepted' | 'rejected' | 'partially_accepted';
 
-export interface Criterion {
+/** 验收判据（内核 AcceptanceCriterion：ref + 文案 + 是否可自动核对）。 */
+export interface AcceptanceCriterion {
   criterion_ref: string;
-  kind: CriterionKind;
-  label: string;
+  text: string;
+  auto: boolean;
 }
 
 export interface CriterionResult {
@@ -45,186 +54,302 @@ export interface CriterionResult {
   evidence_refs: string[];
 }
 
-export interface ProposedTask {
-  task_id: string;
-  title: string;
-  assignee_id: string;
-  assignee_kind: 'human' | 'agent';
-  criteria: Criterion[];
-}
+// ---------------------------------------------------------------------------
+// 信封（R-2）
+// ---------------------------------------------------------------------------
 
-export interface ProposalProjection {
-  projection_version: number;
-  proposal_id: string;
-  project_id: string;
-  capture_id: string;
-  status: 'proposed' | 'accepted' | 'rejected';
-  degraded: boolean;
-  degraded_reasons: string[];
-  summary: string;
-  rationale: string;
-  proposed_tasks: ProposedTask[];
-  /** 内核复核用：当前 actor 对该提议可执行的动作；已决提议为空。 */
-  available_actions: CommandType[];
-  created_at: string;
-  decided_at: string | null;
-}
-
-export interface ProjectTaskNode {
-  task_id: string;
-  title: string;
-  lifecycle: TaskLifecycle;
-  wait_state: string;
-  intended_assignee_id: string;
-  assignee_kind: 'human' | 'agent';
-  current_contract_rev: number;
-  criteria: Criterion[];
-  criterion_results: CriterionResult[];
-  available_actions: CommandType[];
-  degraded: boolean;
-  created_from_proposal: string | null;
-  outcome: { outcome_id: string; conclusion_kind: string; recorded_at: string } | null;
-  last_acceptance: {
-    acceptance_id: string;
-    verdict: AcceptanceVerdict;
-    recorded_at: string;
-  } | null;
-}
-
-export interface ProjectProjection {
-  projection_version: number;
-  project_id: string;
-  title: string;
-  plan_rev: number;
-  goal: { goal_id: string; text: string; status: 'draft' | 'in_progress' | 'achieved' };
-  task_graph: {
-    nodes: ProjectTaskNode[];
-    edges: { edge_id: string; from_task: string; to_task: string; kind: string }[];
-  };
-  acceptance: {
-    status: 'not_started' | 'pending' | 'partially_accepted' | 'in_progress' | 'accepted';
-    accepted_tasks: number;
-    active_tasks: number;
-    total_tasks: number;
-    canceled_tasks: number;
-    awaiting_tasks: number;
-    pending_criteria: { task_id: string; criterion_ref: string }[];
-    last_acceptance: {
-      acceptance_id: string;
-      task_id: string;
-      verdict: AcceptanceVerdict;
-      recorded_at: string;
-    } | null;
-  };
-  provenance: { degraded_proposals: number; degraded_tasks: number };
-}
-
-export interface ActionRow {
-  action_id: string;
-  project_id: string;
-  task_id: string;
-  title: string;
-  lifecycle: TaskLifecycle;
-  available_actions: CommandType[];
-  blocked_reasons: string[];
-  pending_criteria: string[];
-  degraded: boolean;
-}
-
-export interface ActionsProjection {
-  projection_version: number;
-  actor_id: string;
-  actions: ActionRow[];
-}
-
-export interface HomeProjection {
-  projection_version: number;
-  pending_actions_count: number;
-  projects: {
-    project_id: string;
-    title: string;
-    goal_text: string;
-    goal_status: 'draft' | 'in_progress' | 'achieved';
-    task_summary: {
-      active_tasks: number;
-      accepted_tasks: number;
-      awaiting_acceptance: number;
-      canceled_tasks: number;
-    };
-    acceptance_status: ProjectProjection['acceptance']['status'];
-    pending_actions_count: number;
-    degraded: boolean;
-    updated_at: string;
-  }[];
-  recent_activity: {
-    seq: number;
-    kind: string;
-    type: string;
-    project_id: string;
-    summary: string;
-    degraded: boolean;
-    occurred_at: string;
-  }[];
-}
-
-export interface CaptureResponse {
-  capture_id: string;
-  proposal_id: string | null;
-  projection_version: number;
-}
-
-export interface CommandReceipt {
-  client_submit_id: string;
-  command_type: CommandType;
-  accepted_at: string;
-  /** 该命令产生的最后一条事件的全局序号；幂等重放时返回首次值。 */
-  seq: number;
-  projection_version: number;
-  duplicate: boolean;
-}
-
-export interface CommandResponse {
-  receipt: CommandReceipt;
-  projection_version: number;
+export interface SuccessEnvelope<T> {
+  ok: true;
+  data: T;
 }
 
 export interface ApiErrorBody {
+  ok: false;
   error: {
     code: string;
     message: string;
-    available_actions?: CommandType[];
-    details?: Record<string, unknown>;
+    detail?: unknown;
   };
-  projection_version?: number;
 }
 
-export interface HealthResponse {
-  ok: true;
-  service: string;
-  mock: boolean;
-  limits: {
-    max_connections: number;
-    max_pending_per_connection: number;
-    slow_consumer_timeout_ms: number;
-    pump_interval_ms: number;
-    heartbeat_ms: number;
-  };
-  streams: { active: number };
+export type Envelope<T> = SuccessEnvelope<T> | ApiErrorBody;
+
+/** 全部投影/视图共有的元信息：projection_version = 已并入的最大 global_seq。 */
+export interface ProjectionMeta {
+  projection_version: number;
 }
 
-/** SSE update 帧的 data（契约要求含 seq 与 kind）。 */
-export interface StreamEventFrame {
-  seq: number;
-  kind: string;
-  type: string;
+// ---------------------------------------------------------------------------
+// GET /api/health（R-2：health 也走信封，data 内含 ok / db / limits）
+// ---------------------------------------------------------------------------
+
+export interface RuntimeLimits {
+  heartbeat_ms: number;
+  max_connections: number;
+  max_queue: number;
+}
+
+export interface HealthData extends ProjectionMeta {
+  ok: boolean;
+  db: boolean;
+  limits: RuntimeLimits;
+}
+
+export type HealthResponse = SuccessEnvelope<HealthData>;
+
+// ---------------------------------------------------------------------------
+// GET /api/home
+// ---------------------------------------------------------------------------
+
+export interface HomeProjectSummary {
   project_id: string;
-  entity_id: string;
+  name: string;
+  goal_statement: string | null;
+  goal_status: string | null;
+  task_counts: Record<string, number>;
+  total_tasks: number;
+  accepted_tasks: number;
+  last_event_at: string | null;
+}
+
+export interface HomeActivity {
+  seq: number;
+  /** 内核事件类型（PascalCase，R-9） */
+  kind: string;
+  project_id: string;
+  task_id: string | null;
+  occurred_at: string;
   summary: string;
+}
+
+export interface HomeData extends ProjectionMeta {
+  actor_id: string;
+  projects: HomeProjectSummary[];
+  my_actions_count: number;
+  recent_activity: HomeActivity[];
+  proposals: { pending: number; degraded: number };
+}
+
+export type HomeResponse = SuccessEnvelope<HomeData>;
+
+// ---------------------------------------------------------------------------
+// GET /api/actions（My Actions）
+// ---------------------------------------------------------------------------
+
+export interface ActionItem {
+  task_id: string;
+  project_id: string;
+  project_name: string;
+  title: string;
+  lifecycle: TaskLifecycle;
+  wait_state: string;
+  next_action: string;
+  available_actions: CommandType[];
+  updated_global_seq: number;
+}
+
+export interface ActionsData extends ProjectionMeta {
+  actor_id: string;
+  items: ActionItem[];
+}
+
+export type ActionsResponse = SuccessEnvelope<ActionsData>;
+
+// ---------------------------------------------------------------------------
+// GET /api/projects/:projectId（R-8 键集）
+// ---------------------------------------------------------------------------
+
+export interface ProjectHeader {
+  project_id: string;
+  name: string;
+  policy_id: string;
+  created_by: string;
+}
+
+export interface ProjectGoal {
+  goal_id: string;
+  statement: string;
+  success_criteria: string;
+  stop_conditions: string;
+  /** 目标状态取值域（真服务与 web 均用 active/achieved/abandoned） */
+  status: string;
+}
+
+export interface ProjectTaskRow {
+  task_id: string;
+  project_id: string;
+  title: string;
+  description: string;
+  lifecycle: TaskLifecycle;
+  wait_state: string;
+  assignee_kind: 'human' | 'agent';
+  assigned_by: string | null;
+  duplicate_suspect: boolean;
+  capture_id: string | null;
+  proposal_id: string | null;
+  current_contract_rev: number;
+  last_outcome_id: string | null;
+  feedback_count: number;
+  cancel_requested: boolean;
+  acceptance_criteria: AcceptanceCriterion[];
+  acceptance: {
+    acceptance_id: string;
+    verdict: AcceptanceVerdict;
+    criterion_results: CriterionResult[];
+    created_at: string;
+  } | null;
+  active_wait_conditions: Array<{ wait_condition_id: string; kind: string; target_ref: string }>;
+  available_actions: CommandType[];
+  updated_global_seq: number;
+}
+
+export interface ProjectAcceptanceStatus {
+  accepted: number;
+  awaiting: number;
+  rejected: number;
+  total: number;
+  criterion_summary: Array<{ task_id: string; criterion_ref: string; verdict: string }>;
+}
+
+export interface ProjectGraph {
+  nodes: Array<{ id: string; title: string; lifecycle: TaskLifecycle }>;
+  edges: Array<{ from: string; to: string; kind: string }>;
+}
+
+export interface PendingProposal {
+  proposal_id: string;
+  kind: string;
+  status: string;
   degraded: boolean;
+  rationale: string;
+  created_at: string;
+}
+
+export interface ProjectData extends ProjectionMeta {
+  project: ProjectHeader;
+  goal: ProjectGoal | null;
+  tasks: ProjectTaskRow[];
+  acceptance_status: ProjectAcceptanceStatus;
+  graph: ProjectGraph;
+  pending_proposals: PendingProposal[];
+}
+
+export type ProjectResponse = SuccessEnvelope<ProjectData>;
+
+// ---------------------------------------------------------------------------
+// GET /api/proposals/:proposalId（R-11：提议不预告 task_id）
+// ---------------------------------------------------------------------------
+
+export interface ProposalDraft {
+  title: string;
+  description: string;
+  assignee_kind: 'human' | 'agent';
+  acceptance_criteria: AcceptanceCriterion[];
+}
+
+export interface ProposalDetails {
+  kind: 'capture_task';
+  task: ProposalDraft;
+}
+
+export interface ProposalData extends ProjectionMeta {
+  proposal_id: string;
+  project_id: string;
+  kind: string;
+  status: 'proposed' | 'accepted' | 'rejected';
+  status_reason: string | null;
+  capture_id: string | null;
+  /** 提议接受前恒为 null：任务 id 只由服务端在 proposal_accept 后发号（R-11）。 */
+  task_id: string | null;
+  rationale: string;
+  assumptions: string[];
+  risk_level: string;
+  base_plan_rev: number;
+  ops: unknown[];
+  degraded: boolean;
+  proposer: {
+    source: 'model' | 'fallback';
+    model: string | null;
+    degraded: boolean;
+    degraded_reason: string | null;
+    latency_ms: number | null;
+  };
+  details: ProposalDetails;
+  created_at: string;
+  available_actions: CommandType[];
+}
+
+export type ProposalResponse = SuccessEnvelope<ProposalData>;
+
+// ---------------------------------------------------------------------------
+// POST /api/capture
+// ---------------------------------------------------------------------------
+
+export interface CaptureData extends ProjectionMeta {
+  capture_id: string;
+  proposal_id: string;
+  project_id: string;
+  degraded: boolean;
+  degraded_reason: string | null;
+  proposer: { source: 'model' | 'fallback'; model: string | null; latency_ms: number | null };
+  draft: ProposalDraft;
+  replayed: boolean;
+  emitted: Array<{ seq: number; kind: string }>;
+}
+
+export type CaptureResponse = SuccessEnvelope<CaptureData>;
+
+// ---------------------------------------------------------------------------
+// POST /api/commands（R-6：首次 201，幂等重放 200 + replayed:true）
+// ---------------------------------------------------------------------------
+
+export interface CommandResultData extends ProjectionMeta {
+  command_type: CommandType;
+  client_submit_id: string;
+  /** true = 幂等重放，未产生新事件 */
+  replayed: boolean;
+  emitted: Array<{ seq: number; kind: string }>;
+  subject: Record<string, unknown>;
+  receipt_event_id: string;
+}
+
+export type CommandResponse = SuccessEnvelope<CommandResultData>;
+
+// ---------------------------------------------------------------------------
+// GET /api/stream（SSE，R-9：kind = 内核事件 PascalCase）
+// ---------------------------------------------------------------------------
+
+export interface StreamEventFrame extends ProjectionMeta {
+  seq: number;
+  /** 内核事件类型（PascalCase 领域事件名，如 FeedbackReceived / PlanChangeProposed） */
+  kind: string;
+  stream_id: string;
+  project_id: string;
+  task_id: string | null;
+  proposal_id: string | null;
   occurred_at: string;
 }
 
-export type CommandPayload =
-  | { proposal_id: string }
-  | { task_id: string }
-  | { task_id: string; criterion_results: CriterionResult[]; rationale?: string };
+/** SSE ready 帧（真服务在补发之后、实时之前发一次）。 */
+export interface StreamReadyFrame {
+  projection_version: number;
+  cursor: number | null;
+  requested_cursor: number | null;
+  replayed: number;
+  project_id: string | null;
+  heartbeat_ms: number;
+}
+
+/** 业务提示帧（不占 seq）：降级提议必须在此明示（R-9 保留该断言）。 */
+export interface StreamNoticeFrame {
+  kind: string;
+  proposal_id?: string;
+  degraded_reason?: string;
+  [key: string]: unknown;
+}
+
+/** POST /api/dev/burst 的响应（mock-only，mock 背压造流用）。 */
+export interface DevBurstData {
+  emitted: number;
+  projection_version: number;
+}

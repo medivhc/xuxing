@@ -1,5 +1,6 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { JOURNEY_BASE_URL } from '../journeys.config.mts';
+import type { StreamEventFrame, StreamReadyFrame } from '../contract.mts';
 
 // ============================================================================
 // 极简 SSE 客户端（协议级测试用；不依赖浏览器 EventSource）。
@@ -7,6 +8,12 @@ import { JOURNEY_BASE_URL } from '../journeys.config.mts';
 // - open({paused:true}) 只拿响应头、不读 body —— 用来构造「慢消费者」；
 // - startReading() 之后按 chunk 解析 event/id/data/comment；
 // - waitFor / waitForUpdate / waitForClosed 给测试确定性的等待点。
+//
+// 帧类型（R-2/R-9，以真服务/ mock 一致的协议为准）：
+//   event: event        data = 事件摘要帧（kind = PascalCase 内核事件名，含 seq）
+//   event: ready        data = {projection_version, cursor, requested_cursor, replayed, ...}
+//   event: notice       data = 业务提示（如 proposal_degraded，不占 seq）
+//   `id: <seq>` + `: ping <seq>`  心跳注释帧
 // ============================================================================
 
 export interface SseFrame {
@@ -16,26 +23,20 @@ export interface SseFrame {
   comment: string | null;
 }
 
-export interface ParsedUpdate {
-  seq: number;
-  kind: string;
-  type: string;
-  project_id: string;
-  entity_id: string;
-  summary: string;
-  degraded: boolean;
-  occurred_at: string;
-}
+/** update 帧解析结果（kind = PascalCase 内核事件名）。 */
+export type ParsedUpdate = StreamEventFrame;
 
 export class SseOpenError extends Error {
   readonly status: number;
   readonly body: string;
+  readonly headers: Headers;
 
-  constructor(status: number, body: string) {
+  constructor(status: number, body: string, headers: Headers) {
     super(`SSE 打开失败：HTTP ${status} ${body.slice(0, 300)}`);
     this.name = 'SseOpenError';
     this.status = status;
     this.body = body;
+    this.headers = headers;
   }
 }
 
@@ -67,7 +68,7 @@ function parseBlock(block: string): SseFrame | null {
   }
   const data = dataLines.length > 0 ? dataLines.join('\n') : null;
   const comment = commentLines.length > 0 ? commentLines.join('\n') : null;
-  if (data === null && comment === null && event === 'message') return null;
+  if (data === null && comment === null && event === 'message' && id === null) return null;
   return { id, event, data, comment };
 }
 
@@ -104,7 +105,7 @@ export class SseStream {
     if (!response.ok) {
       const body = await response.text().catch(() => '');
       controller.abort();
-      throw new SseOpenError(response.status, body);
+      throw new SseOpenError(response.status, body, response.headers);
     }
     const stream = new SseStream(response, controller);
     if (!options.paused) stream.startReading();
@@ -241,7 +242,7 @@ export class SseStream {
 
   async waitForUpdate(predicate: (update: ParsedUpdate) => boolean, timeoutMs = 8_000): Promise<ParsedUpdate> {
     const frame = await this.waitFor((candidate) => {
-      if (candidate.event !== 'update' || !candidate.data) return false;
+      if (candidate.event !== 'event' || !candidate.data) return false;
       try {
         return predicate(JSON.parse(candidate.data) as ParsedUpdate);
       } catch {
@@ -254,11 +255,11 @@ export class SseStream {
   updates(): ParsedUpdate[] {
     const result: ParsedUpdate[] = [];
     for (const frame of this.frameList) {
-      if (frame.event !== 'update' || !frame.data) continue;
+      if (frame.event !== 'event' || !frame.data) continue;
       try {
         result.push(JSON.parse(frame.data) as ParsedUpdate);
       } catch {
-        // 非 JSON update 帧不参与序号断言
+        // 非 JSON 事件帧不参与序号断言
       }
     }
     return result;
@@ -268,14 +269,29 @@ export class SseStream {
     return this.updates().map((update) => update.seq);
   }
 
-  backpressureFrame(): { code: string; reason: string } | null {
-    const found = this.frameList.find((frame) => frame.event === 'backpressure' && frame.data);
+  /** ready 帧（建立订阅后服务端先补发、再发 ready、然后转实时）。 */
+  readyFrame(): StreamReadyFrame | null {
+    const found = this.frameList.find((frame) => frame.event === 'ready' && frame.data);
     if (!found) return null;
     try {
-      return JSON.parse(found.data!) as { code: string; reason: string };
+      return JSON.parse(found.data!) as StreamReadyFrame;
     } catch {
       return null;
     }
+  }
+
+  /** notice 帧（业务提示，不占 seq；如 proposal_degraded）。 */
+  notices(): Array<Record<string, unknown>> {
+    const result: Array<Record<string, unknown>> = [];
+    for (const frame of this.frameList) {
+      if (frame.event !== 'notice' || !frame.data) continue;
+      try {
+        result.push(JSON.parse(frame.data!) as Record<string, unknown>);
+      } catch {
+        // ignore
+      }
+    }
+    return result;
   }
 
   async waitForClosed(timeoutMs = 8_000): Promise<void> {
