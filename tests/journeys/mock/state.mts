@@ -174,26 +174,29 @@ const CAPTURE_CRITERIA: AcceptanceCriterion[] = [
   { criterion_ref: 'c-journey-2', text: '双轨对照结论已给出（人工判定）', auto: false },
 ];
 
-/** 当前 actor 对一条 Task 的可用动作（canonical 词表，服务端复核用同一函数）。 */
+/** 当前 actor 对一条 Task 的可用动作（canonical 词表，服务端复核用同一函数）。
+ * 与真服务定版口径一致：task_cancel 永不进 available_actions——展示层不提供
+ * 取消动作（server/src/projection/actions.ts 已删该分支），取消由 task_cancel
+ * 命令直达，命令门为终态判定（server/src/commands/commands.ts taskCancel）。 */
 export function availableActionsFor(task: TaskRecord, actorId: string, hasLiveRun = true): CommandType[] {
   if (TERMINAL.has(task.lifecycle)) return [];
   if (task.assignee_id !== actorId) return [];
   switch (task.lifecycle) {
     case 'defined':
     case 'ready':
-      return ['task_advance', 'task_cancel'];
+      return ['task_advance'];
     case 'active': {
       // 真服务口径（server/src/projection/actions.ts + REQ-HUM-1/HUM-2）：
       //   - feedback_submit 只在有在跑的人类 Run 时可用；
-      //   - task_cancel 受 allRunsTerminal 约束，Run 还在跑时不出现在动作集里。
+      //   - 无在跑 Run 时只剩 task_advance（取消走命令直达，不进动作集）。
       const actions: CommandType[] = [];
       if (hasLiveRun) actions.push('feedback_submit');
-      else actions.push('task_advance', 'task_cancel');
+      else actions.push('task_advance');
       return actions;
     }
     case 'awaiting_acceptance':
       // R-10：验收动作就在这条上，任务留在 My Actions 直到验收落账
-      return ['acceptance_record', 'task_cancel'];
+      return ['acceptance_record'];
     default:
       return [];
   }
@@ -953,7 +956,10 @@ export class JourneyState {
   private cancelTask(taskId: string, actorId: string): Record<string, unknown> {
     const task = this.requireTask(taskId);
     const actions = availableActionsFor(task, actorId, this.liveRuns.has(task.task_id));
-    if (!actions.includes('task_cancel')) {
+    // 命令门与真服务 commands.ts taskCancel 同口径：取消命令本身即落意图的
+    // 第一步，不以 available_actions 复核作门（新语义下动作集永不含 task_cancel，
+    // 用它作门会自锁）；只以终态 + 任务归属判定。
+    if (TERMINAL.has(task.lifecycle) || task.assignee_id !== actorId) {
       throw conflict(`任务 ${taskId} 当前不可取消（lifecycle=${task.lifecycle}）`, {
         reason: 'not_in_available_actions',
         task_id: taskId,
