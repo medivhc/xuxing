@@ -231,6 +231,8 @@ interface HomeProjection {
 | `wait_expired` | `WaitConditionExpired` | 后续 `WaitConditionSatisfied` / `WaitConditionCanceled` 或 Task 终态 |
 | `cancel_pending` | `TaskCancelRequested` 且尚无 `TaskCanceled` | `TaskCanceled` |
 
+> **服务端实现口径（2026-10-24 落地，`server/src/api/views.ts` 的 `attentionItems`，投影层单测 `server/test/home-attention.test.ts` 钉死）**：K0 服务端无独立 Decision 实体——`decision_pending` 由待裁决提议承载（`ProposalRecord.status ∈ {proposed, needs_decision}`，`decision_id = proposal_id`，裁决走提议命令）；其余五类按上表条件映射到投影记录现状字段（awaiting_acceptance 且最新有效 Acceptance 缺失或 `partially_accepted`；`Run.state = indeterminate`；`Task.duplicate_suspect` 且未 canceled；`WaitCondition.status = expired` 且任务未终态；`Task.cancel_requested_by` 非空且未 canceled）。`attention_id` 格式为 `attention:<kind>:<entity_id>`（kind 限定保证同任务多类共存时唯一）。`rank` 由服务端计算：kind 优先序 `decision_pending → acceptance_due → run_indeterminate → cancel_pending → wait_expired → duplicate_suspect`，同 kind 按 `created_at` 升序、`attention_id` 字典序兜底，顺序编号 1..n；任务派生项的 `created_at` 取该任务在投影保留窗口内最近事件的 `occurred_at`。`/api/home` 响应为本节页面契约的超集：另保留 API 级附加键（`actor_id` / `my_actions_count` / `recent_activity` / `proposals` / 项目 `last_event_at`），页面只消费本节键集。空态时 `attention` 恒为空数组、字段不得缺失（曾因缺失导致整页白屏，见 WHITESCREEN-FIX-1024）。
+
 ### 2.3 状态集（7）
 
 | ID | 状态 | 一句话定义 | 由哪些事件/投影派生 |
