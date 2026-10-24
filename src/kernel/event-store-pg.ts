@@ -728,6 +728,11 @@ export class ProjectStreamRequiredError extends Error {
  * S3-②（F13 残留）：流内必须有 ProjectCreated 事实才能承载后续事件。
  * 品牌类型与撞值校验只能保证「看起来像 project_id」，不能证明项目真的被创建过。
  */
+/** $system 保留流（K1-B 节点事件，INV-12 增补）：非 Project 流，不受 ProjectCreated 建流约束。 */
+function isReservedSystemStream(stream_id: string): boolean {
+  return stream_id === '$system';
+}
+
 export class ProjectCreatedRequiredError extends Error {
   readonly stream_id: string;
   readonly type: string;
@@ -1590,7 +1595,7 @@ async function appendWithin(
   const last_hash = head.rows[0].last_hash;
 
   // S3-②：新流的首条事件必须是 ProjectCreated（其余事件不得凭空建项目流）。
-  if (requireProjectCreated && last_seq === 0 && input.type !== 'ProjectCreated') {
+  if (requireProjectCreated && last_seq === 0 && input.type !== 'ProjectCreated' && !isReservedSystemStream(input.stream_id)) {
     throw new ProjectCreatedRequiredError(input.stream_id, input.type);
   }
 
@@ -2475,7 +2480,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       const payload_canonical = canonicalJson(payload);
       await lockAppendOrder(conn);
       const head_seq = await ensureAndLockStream(conn, input.stream_id);
-      if (requireProjectCreated && head_seq === 0 && input.type !== 'ProjectCreated') {
+      if (requireProjectCreated && head_seq === 0 && input.type !== 'ProjectCreated' && !isReservedSystemStream(input.stream_id)) {
         throw new ProjectCreatedRequiredError(input.stream_id, input.type);
       }
 
@@ -2702,7 +2707,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       assertProjectStreamId(input.stream_id, { task_id: input.task_id });
       await lockAppendOrder(conn);
       const head_seq = await ensureAndLockStream(conn, input.stream_id);
-      if (requireProjectCreated && head_seq === 0) {
+      if (requireProjectCreated && head_seq === 0 && !isReservedSystemStream(input.stream_id)) {
         throw new ProjectCreatedRequiredError(input.stream_id, 'TaskCancelRequested');
       }
 

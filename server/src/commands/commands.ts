@@ -769,7 +769,7 @@ async function createExecutorRun(
     },
   }));
 
-  addEmitted(emitted, await tx.append({
+  addEmitted(emitted, await appendRunCreated(tx, {
     ...base,
     type: 'RunCreated',
     idempotency_key: `${keyPrefix}:created`,
@@ -797,12 +797,15 @@ async function createExecutorRun(
     },
   }));
 
-  addEmitted(emitted, await tx.append({
+  addEmitted(emitted, (await appendRunTransition(tx, {
     ...base,
     type: 'RunQueued',
+    entity: 'run',
+    from: 'created',
+    to: 'queued',
     idempotency_key: `${keyPrefix}:queued`,
     payload: { run_id, executor_kind, side_effect_level },
-  }));
+  })).event);
 
   return run_id;
 }
@@ -1777,12 +1780,15 @@ async function applyDecisionToDuplicate(
     }));
   }
   for (const run of liveRuns.filter((r) => r.run_kind === 'human_light')) {
-    addEmitted(emitted, await tx.append({
+    addEmitted(emitted, (await appendRunTransition(tx, {
       ...base,
       type: 'RunCanceled',
+      entity: 'run',
+      from: run.state,
+      to: 'canceled',
       idempotency_key: `${keyPrefix}:run-${run.run_id}`,
       payload: { run_id: run.run_id, reason: 'duplicate_merged' },
-    }));
+    })).event);
   }
   if (blocking.length > 0) {
     // executor Run 在飞：只落取消意图，正式取消等 Run 终态后由取消链推进（如实标注，不假装已合并）。
