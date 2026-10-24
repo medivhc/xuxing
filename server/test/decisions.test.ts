@@ -469,6 +469,24 @@ describe('K1-A resolve_decision：Run 对账 subject', () => {
     await booted.close();
   });
 
+  it('m-03：Run 已非 indeterminate 且 disposition 缺失（组合错误）→ 先报 400 schema_invalid；带 disposition 才报 409', async () => {
+    const booted = await bootApp();
+    await makeIndeterminateRun(booted, { taskId: 'task-rec-0', runId: 'run-rec-0', decisionId: 'dec-rec-0' });
+    // 先把 Run 移出 indeterminate（对账已由另一路径处置）
+    await appendTransition(booted, {
+      type: 'RunFailed', entity: 'run', from: 'indeterminate', to: 'failed',
+      facts: { reconciliation: 'not_executed' },
+      payload: { run_id: 'run-rec-0', reason: 'reconciled_not_executed' },
+    });
+    const bad = await resolve(booted, { decision_id: 'dec-rec-0', verdict: 'approved' });
+    expect(bad.status).toBe(400);
+    expect((await jsonOf(bad)).error.detail).toMatchObject({ reason: 'schema_invalid', field: 'disposition' });
+    const conflict = await resolve(booted, { decision_id: 'dec-rec-0', verdict: 'approved', disposition: 'executed' });
+    expect(conflict.status).toBe(409);
+    expect((await jsonOf(conflict)).error.detail).toMatchObject({ reason: 'precondition_unmet' });
+    await booted.close();
+  });
+
   it('not_executed → Run failed（reconciled_not_executed）、Task 保持 active 且可重新派发新 Run', async () => {
     const booted = await bootApp();
     await makeIndeterminateRun(booted, { taskId: 'task-rec-2', runId: 'run-rec-2', decisionId: 'dec-rec-2' });
@@ -572,6 +590,60 @@ describe('K1-A resolve_decision：疑似重复 subject', () => {
       (e) => (e.payload as Record<string, unknown>).task_id === 'task-dup-2',
     );
     expect((cancelReq[0]!.payload as Record<string, unknown>).reason).toBe('duplicate_merged');
+    await booted.close();
+  });
+
+  it('approved → 被疑 Task 的未决事项以 PlanChange 并入目标 Task（AC-10 并入覆盖，M-02）', async () => {
+    const booted = await bootApp();
+    // 目标 Task 真实存在
+    await appendRaw(booted, 'TaskCaptured', {
+      task_id: 'task-target',
+      title: '目标任务',
+      description: '',
+      assignee_kind: 'human',
+      goal_id: null,
+      capture_id: null,
+      proposal_id: null,
+      acceptance_criteria: [{ criterion_ref: 'c1', text: '目标完成', auto: false }],
+      plan_rev_introduced: 1,
+    });
+    await makeSuspect(booted, 'task-dup-3', 'dec-dup-3');
+    // 被疑 Task 的未决事项：一条活跃等待条件
+    await appendRaw(booted, 'WaitConditionCreated', {
+      wait_condition_id: 'wc-dup-3',
+      task_id: 'task-dup-3',
+      kind: 'person',
+      target_ref: 'user:zhangsan',
+    });
+    const res = await resolve(booted, { decision_id: 'dec-dup-3', verdict: 'approved' });
+    expect(res.status).toBe(201);
+    const subject = (await jsonOf(res)).data.subject;
+    expect(subject).toMatchObject({ cascade: 'completed', merged_into: 'task-target' });
+    const changeId = subject.merged_change_id as string;
+    expect(changeId).toBeTruthy();
+    expect(subject.carried_wait_conditions).toEqual(['wc-dup-3']);
+
+    // 事件流恰一条并入 PlanChange：以目标 Task 为 subject、审计链可溯
+    const proposed = (await streamEvents(booted, 'PlanChangeProposed')).filter(
+      (e) => (e.payload as Record<string, unknown>).change_id === changeId,
+    );
+    expect(proposed).toHaveLength(1);
+    const payload = proposed[0]!.payload as Record<string, unknown>;
+    expect(payload.task_id).toBe('task-target');
+    expect(payload.client_proposal_id).toBe('merge:dec-dup-3');
+    const ops = payload.ops as Array<Record<string, unknown>>;
+    expect(ops[0]).toMatchObject({ op: 'merge_task', from_task_id: 'task-dup-3', into_task_id: 'task-target', decision_id: 'dec-dup-3' });
+    expect(ops).toContainEqual(
+      expect.objectContaining({ op: 'carry_wait_condition', wait_condition_id: 'wc-dup-3', kind: 'person', target_ref: 'user:zhangsan' }),
+    );
+    expect(ops).toContainEqual(expect.objectContaining({ op: 'carry_acceptance_criteria' }));
+
+    // 投影：并入 Change 以 proposed 挂在目标 Task 名下；被疑 Task 已取消
+    const snapshot = booted.config.projection.snapshot();
+    const change = snapshot.proposals.find((pr) => pr.proposal_id === changeId);
+    expect(change?.status).toBe('proposed');
+    expect(change?.task_id).toBe('task-target');
+    expect(snapshot.tasks.find((t) => t.task_id === 'task-dup-3')?.lifecycle).toBe('canceled');
     await booted.close();
   });
 });

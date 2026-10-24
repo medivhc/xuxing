@@ -442,6 +442,12 @@ describe('K1-B 租约过期分流与 probe 对账（AC-06/07）', () => {
     expect(probe.status, JSON.stringify(probe.body)).toBe(200);
     expect(probe.body.data.run_state).toBe('succeeded');
     expect((await projectRun(booted, run_id)).state).toBe('succeeded');
+    // m-02：probe executed 先补录 RunRawResultReceived 再走 Outcome 流（与裁决路径同形状）
+    const rawEvents = (await streamTypes(booted)).filter(
+      (e) => e.type === 'RunRawResultReceived' && (e.payload as any).run_id === run_id,
+    );
+    expect(rawEvents).toHaveLength(1);
+    expect((rawEvents[0]!.payload as any).via).toBe('probe_reconciliation');
     const proj = await jsonOf(await api(booted, `/api/projects/${PROJECT}`));
     expect(proj.data.tasks.find((t: any) => t.task_id === task_id).lifecycle).toBe('awaiting_acceptance');
 
@@ -471,6 +477,9 @@ describe('K1-B 租约过期分流与 probe 对账（AC-06/07）', () => {
     });
     expect(probeA.body.data.run_state).toBe('failed');
     expect((await projectRun(booted, a.run_id)).state).toBe('failed');
+    // m-01：probe 对账 reason 与裁决路径统一为 reconciled_not_executed
+    const failedA = (await streamTypes(booted)).find((e) => e.type === 'RunFailed' && (e.payload as any).run_id === a.run_id);
+    expect((failedA!.payload as any).reason).toBe('reconciled_not_executed');
 
     const b = await leaseAndStart({ note: true });
     await nodePost(booted, `/api/nodes/${NODE}/runs/${b.run_id}/side-effect-note`, {
@@ -509,6 +518,76 @@ describe('K1-B 租约过期分流与 probe 对账（AC-06/07）', () => {
     expect((await projectRun(booted, run_id)).state).toBe('canceled');
     const proj = await jsonOf(await api(booted, `/api/projects/${PROJECT}`));
     expect(proj.data.tasks.find((t: any) => t.task_id === task_id).lifecycle).toBe('canceled');
+  });
+});
+
+describe('K1-B 派发占用原子性与回报归属（M-01/m-06）', () => {
+  let booted: BootedApp;
+  beforeAll(async () => {
+    booted = await bootApp({ proposer: agentProposer() });
+  });
+  afterAll(async () => {
+    await booted.close();
+  });
+
+  it('M-01：store 并发 claim 只一方成功；两节点并发 poll 同一 Run 只一方领到信封', async () => {
+    const drain = await registerNode(booted, {});
+    // 先把既有 queued Run 全部占用到 drain 节点，隔离出干净的竞抢面
+    for (let i = 0; i < 16; i++) {
+      const held = await booted.config.dispatcher.poll(drain, 0);
+      if (!held.dispatch) break;
+    }
+    const nodeA = await registerNode(booted, {});
+    const nodeB = await registerNode(booted, {});
+
+    // store 层：同一行并发 claim，恰一方 rowCount=1，占用不被覆写
+    const first = await makeAgentRun(booted);
+    await booted.config.dispatcher.tick(); // 同步派发行（syncFromProjection 建行）
+    const [c1, c2] = await Promise.all([
+      booted.config.nodeStore.claimDispatch(first.run_id, nodeA, new Date().toISOString()),
+      booted.config.nodeStore.claimDispatch(first.run_id, nodeB, new Date().toISOString()),
+    ]);
+    expect([c1, c2].filter(Boolean)).toHaveLength(1);
+    expect((await booted.config.nodeStore.getDispatch(first.run_id))?.node_id).toBe(c1 ? nodeA : nodeB);
+
+    // dispatcher 层：两节点并发 poll 同一 queued Run，只一方领到信封
+    const second = await makeAgentRun(booted);
+    const [pa, pb] = await Promise.all([
+      booted.config.dispatcher.poll(nodeA, 0),
+      booted.config.dispatcher.poll(nodeB, 0),
+    ]);
+    const winners = [pa, pb].filter((r) => r.dispatch?.run_id === second.run_id);
+    expect(winners).toHaveLength(1);
+    const row = await booted.config.nodeStore.getDispatch(second.run_id);
+    expect(row?.node_id).toBe(winners[0] === pa ? nodeA : nodeB);
+    expect(row?.state).toBe('queued'); // 占用待 ack，未成租约
+  });
+
+  it('m-06：非归属节点凭 (run_id, client_key) 回放他人结果 → 409；归属节点回放仍得首次结果', async () => {
+    const nodeA = await registerNode(booted, {});
+    const nodeB = await registerNode(booted, {});
+    const { run_id } = await makeAgentRun(booted);
+    const poll = await pollFor(booted, nodeA, run_id);
+    expect(poll?.dispatch.run_id).toBe(run_id);
+    await nodePost(booted, `/api/nodes/${nodeA}/runs/${run_id}/ack`);
+    await nodePost(booted, `/api/nodes/${nodeA}/runs/${run_id}/started`);
+    const raw = await nodePost(booted, `/api/nodes/${nodeA}/runs/${run_id}/raw-result`, {
+      client_result_id: `rr:${run_id}:1`,
+      summary: '执行完毕',
+    });
+    expect(raw.status, JSON.stringify(raw.body)).toBe(200);
+    const replayByOther = await nodePost(booted, `/api/nodes/${nodeB}/runs/${run_id}/raw-result`, {
+      client_result_id: `rr:${run_id}:1`,
+      summary: '执行完毕',
+    });
+    expect(replayByOther.status).toBe(409);
+    expect(replayByOther.body.data).toBeUndefined();
+    const replayByOwner = await nodePost(booted, `/api/nodes/${nodeA}/runs/${run_id}/raw-result`, {
+      client_result_id: `rr:${run_id}:1`,
+      summary: '执行完毕',
+    });
+    expect(replayByOwner.status).toBe(200);
+    expect(replayByOwner.body.data).toEqual(raw.body.data);
   });
 });
 
