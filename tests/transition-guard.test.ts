@@ -58,29 +58,76 @@ const RUN_ROWS: Array<[RunState, Cell[]]> = [
 ];
 
 // 满足前置条件所需的最小 facts（逐格显式，避免用一个「全真」对象掩盖条件分支）。
+const READY_FACTS: GuardFacts = {
+  dependenciesSatisfied: true,
+  dataInputsAvailable: true,
+  waitStateNone: true,
+  duplicateSuspectFalse: true,
+  capabilityAvailable: true,
+  policyAllows: true,
+};
+
+const CANCEL_FACTS: GuardFacts = { cancellationRequested: true, allRunsTerminal: true };
+
 const TASK_FACTS: Record<string, GuardFacts> = {
   'captured->defined': { hasTitle: true, assigneeKind: 'human' },
+  'defined->ready': READY_FACTS,
+  'ready->active': { runDispatched: true },
+  'active->awaiting_acceptance': { runOutcomeRecorded: true },
   'awaiting_acceptance->defined': { acceptanceVerdict: 'rejected' },
   'awaiting_acceptance->active': { acceptanceVerdict: 'rejected', needsReexecution: true },
   'awaiting_acceptance->accepted': { acceptanceVerdict: 'accepted' },
   'accepted->awaiting_acceptance': { acceptanceSuperseded: true },
-  'active->canceled': { allRunsTerminal: true },
-  'awaiting_acceptance->canceled': { allRunsTerminal: true },
+  'captured->canceled': CANCEL_FACTS,
+  'defined->canceled': CANCEL_FACTS,
+  'ready->canceled': CANCEL_FACTS,
+  'active->canceled': CANCEL_FACTS,
+  'awaiting_acceptance->canceled': CANCEL_FACTS,
 };
 
 const RUN_FACTS: Record<string, GuardFacts> = {
+  'created->queued': {},
+  'created->canceled': { cancellationRequested: true },
+  'queued->leased': {},
+  'queued->canceled': { cancellationRequested: true },
   'leased->queued': { leaseExpired: true, started: false },
+  'leased->running': {},
   'leased->failed': {
     leaseExpired: true, started: true, sideEffectLevel: 'L1', externalSideEffectCalled: false,
   },
+  'leased->canceled': { cancellationRequested: true, started: false },
   'leased->indeterminate': {
     leaseExpired: true, started: true, sideEffectLevel: 'L2', externalSideEffectCalled: false,
   },
+  'running->succeeded': {},
+  'running->failed': {},
+  'running->canceled': { cancellationRequested: true, cancelAcknowledged: true },
   'running->timed_out': { runTimeoutExceeded: true, sideEffectResidue: 'none' },
-  'running->canceled': { cancelAcknowledged: true },
+  'running->indeterminate': { heartbeatLost: true },
   'indeterminate->succeeded': { reconciliation: 'completed' },
   'indeterminate->failed': { reconciliation: 'failed' },
   'indeterminate->canceled': { reconciliationConcluded: true },
+};
+
+/** F6：每格允许的触发事件类型（与实现表独立转录）。 */
+const RUN_EVENT_BY_CELL: Record<string, string> = {
+  'created->queued': 'RunQueued',
+  'created->canceled': 'RunCanceled',
+  'queued->leased': 'RunLeased',
+  'queued->canceled': 'RunCanceled',
+  'leased->queued': 'RunQueued',
+  'leased->running': 'RunStarted',
+  'leased->failed': 'RunFailed',
+  'leased->canceled': 'RunCanceled',
+  'leased->indeterminate': 'RunIndeterminate',
+  'running->succeeded': 'RunSucceeded',
+  'running->failed': 'RunFailed',
+  'running->canceled': 'RunCanceled',
+  'running->timed_out': 'RunTimedOut',
+  'running->indeterminate': 'RunIndeterminate',
+  'indeterminate->succeeded': 'RunSucceeded',
+  'indeterminate->failed': 'RunFailed',
+  'indeterminate->canceled': 'RunCanceled',
 };
 
 interface MatrixCase {
@@ -119,7 +166,7 @@ const label = (c: MatrixCase) => `${c.spec_ref} ${c.row}→${c.col}`;
 const TERMINAL_TASK = new Set(['canceled']);
 const TERMINAL_RUN = new Set(['succeeded', 'failed', 'canceled', 'timed_out']);
 
-// §4.2：三类拒绝可区分——自环 / 终态 / 矩阵 ✗
+// §3.1/§3.2：三类拒绝可区分——自环 / 终态 / 矩阵 ✗
 function expectedDenyReason(c: MatrixCase) {
   if (c.row === c.col) return 'not_a_transition';
   const terminal = c.entity === 'task' ? TERMINAL_TASK : TERMINAL_RUN;
@@ -165,7 +212,7 @@ describe('迁移矩阵 §3.2 Run（5×8 + 4×8=72 格，逐格）', () => {
       entity: 'run',
       from: c.row,
       to: c.col,
-      event_type: 'RunQueued',
+      event_type: RUN_EVENT_BY_CELL[`${c.row}->${c.col}`] ?? 'RunQueued',
       facts: c.facts,
     });
 
@@ -204,7 +251,7 @@ describe('迁移矩阵 §3.2 Run（5×8 + 4×8=72 格，逐格）', () => {
 });
 
 // ---------------------------------------------------------------------------
-// §4.3 前置条件：每格正向 + 反向各一条
+// §3.1/§3.2 前置条件：每格正向 + 反向各一条
 // ---------------------------------------------------------------------------
 interface PreconditionCase {
   name: string;
@@ -267,17 +314,45 @@ const PRECONDITIONS: PreconditionCase[] = [
     unmet: ['acceptanceInvalidated'],
   },
   {
-    name: '§3.1 active→canceled（全部 Run 达终态 REQ-RUN-6③）',
+    name: '§3.1 defined→ready（REQ-SCH-1 六项全部满足）',
+    entity: 'task', from: 'defined', to: 'ready',
+    good: { ...READY_FACTS },
+    bad: { ...READY_FACTS, duplicateSuspectFalse: false },
+    unmet: ['duplicateSuspectFalse'],
+  },
+  {
+    name: '§3.1 ready→active（已派发 Run）',
+    entity: 'task', from: 'ready', to: 'active',
+    good: { runDispatched: true },
+    bad: { runDispatched: false },
+    unmet: ['runDispatched'],
+  },
+  {
+    name: '§3.1 active→awaiting_acceptance（Run 已产出 Outcome，F3）',
+    entity: 'task', from: 'active', to: 'awaiting_acceptance',
+    good: { runOutcomeRecorded: true },
+    bad: { runOutcomeRecorded: false },
+    unmet: ['runOutcomeRecorded'],
+  },
+  {
+    name: '§3.1 active→canceled（取消意图 + 全部 Run 达终态 REQ-RUN-6①③）',
     entity: 'task', from: 'active', to: 'canceled',
-    good: { allRunsTerminal: true },
-    bad: { allRunsTerminal: false },
+    good: { cancellationRequested: true, allRunsTerminal: true },
+    bad: { cancellationRequested: true, allRunsTerminal: false },
     unmet: ['allRunsTerminal'],
   },
   {
-    name: '§3.1 awaiting_acceptance→canceled（全部 Run 达终态 REQ-RUN-6③）',
+    name: '§3.1 active→canceled（无取消意图不得直接收尾）',
+    entity: 'task', from: 'active', to: 'canceled',
+    good: { cancellationRequested: true, allRunsTerminal: true },
+    bad: { cancellationRequested: false, allRunsTerminal: true },
+    unmet: ['cancellationRequested'],
+  },
+  {
+    name: '§3.1 awaiting_acceptance→canceled（取消意图 + 全部 Run 达终态）',
     entity: 'task', from: 'awaiting_acceptance', to: 'canceled',
-    good: { allRunsTerminal: true },
-    bad: { allRunsTerminal: false },
+    good: { cancellationRequested: true, allRunsTerminal: true },
+    bad: { cancellationRequested: true, allRunsTerminal: false },
     unmet: ['allRunsTerminal'],
   },
   {
@@ -316,11 +391,25 @@ const PRECONDITIONS: PreconditionCase[] = [
     unmet: ['timeoutNoSideEffectResidue'],
   },
   {
-    name: '§3.2 running→canceled（取消确认）',
+    name: '§3.2 running→canceled（取消意图 + 取消确认）',
     entity: 'run', from: 'running', to: 'canceled',
-    good: { cancelAcknowledged: true },
-    bad: { cancelAcknowledged: false },
+    good: { cancellationRequested: true, cancelAcknowledged: true },
+    bad: { cancellationRequested: true, cancelAcknowledged: false },
     unmet: ['cancelAcknowledged'],
+  },
+  {
+    name: '§3.2 running→indeterminate（心跳丢失，F5）',
+    entity: 'run', from: 'running', to: 'indeterminate',
+    good: { heartbeatLost: true },
+    bad: { heartbeatLost: false },
+    unmet: ['heartbeatLost'],
+  },
+  {
+    name: '§3.2 leased→canceled（未启动可直接取消 REQ-RUN-6②）',
+    entity: 'run', from: 'leased', to: 'canceled',
+    good: { cancellationRequested: true, started: false },
+    bad: { cancellationRequested: true, started: true },
+    unmet: ['runNotStarted'],
   },
   {
     name: '§3.2 indeterminate→succeeded（对账确认已完成）',
@@ -345,9 +434,16 @@ const PRECONDITIONS: PreconditionCase[] = [
   },
 ];
 
-describe('§4.3 前置条件（正向 + 反向）', () => {
+describe('§3.1/§3.2 前置条件（正向 + 反向）', () => {
   it.each(PRECONDITIONS.map((p) => [p.name, p] as const))('%s', (_name, p) => {
-    const base = { entity: p.entity, from: p.from, to: p.to, event_type: 'TaskLifecycleChanged' };
+    const base = {
+      entity: p.entity,
+      from: p.from,
+      to: p.to,
+      event_type: p.entity === 'task'
+        ? 'TaskLifecycleChanged'
+        : (RUN_EVENT_BY_CELL[`${p.from}->${p.to}`] ?? 'RunQueued'),
+    };
 
     const ok = guardTransition({ ...base, facts: p.good });
     expect(ok.allowed).toBe(true);
@@ -452,7 +548,7 @@ describe('§4.3 前置条件（正向 + 反向）', () => {
       {
         requirement: 'leaseExpiredStartedHighSideEffect',
         fact: 'externalSideEffectCalled',
-        expected: 'externalSideEffectCalled=true',
+        expected: 'externalSideEffectCalled=true（与 sideEffectLevel 满足其一即可）',
       },
     ]);
   });
@@ -468,17 +564,12 @@ describe('§4.3 前置条件（正向 + 反向）', () => {
 });
 
 // ---------------------------------------------------------------------------
-// INV-11：迁入 accepted/canceled 必须返回收尾动作（顺序固定），但不拒绝迁移
+// INV-11 / REQ-RUN-6：迁入 accepted/canceled 必须返回收尾动作（顺序固定），但不拒绝迁移
 // ---------------------------------------------------------------------------
-describe('INV-11 终态收尾 required_effects', () => {
+describe('INV-11 / REQ-RUN-6 终态收尾 required_effects', () => {
   it.each([
     ['awaiting_acceptance', 'accepted', { acceptanceVerdict: 'accepted' as const }],
-    ['awaiting_acceptance', 'canceled', { allRunsTerminal: true }],
-    ['active', 'canceled', { allRunsTerminal: true }],
-    ['ready', 'canceled', {}],
-    ['defined', 'canceled', {}],
-    ['captured', 'canceled', {}],
-  ])('task %s→%s 返回按序两项收尾动作', (from, to, facts) => {
+  ])('task %s→%s 返回 INV-11 两项收尾动作', (from, to, facts) => {
     const result = guardTransition({
       entity: 'task', from, to, event_type: 'TaskLifecycleChanged', facts,
     });
@@ -488,6 +579,28 @@ describe('INV-11 终态收尾 required_effects', () => {
       'reset_wait_state_none',
     ]);
     expect(result.required_effects_basis).toBe('INV-11');
+  });
+
+  it.each([
+    ['awaiting_acceptance', 'canceled'],
+    ['active', 'canceled'],
+    ['ready', 'canceled'],
+    ['defined', 'canceled'],
+    ['captured', 'canceled'],
+  ])('task %s→%s 返回 REQ-RUN-6 五项收尾动作（含 TaskCanceled 落点）', (from, to) => {
+    const result = guardTransition({
+      entity: 'task', from, to, event_type: 'TaskLifecycleChanged',
+      facts: { cancellationRequested: true, allRunsTerminal: true },
+    });
+    expect(result.allowed).toBe(true);
+    expect(result.required_effects).toEqual([
+      'expire_pending_decisions',
+      'end_active_assignments',
+      'cancel_active_wait_conditions',
+      'reset_wait_state_none',
+      'emit_task_canceled',
+    ]);
+    expect(result.required_effects_basis).toBe('REQ-RUN-6');
   });
 
   it('非终态目标不返回收尾动作', () => {
@@ -510,7 +623,7 @@ describe('INV-11 终态收尾 required_effects', () => {
 });
 
 // ---------------------------------------------------------------------------
-// §3.1 wait_state 正交维度（§4.4）
+// §3.1 wait_state 正交维度（§2.2 契约）
 // ---------------------------------------------------------------------------
 describe('wait_state 维度迁移', () => {
   it.each([
@@ -563,9 +676,9 @@ describe('wait_state 维度迁移', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 错误分类：未知状态 / 自环 / 非法迁移三者必须可区分（§4.2）
+// 错误分类：未知状态 / 自环 / 非法迁移三者必须可区分（§3.1/§3.2）
 // ---------------------------------------------------------------------------
-describe('拒绝原因分类可区分（§4.2）', () => {
+describe('拒绝原因分类可区分（§3.1/§3.2）', () => {
   it('未知 from/to → unknown_state（编程错误，非矩阵 ✗）', () => {
     expect(guardTransition({
       entity: 'task', from: 'bogus', to: 'defined', event_type: 'TaskLifecycleChanged',
@@ -597,9 +710,159 @@ describe('拒绝原因分类可区分（§4.2）', () => {
   it('允许格 basis 携带 spec 依据（requirement 或 note 至少其一非空）', () => {
     const result = guardTransition({
       entity: 'task', from: 'ready', to: 'active',
-      event_type: 'TaskLifecycleChanged', facts: {},
+      event_type: 'TaskLifecycleChanged', facts: { runDispatched: true },
     });
     expect(result.allowed).toBe(true);
     expect(Boolean(result.basis.requirement || result.basis.note)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F6：事件类型参与校验（created→queued 配 RunSucceeded 必须拒绝）
+// ---------------------------------------------------------------------------
+describe('F6 事件类型与迁移格匹配', () => {
+  it('created→queued 配 RunSucceeded → event_type_mismatch，附期望类型', () => {
+    const result = guardTransition({
+      entity: 'run', from: 'created', to: 'queued', event_type: 'RunSucceeded', facts: {},
+    });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe('event_type_mismatch');
+    expect(result.expected_event_types).toEqual(['RunQueued']);
+  });
+
+  it('running→succeeded 配 RunQueued → event_type_mismatch', () => {
+    const result = guardTransition({
+      entity: 'run', from: 'running', to: 'succeeded', event_type: 'RunQueued', facts: {},
+    });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe('event_type_mismatch');
+    expect(result.expected_event_types).toEqual(['RunSucceeded']);
+  });
+
+  it('Task 迁移只接受 TaskLifecycleChanged', () => {
+    const result = guardTransition({
+      entity: 'task', from: 'captured', to: 'defined', event_type: 'TaskCaptured',
+      facts: { hasTitle: true, assigneeKind: 'human' },
+    });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe('event_type_mismatch');
+    expect(result.expected_event_types).toEqual(['TaskLifecycleChanged']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F9：REQ-RUN-4「L2/L3 或已有外部副作用调用记录」是 OR，不得按 AND 拒绝
+// ---------------------------------------------------------------------------
+describe('F9 leased→indeterminate 的副作用条件是 OR', () => {
+  it('L2 且 externalSideEffectCalled 缺省 → 放行（不要求两个条件同时为真）', () => {
+    const result = guardTransition({
+      entity: 'run', from: 'leased', to: 'indeterminate', event_type: 'RunIndeterminate',
+      facts: { leaseExpired: true, started: true, sideEffectLevel: 'L2' },
+    });
+    expect(result.allowed).toBe(true);
+    expect(result.unmet ?? []).toHaveLength(0);
+  });
+
+  it('L3 且 externalSideEffectCalled=false → 放行', () => {
+    const result = guardTransition({
+      entity: 'run', from: 'leased', to: 'indeterminate', event_type: 'RunIndeterminate',
+      facts: { leaseExpired: true, started: true, sideEffectLevel: 'L3', externalSideEffectCalled: false },
+    });
+    expect(result.allowed).toBe(true);
+  });
+
+  it('L1 但 externalSideEffectCalled=true → 放行（第二分支单独满足）', () => {
+    const result = guardTransition({
+      entity: 'run', from: 'leased', to: 'indeterminate', event_type: 'RunIndeterminate',
+      facts: { leaseExpired: true, started: true, sideEffectLevel: 'L1', externalSideEffectCalled: true },
+    });
+    expect(result.allowed).toBe(true);
+  });
+
+  it('L1 且 externalSideEffectCalled 缺省 → precondition_facts_missing（不猜）', () => {
+    const result = guardTransition({
+      entity: 'run', from: 'leased', to: 'indeterminate', event_type: 'RunIndeterminate',
+      facts: { leaseExpired: true, started: true, sideEffectLevel: 'L1' },
+    });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe('precondition_facts_missing');
+    expect(result.unmet).toEqual(['leaseExpiredStartedHighSideEffect']);
+  });
+
+  it('L1 且 externalSideEffectCalled=false → precondition_unmet', () => {
+    const result = guardTransition({
+      entity: 'run', from: 'leased', to: 'indeterminate', event_type: 'RunIndeterminate',
+      facts: { leaseExpired: true, started: true, sideEffectLevel: 'L1', externalSideEffectCalled: false },
+    });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe('precondition_unmet');
+    expect(result.unmet_requirements).toEqual(['leaseExpiredStartedHighSideEffect']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F10：acceptanceInvalidated 是 OR 语义（任一 true 即 met；两侧均 false 才 unmet；
+// 任一侧未知且无 true → missing，且只提示真正缺的那一侧）
+// ---------------------------------------------------------------------------
+describe('F10：acceptanceInvalidated 三值 OR 语义', () => {
+  const evaluate = (facts: GuardFacts) =>
+    guardTransition({
+      entity: 'task', from: 'accepted', to: 'awaiting_acceptance',
+      event_type: 'TaskLifecycleChanged', facts,
+    });
+
+  it.each([
+    ['仅 superseded=true', { acceptanceSuperseded: true }],
+    ['仅 declaresRevalidation=true', { declaresRevalidation: true }],
+    ['superseded=true, revalidation=false', { acceptanceSuperseded: true, declaresRevalidation: false }],
+    ['superseded=false, revalidation=true', { acceptanceSuperseded: false, declaresRevalidation: true }],
+    ['两侧均 true', { acceptanceSuperseded: true, declaresRevalidation: true }],
+  ])('%s → met，放行', (_label, facts) => {
+    const result = evaluate(facts);
+    expect(result.allowed).toBe(true);
+    expect(result.unmet).toEqual([]);
+  });
+
+  it('两侧均 false → precondition_unmet（不是 missing）', () => {
+    const result = evaluate({ acceptanceSuperseded: false, declaresRevalidation: false });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe('precondition_unmet');
+    expect(result.unmet).toEqual(['acceptanceInvalidated']);
+    expect(result.missing_facts).toEqual([]);
+  });
+
+  it('仅 superseded=false（revalidation 未知）→ missing，只提示 declaresRevalidation', () => {
+    const result = evaluate({ acceptanceSuperseded: false });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe('precondition_facts_missing');
+    expect(result.unmet).toEqual(['acceptanceInvalidated']);
+    expect(result.unmet_requirements).toEqual([]);
+    expect(result.missing_facts).toHaveLength(1);
+    expect(result.missing_facts?.[0]).toMatchObject({
+      fact: 'declaresRevalidation',
+      alternatives: ['acceptanceSuperseded'],
+    });
+  });
+
+  it('仅 declaresRevalidation=false（superseded 未知）→ missing，只提示 acceptanceSuperseded', () => {
+    const result = evaluate({ declaresRevalidation: false });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe('precondition_facts_missing');
+    expect(result.missing_facts).toHaveLength(1);
+    expect(result.missing_facts?.[0]).toMatchObject({
+      fact: 'acceptanceSuperseded',
+      alternatives: ['declaresRevalidation'],
+    });
+  });
+
+  it('两侧都未知 → missing，给出一条带 alternatives 的可执行提示', () => {
+    const result = evaluate({});
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe('precondition_facts_missing');
+    expect(result.missing_facts).toHaveLength(1);
+    expect(result.missing_facts?.[0]).toMatchObject({
+      fact: 'acceptanceSuperseded',
+      alternatives: ['declaresRevalidation'],
+    });
   });
 });

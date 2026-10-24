@@ -1,4 +1,4 @@
-import type { EventEnvelope, EventType } from './events.js';
+import type { EventEnvelope, EventType, ProjectId } from './events.js';
 
 /**
  * Event Store 接口（spec §2.4/§4）。
@@ -10,7 +10,7 @@ import type { EventEnvelope, EventType } from './events.js';
  */
 export interface EventStore {
   append(input: {
-    stream_id: string;
+    stream_id: ProjectId;
     type: EventType;
     actor_id: string;
     actor_kind: EventEnvelope['actor_kind'];
@@ -20,6 +20,6 @@ export interface EventStore {
     payload: unknown;
   }): Promise<EventEnvelope>;
 
-  readStream(stream_id: string, from_seq?: number): Promise<EventEnvelope[]>;
+  readStream(stream_id: ProjectId, from_seq?: number): Promise<EventEnvelope[]>;
   replay(from_global_seq?: number): Promise<EventEnvelope[]>;
 }

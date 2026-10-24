@@ -1,6 +1,6 @@
 // PG Event Store —— 确定性事件溯源的写入与读取路径（spec §4 / INV-12 / INV-13）。
 //
-// 编码与并发约定（plan §3，Q1/Q2/Q5 已裁决）：
+// 编码与并发约定（spec §4 / §8.2；Q1/Q2/Q5 见 §9 已裁决）：
 // - 哈希：H = sha256，输入逐字节为
 //     prev_hash_hex + 0x1F + payload_canonical + 0x1F + decimal(seq)
 //   genesis prev_hash = 64 个 '0'；输出小写 hex。golden vector 已冻结在测试中。
@@ -14,24 +14,35 @@
 // - replay 用单条 SELECT（单快照）按 global_seq 重演；global_seq 允许空洞（回滚跳号），
 //   只保证单调。增量 tailing 需要水位保护，按 Q5 留给 batch 2。
 // - occurred_at 由注入时钟提供（store 接口无该参数，见假设 A8）。
-// - 状态迁移写路径（appendStateTransition）：先 guardTransition，再保证 payload.from/to
-//   与顶层一致（缺失补齐、矛盾拒绝），并校验事件类型属于 entity 家族（task/run，spec §4）。
-// - INV-11 的收尾动作可正确兑现：withTransaction(fn) 内 fn 拿到共享同一 client 的 store，
-//   append / appendStateTransition 同事务提交，任一抛错整体回滚。accepted/canceled 可用。
-//   跨事务批量（appendBatch）仍留给 batch 2（Q4）；本批不提供跨事务原子性。
+// - 状态迁移写路径（appendStateTransition）：
+//   ① 事件类型必须属于 entity 家族（spec §4）且与 from→to 格匹配（F6）；
+//   ② 期望 from 由事件流当前状态派生（F1），入参 from 不一致即拒；
+//   ③ payload.from/to 与顶层一致（缺失补齐、矛盾拒绝），TaskLifecycleChanged 必须带
+//      trigger_event_id（F7）；
+//   ④ guard 的客观 fact（Outcome/取消意图/Run 终态/wait_state/duplicate）从事件流派生并
+//      覆盖调用方自述（F3/F4/F5）；
+//   ⑤ 迁入 accepted/canceled 时 INV-11 / REQ-RUN-6 收尾事件由内核在同一事务内自动落库，
+//      调用方无法忽略（F2/F4）；通用 append 路径禁止直写终态迁移，堵死绕过口。
+// - 跨事务批量（appendBatch）仍留给 batch 2（Q4）；withTransaction 提供显式同事务入口。
 
 import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { ulid } from 'ulid';
-import type { EventEnvelope, EventType } from './events.js';
+import type { EventEnvelope, EventType, ProjectId } from './events.js';
 import { EVENT_TYPES } from './events.js';
 import type { EventStore } from './event-store.js';
 import {
+  RUN_STATES,
+  TASK_STATES,
   guardTransition,
+  guardTransitionReplay,
+  guardWaitStateChange,
   isMatrixCellAllowed,
+  type GuardEffect,
   type GuardFacts,
   type GuardResult,
 } from './transition-guard.js';
+import type { RunState, TaskLifecycle, TaskWaitState } from '../domain/types.js';
 
 export const GENESIS_HASH = '0'.repeat(64);
 
@@ -86,10 +97,13 @@ export class TransitionDeniedError extends Error {
     const missing = result.missing_facts?.length
       ? ` missing_facts=${result.missing_facts.map((hint) => hint.expected).join(',')}`
       : '';
+    const expectedTypes = result.expected_event_types?.length
+      ? ` expected_event_types=${result.expected_event_types.join('|')}`
+      : '';
     super(
       `状态迁移被拒绝：${result.basis.spec_ref} ${result.basis.row}→${result.basis.col} ` +
         `reason=${result.reason ?? 'unknown'}${result.unmet?.length ? ` unmet=${result.unmet.join(',')}` : ''}` +
-        missing,
+        missing + expectedTypes,
     );
     this.name = 'TransitionDeniedError';
     this.result = result;
@@ -136,11 +150,89 @@ export class TransitionPayloadError extends Error {
   }
 }
 
+/** 通用 append 的 payload 必须是 plain object（F8：array/null/Date/Map 一律拒绝）。 */
+export class PayloadNotPlainObjectError extends Error {
+  readonly received: string;
+  constructor(received: string) {
+    super(
+      `事件 payload 必须是 plain object（收到 ${received}）：` +
+        `array/null/Date/Map 等无法作为事件事实（spec §4 事件信封）`,
+    );
+    this.name = 'PayloadNotPlainObjectError';
+    this.received = received;
+  }
+}
+
+/**
+ * 终态迁移必须走 appendStateTransition（F2 的绕过口封堵）：
+ * accepted/canceled 的 INV-11 / REQ-RUN-6 收尾必须与 lifecycle 迁移同事务，
+ * 通用 append 直写会跳过收尾，因此拒绝。
+ */
+export class TerminalClosureRequiredError extends Error {
+  readonly task_id: string;
+  readonly to: string;
+  constructor(task_id: string, to: string) {
+    super(
+      `Task ${task_id} 迁移到 ${to} 必须走 appendStateTransition（内核要在同一事务内执行 INV-11/REQ-RUN-6 收尾），` +
+        `通用 append 直写会绕过收尾`,
+    );
+    this.name = 'TerminalClosureRequiredError';
+    this.task_id = task_id;
+    this.to = to;
+  }
+}
+
+export type TransitionStateDenialReason =
+  /** payload 里找不到 task_id / run_id，无法定位迁移主体。 */
+  | 'subject_id_missing'
+  /** 事件流里没有该主体的创建/生命周期事件。 */
+  | 'subject_not_found'
+  /** 入参 from 与事件流派生的当前状态不一致（F1 核心拒绝）。 */
+  | 'from_mismatch'
+  /** 流的最后一条生命周期事件自身不合法（payload.to 不在状态枚举内）。 */
+  | 'stream_state_invalid'
+  /** 已 accepted/canceled 的 Task 不允许再走取消路径（须另立 Task）。 */
+  | 'task_already_terminal';
+
+/**
+ * F1：迁移与事件流当前状态不一致 —— 永远不按调用方自述的 from 落库。
+ * 分类可区分：缺主体 id / 主体不存在 / from 不一致 / 流状态损坏 / 终态任务。
+ */
+export class TransitionStateError extends Error {
+  readonly reason: TransitionStateDenialReason;
+  readonly entity: 'task' | 'run';
+  readonly subject_id: string | null;
+  readonly expected_from: string | null;
+  readonly provided_from: string | null;
+  constructor(input: {
+    reason: TransitionStateDenialReason;
+    entity: 'task' | 'run';
+    subject_id: string | null;
+    expected_from?: string | null;
+    provided_from?: string | null;
+    detail?: string;
+  }) {
+    super(
+      `状态迁移被拒绝（流状态）：entity=${input.entity} subject=${input.subject_id ?? '<missing>'} ` +
+        `reason=${input.reason}` +
+        (input.expected_from !== undefined ? ` expected_from=${input.expected_from}` : '') +
+        (input.provided_from !== undefined ? ` provided_from=${input.provided_from}` : '') +
+        (input.detail ? ` detail=${input.detail}` : ''),
+    );
+    this.name = 'TransitionStateError';
+    this.reason = input.reason;
+    this.entity = input.entity;
+    this.subject_id = input.subject_id;
+    this.expected_from = input.expected_from ?? null;
+    this.provided_from = input.provided_from ?? null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // payload 规范化与哈希（具名导出，测试独立重算整条链）
 // ---------------------------------------------------------------------------
 
-function encodeCanonical(value: unknown): string {
+function encodeCanonical(value: unknown, stack: Set<object> = new Set()): string {
   if (value === null) return 'null';
 
   switch (typeof value) {
@@ -156,21 +248,72 @@ function encodeCanonical(value: unknown): string {
       return JSON.stringify(value);
     }
     case 'object': {
-      if (Array.isArray(value)) {
-        return `[${value.map((item) => encodeCanonical(item)).join(',')}]`;
+      if (stack.has(value)) {
+        throw new CanonicalizationError('不可规范化的循环引用（payload 必须是无环数据）');
       }
+
+      if (Array.isArray(value)) {
+        // 稀疏数组的 hole 会被 JSON.stringify 静默写成 null，必须显式拒绝。
+        // 同时拒绝 symbol key 与非枚举自有属性（JSON.stringify 会静默忽略）。
+        if (Object.getOwnPropertySymbols(value).length > 0) {
+          throw new CanonicalizationError('数组含 symbol key，无法规范化');
+        }
+        const names = Object.getOwnPropertyNames(value);
+        for (const name of names) {
+          if (name === 'length') continue;
+          const index = Number(name);
+          if (!Number.isSafeInteger(index) || index < 0 || index >= value.length || String(index) !== name) {
+            throw new CanonicalizationError(`数组含非索引自有属性 ${JSON.stringify(name)}，无法规范化`);
+          }
+        }
+
+        stack.add(value);
+        try {
+          const parts: string[] = [];
+          for (let index = 0; index < value.length; index += 1) {
+            // hole（或非枚举索引）不能当作 null 悄悄写入哈希
+            if (!Object.prototype.propertyIsEnumerable.call(value, index)) {
+              throw new CanonicalizationError(`稀疏数组存在 hole：index ${index}，无法规范化`);
+            }
+            parts.push(encodeCanonical(value[index], stack));
+          }
+          return `[${parts.join(',')}]`;
+        } finally {
+          stack.delete(value);
+        }
+      }
+
       const proto = Object.getPrototypeOf(value);
       if (proto !== Object.prototype && proto !== null) {
         throw new CanonicalizationError(
           `只接受 plain object / array / 原始值，收到 ${Object.prototype.toString.call(value)}`,
         );
       }
+
+      // symbol key / 非枚举 key 会被 JSON.stringify 静默忽略，这里显式拒绝。
+      if (Object.getOwnPropertySymbols(value).length > 0) {
+        throw new CanonicalizationError('对象含 symbol key，无法规范化');
+      }
+      const enumerableNames = Object.keys(value);
+      const allNames = Object.getOwnPropertyNames(value);
+      if (allNames.length !== enumerableNames.length) {
+        const hidden = allNames.find((name) => !Object.prototype.propertyIsEnumerable.call(value, name));
+        throw new CanonicalizationError(
+          `对象含不可枚举自有属性 ${JSON.stringify(hidden ?? '<unknown>')}，无法规范化`,
+        );
+      }
+
       const record = value as Record<string, unknown>;
       // 默认 sort 即为 UTF-16 code unit 升序（不能用 localeCompare）
-      const keys = Object.keys(record).sort();
-      return `{${keys
-        .map((key) => `${JSON.stringify(key)}:${encodeCanonical(record[key])}`)
-        .join(',')}}`;
+      const keys = [...enumerableNames].sort();
+      stack.add(value);
+      try {
+        return `{${keys
+          .map((key) => `${JSON.stringify(key)}:${encodeCanonical(record[key], stack)}`)
+          .join(',')}}`;
+      } finally {
+        stack.delete(value);
+      }
     }
     default:
       // undefined / function / symbol / bigint
@@ -204,7 +347,7 @@ export function computeEventHash(
 }
 
 // ---------------------------------------------------------------------------
-// DDL（plan §3.1；幂等 IF NOT EXISTS）
+// DDL（幂等 IF NOT EXISTS；INV-12 链头与唯一约束）
 // ---------------------------------------------------------------------------
 
 const DDL: string[] = [
@@ -244,6 +387,10 @@ const DDL: string[] = [
   `DROP TRIGGER IF EXISTS events_no_mutation ON events`,
   `CREATE TRIGGER events_no_mutation BEFORE UPDATE OR DELETE ON events
      FOR EACH ROW EXECUTE FUNCTION events_forbid_mutation()`,
+  // F16：TRUNCATE 不触发行级触发器，必须用语句级 TRUNCATE 触发器一并封堵。
+  `DROP TRIGGER IF EXISTS events_no_truncate ON events`,
+  `CREATE TRIGGER events_no_truncate BEFORE TRUNCATE ON events
+     FOR EACH STATEMENT EXECUTE FUNCTION events_forbid_mutation()`,
 ];
 
 /** 建表 + 触发器（幂等；重复调用安全）。 */
@@ -292,7 +439,7 @@ function toIso(value: Date | string): string {
 function rowToEnvelope(row: EventRow): EventEnvelope {
   return {
     id: row.id,
-    stream_id: row.stream_id,
+    stream_id: row.stream_id as ProjectId,
     seq: toSafeNumber(row.seq, 'events.seq'),
     global_seq: toSafeNumber(row.global_seq, 'events.global_seq'),
     type: row.type as EventType,
@@ -316,6 +463,32 @@ function isUniqueViolation(error: unknown, constraint: string): boolean {
   return candidate.code === '23505' && candidate.constraint === constraint;
 }
 
+/**
+ * F15：幂等 key 的「同内容」定义 = type + payload + actor_id + actor_kind +
+ * correlation_id + causation_id。任一不同都视为同 key 不同内容，拒绝静默返回首次事件。
+ */
+function idempotencyContentMismatch(
+  existing: {
+    type: string;
+    payload_canonical: string;
+    actor_id: string;
+    actor_kind: EventEnvelope['actor_kind'];
+    causation_id: string | null;
+    correlation_id: string;
+  },
+  input: Parameters<EventStore['append']>[0],
+  payload_canonical: string,
+): boolean {
+  return (
+    existing.type !== input.type ||
+    existing.payload_canonical !== payload_canonical ||
+    existing.actor_id !== input.actor_id ||
+    existing.actor_kind !== input.actor_kind ||
+    existing.correlation_id !== input.correlation_id ||
+    existing.causation_id !== input.causation_id
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 工厂与接口
 // ---------------------------------------------------------------------------
@@ -332,7 +505,28 @@ export type AppendStateTransitionInput = Parameters<EventStore['append']>[0] & {
   from: string;
   to: string;
   facts?: GuardFacts;
+  /** F7：TaskLifecycleChanged 的触发事件 id；缺省时回落到信封 causation_id。 */
+  trigger_event_id?: string;
 };
+
+/** F2/F4 收尾动作的落库证据（与 lifecycle 迁移同事务）。 */
+export interface TransitionClosure {
+  wait_conditions_canceled: string[];
+  wait_state_reset_from: TaskWaitState | null;
+  decisions_expired: string[];
+  assignments_ended: string[];
+  /** REQ-RUN-6③：TaskCanceled 事件的 id（accepted 迁移为 null）。 */
+  task_canceled_event_id: string | null;
+  /** 实际执行的收尾动作（按序）。 */
+  effects_applied: GuardEffect[];
+}
+
+export interface AppendStateTransitionResult {
+  event: EventEnvelope;
+  guard: GuardResult;
+  /** 终态迁移的收尾结果；非终态为 null。 */
+  closure: TransitionClosure | null;
+}
 
 /**
  * 状态迁移事件家族（spec §4）：
@@ -362,6 +556,440 @@ function assertTransitionEventType(entity: 'task' | 'run', type: string): void {
 }
 
 /**
+ * §4 / INV-12：事件流的 stream_id 恒为 project_id。
+ * 把 task_id/run_id 等主体 id 当 stream_id 会破坏按 Project 重演与投影边界，必须拒绝。
+ */
+export class ProjectStreamRequiredError extends Error {
+  readonly stream_id: string;
+  constructor(stream_id: string, detail: string) {
+    super(
+      `stream_id 必须是 project_id（spec §4 / INV-12），收到 ${JSON.stringify(stream_id)}：${detail}`,
+    );
+    this.name = 'ProjectStreamRequiredError';
+    this.stream_id = stream_id;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// payload 形状（F8：通用 append 只接受 plain object）
+// ---------------------------------------------------------------------------
+
+function describePayloadShape(payload: unknown): string {
+  if (payload === null) return 'null';
+  if (Array.isArray(payload)) return 'array';
+  if (payload instanceof Date) return 'Date';
+  if (payload instanceof Map) return 'Map';
+  if (payload instanceof Set) return 'Set';
+  if (typeof payload !== 'object') return typeof payload;
+  return Object.prototype.toString.call(payload);
+}
+
+function isPlainObject(payload: unknown): payload is Record<string, unknown> {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return false;
+  const proto = Object.getPrototypeOf(payload);
+  return proto === Object.prototype || proto === null;
+}
+
+/** payload 中可能出现的主体 id 字段：这些值绝不能同时充当 stream_id（INV-12）。 */
+const SUBJECT_ID_FIELDS = [
+  'task_id',
+  'run_id',
+  'wait_condition_id',
+  'decision_id',
+  'assignment_id',
+  'outcome_id',
+  'feedback_id',
+  'evidence_id',
+  'goal_id',
+  'plan_change_id',
+  'release_override_id',
+] as const;
+
+/**
+ * F13：运行时兜底 —— branded ProjectId 只管编译期，JS/反序列化输入仍需校验：
+ * 非空、不等于 payload 中任一主体 id、若 payload 自带 project_id 则必须一致。
+ */
+function assertProjectStreamId(stream_id: string, payload: Record<string, unknown>): void {
+  if (stream_id.trim().length === 0) {
+    throw new ProjectStreamRequiredError(stream_id, 'project_id 不能为空');
+  }
+  for (const field of SUBJECT_ID_FIELDS) {
+    const value = payload[field];
+    if (typeof value === 'string' && value === stream_id) {
+      throw new ProjectStreamRequiredError(
+        stream_id,
+        `该值同时是 payload.${field}；事件流按 Project 划分，禁止用主体 id 建流`,
+      );
+    }
+  }
+  const declaredProject = payload.project_id;
+  if (typeof declaredProject === 'string' && declaredProject !== stream_id) {
+    throw new ProjectStreamRequiredError(
+      stream_id,
+      `与 payload.project_id=${JSON.stringify(declaredProject)} 不一致（stream 必须等于 Project id）`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// F1：从事件流派生当前状态（appendStateTransition 的唯一 from 来源）
+// ---------------------------------------------------------------------------
+
+const DERIVED_EVENT_TYPES: readonly EventType[] = [
+  'TaskCaptured',
+  'TaskLifecycleChanged',
+  'TaskWaitStateChanged',
+  'TaskCancelRequested',
+  'TaskDuplicateSuspected',
+  'TaskDuplicateResolved',
+  'OutcomeRecorded',
+  'WaitConditionCreated',
+  'WaitConditionCanceled',
+  'WaitConditionSatisfied',
+  'WaitConditionExpired',
+  'DecisionCreated',
+  'DecisionResolved',
+  'DecisionExpired',
+  'AssignmentCreated',
+  'AssignmentEnded',
+  'RunCreated',
+  'RunQueued',
+  'RunLeased',
+  'RunStarted',
+  'RunSucceeded',
+  'RunFailed',
+  'RunCanceled',
+  'RunTimedOut',
+  'RunIndeterminate',
+];
+
+const RUN_STATE_BY_EVENT: Partial<Record<EventType, RunState>> = {
+  RunCreated: 'created',
+  RunQueued: 'queued',
+  RunLeased: 'leased',
+  RunStarted: 'running',
+  RunSucceeded: 'succeeded',
+  RunFailed: 'failed',
+  RunCanceled: 'canceled',
+  RunTimedOut: 'timed_out',
+  RunIndeterminate: 'indeterminate',
+};
+
+const TERMINAL_RUN_STATES: ReadonlySet<string> = new Set([
+  'succeeded', 'failed', 'canceled', 'timed_out',
+]);
+
+interface RunFactsRow {
+  run_id: string;
+  task_id: string | null;
+  state: RunState;
+  /** 是否出现过 RunStarted（REQ-RUN-4 的「已启动」判据）。 */
+  started: boolean;
+}
+
+interface WaitConditionFactsRow {
+  id: string;
+  task_id: string | null;
+  active: boolean;
+}
+
+interface DecisionFactsRow {
+  id: string;
+  /** Decision.subject_ref；取消级联覆盖该 Task 的 pending Decision。 */
+  subject_ref: string | null;
+  task_id: string | null;
+  pending: boolean;
+}
+
+interface AssignmentFactsRow {
+  id: string;
+  task_id: string | null;
+  active: boolean;
+}
+
+interface StreamFacts {
+  /** 最后一条生命周期事件派生的 Task.lifecycle（F1 的期望 from）。 */
+  taskLifecycle: Map<string, string>;
+  taskWaitState: Map<string, TaskWaitState>;
+  taskCancelRequested: Set<string>;
+  taskDuplicateSuspect: Set<string>;
+  outcomesByTask: Set<string>;
+  runs: Map<string, RunFactsRow>;
+  waitConditions: Map<string, WaitConditionFactsRow>;
+  decisions: Map<string, DecisionFactsRow>;
+  assignments: Map<string, AssignmentFactsRow>;
+}
+
+function payloadField(payload: unknown, field: string): string | null {
+  if (!isPlainObject(payload)) return null;
+  const value = payload[field];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function payloadId(payload: unknown, preferred: string): string | null {
+  return payloadField(payload, preferred) ?? payloadField(payload, 'id');
+}
+
+function requirePayloadId(type: string, payload: unknown, preferred: string): string {
+  const id = payloadId(payload, preferred);
+  if (id === null) {
+    throw new StoreInvariantError(`${type} 事件缺少 ${preferred}，无法派生流状态`);
+  }
+  return id;
+}
+
+/**
+ * 单条 SELECT 读出该 stream 中参与状态派生的全部事件，按 seq 升序在内存折叠。
+ * 规模假设见 spec §7（单 Project ≤500 Task），一次流内扫描可接受；
+ * 若未来击穿假设，改为按 subject 索引查询（需在 DDL 增加表达式索引）。
+ */
+async function deriveStreamFacts(
+  reader: Pool | PoolClient,
+  stream_id: string,
+): Promise<StreamFacts> {
+  const facts: StreamFacts = {
+    taskLifecycle: new Map(),
+    taskWaitState: new Map(),
+    taskCancelRequested: new Set(),
+    taskDuplicateSuspect: new Set(),
+    outcomesByTask: new Set(),
+    runs: new Map(),
+    waitConditions: new Map(),
+    decisions: new Map(),
+    assignments: new Map(),
+  };
+
+  const { rows } = await reader.query<{ type: string; payload: unknown }>(
+    `SELECT type, payload FROM events
+     WHERE stream_id = $1 AND type = ANY($2::text[])
+     ORDER BY seq ASC`,
+    [stream_id, DERIVED_EVENT_TYPES],
+  );
+
+  for (const row of rows) {
+    const type = row.type as EventType;
+    const payload = row.payload;
+
+    switch (type) {
+      case 'TaskCaptured': {
+        const task_id = requirePayloadId(type, payload, 'task_id');
+        facts.taskLifecycle.set(task_id, 'captured');
+        if (!facts.taskWaitState.has(task_id)) facts.taskWaitState.set(task_id, 'none');
+        break;
+      }
+      case 'TaskLifecycleChanged': {
+        const task_id = requirePayloadId(type, payload, 'task_id');
+        const to = payloadField(payload, 'to');
+        if (to === null) {
+          throw new StoreInvariantError(
+            `TaskLifecycleChanged 缺少 payload.to（task=${task_id}），流状态无法派生`,
+          );
+        }
+        facts.taskLifecycle.set(task_id, to);
+        break;
+      }
+      case 'TaskWaitStateChanged': {
+        const task_id = requirePayloadId(type, payload, 'task_id');
+        const to = payloadField(payload, 'to');
+        if (to !== null) facts.taskWaitState.set(task_id, to as TaskWaitState);
+        break;
+      }
+      case 'TaskCancelRequested':
+        facts.taskCancelRequested.add(requirePayloadId(type, payload, 'task_id'));
+        break;
+      case 'TaskDuplicateSuspected':
+        facts.taskDuplicateSuspect.add(requirePayloadId(type, payload, 'task_id'));
+        break;
+      case 'TaskDuplicateResolved':
+        facts.taskDuplicateSuspect.delete(requirePayloadId(type, payload, 'task_id'));
+        break;
+      case 'OutcomeRecorded':
+        facts.outcomesByTask.add(requirePayloadId(type, payload, 'task_id'));
+        break;
+      case 'WaitConditionCreated': {
+        const id = requirePayloadId(type, payload, 'wait_condition_id');
+        facts.waitConditions.set(id, {
+          id,
+          task_id: payloadField(payload, 'task_id'),
+          active: true,
+        });
+        break;
+      }
+      case 'WaitConditionCanceled':
+      case 'WaitConditionSatisfied':
+      case 'WaitConditionExpired': {
+        const id = payloadId(payload, 'wait_condition_id');
+        if (id === null) {
+          throw new StoreInvariantError(`${type} 事件缺少 wait_condition_id`);
+        }
+        const existing = facts.waitConditions.get(id);
+        if (existing) existing.active = false;
+        else {
+          facts.waitConditions.set(id, {
+            id,
+            task_id: payloadField(payload, 'task_id'),
+            active: false,
+          });
+        }
+        break;
+      }
+      case 'DecisionCreated': {
+        const id = requirePayloadId(type, payload, 'decision_id');
+        facts.decisions.set(id, {
+          id,
+          subject_ref: payloadField(payload, 'subject_ref'),
+          task_id: payloadField(payload, 'task_id'),
+          pending: true,
+        });
+        break;
+      }
+      case 'DecisionResolved':
+      case 'DecisionExpired': {
+        const id = payloadId(payload, 'decision_id');
+        if (id === null) throw new StoreInvariantError(`${type} 事件缺少 decision_id`);
+        const existing = facts.decisions.get(id);
+        if (existing) existing.pending = false;
+        else {
+          facts.decisions.set(id, {
+            id,
+            subject_ref: payloadField(payload, 'subject_ref'),
+            task_id: payloadField(payload, 'task_id'),
+            pending: false,
+          });
+        }
+        break;
+      }
+      case 'AssignmentCreated': {
+        const id = requirePayloadId(type, payload, 'assignment_id');
+        facts.assignments.set(id, {
+          id,
+          task_id: payloadField(payload, 'task_id'),
+          active: true,
+        });
+        break;
+      }
+      case 'AssignmentEnded': {
+        const id = payloadId(payload, 'assignment_id');
+        if (id === null) throw new StoreInvariantError(`${type} 事件缺少 assignment_id`);
+        const existing = facts.assignments.get(id);
+        if (existing) existing.active = false;
+        else {
+          facts.assignments.set(id, {
+            id,
+            task_id: payloadField(payload, 'task_id'),
+            active: false,
+          });
+        }
+        break;
+      }
+      default: {
+        const runState = RUN_STATE_BY_EVENT[type];
+        if (runState === undefined) break;
+        const run_id = requirePayloadId(type, payload, 'run_id');
+        const existing = facts.runs.get(run_id);
+        const started =
+          (existing?.started ?? false) ||
+          facts.runs.get(run_id)?.state === 'running' ||
+          type === 'RunStarted';
+        facts.runs.set(run_id, {
+          run_id,
+          task_id: existing?.task_id ?? payloadField(payload, 'task_id'),
+          state: runState,
+          started: started || runState === 'running',
+        });
+        break;
+      }
+    }
+  }
+
+  return facts;
+}
+
+function deriveTaskLifecycle(
+  facts: StreamFacts,
+  task_id: string,
+): TaskLifecycle | null {
+  const lifecycle = facts.taskLifecycle.get(task_id);
+  if (lifecycle === undefined) return null;
+  if (!(TASK_STATES as readonly string[]).includes(lifecycle)) {
+    throw new TransitionStateError({
+      reason: 'stream_state_invalid',
+      entity: 'task',
+      subject_id: task_id,
+      expected_from: lifecycle,
+      detail: `最后一条生命周期事件的 to=${lifecycle} 不在 Task 状态枚举内`,
+    });
+  }
+  return lifecycle as TaskLifecycle;
+}
+
+function deriveRunState(facts: StreamFacts, run_id: string): RunFactsRow | null {
+  const run = facts.runs.get(run_id);
+  if (run === undefined) return null;
+  if (!(RUN_STATES as readonly string[]).includes(run.state)) {
+    throw new TransitionStateError({
+      reason: 'stream_state_invalid',
+      entity: 'run',
+      subject_id: run_id,
+      expected_from: run.state,
+    });
+  }
+  return run;
+}
+
+function currentWaitState(facts: StreamFacts, task_id: string): TaskWaitState {
+  return facts.taskWaitState.get(task_id) ?? 'none';
+}
+
+function runsOfTask(facts: StreamFacts, task_id: string): RunFactsRow[] {
+  return [...facts.runs.values()].filter((run) => run.task_id === task_id);
+}
+
+function allRunsTerminalForTask(facts: StreamFacts, task_id: string): boolean {
+  return runsOfTask(facts, task_id).every((run) => TERMINAL_RUN_STATES.has(run.state));
+}
+
+/**
+ * F3/F4/F5：能从事件流客观判定的 fact，一律以派生值覆盖调用方自述。
+ * 不能从本批事件流判定的（capability/policy/sideEffectLevel/心跳等）仍由调用方显式提供，
+ * 缺失即 precondition_facts_missing（不默认放行）。
+ */
+function derivedTaskFacts(facts: StreamFacts, task_id: string): GuardFacts {
+  return {
+    waitStateNone: currentWaitState(facts, task_id) === 'none',
+    duplicateSuspectFalse: !facts.taskDuplicateSuspect.has(task_id),
+    runOutcomeRecorded: facts.outcomesByTask.has(task_id),
+    cancellationRequested: facts.taskCancelRequested.has(task_id),
+    allRunsTerminal: allRunsTerminalForTask(facts, task_id),
+  };
+}
+
+function derivedRunFacts(facts: StreamFacts, run: RunFactsRow): GuardFacts {
+  return {
+    started: run.started,
+    cancellationRequested:
+      run.task_id !== null && facts.taskCancelRequested.has(run.task_id),
+  };
+}
+
+function mergeFacts(caller: GuardFacts | undefined, derived: GuardFacts): GuardFacts {
+  const merged: Record<string, unknown> = { ...(caller ?? {}) };
+  for (const [key, value] of Object.entries(derived)) {
+    if (value !== undefined) merged[key] = value;
+  }
+  return merged as GuardFacts;
+}
+
+function subjectIdFor(
+  entity: 'task' | 'run',
+  payload: Record<string, unknown>,
+): string | null {
+  return entity === 'task'
+    ? payloadField(payload, 'task_id')
+    : payloadField(payload, 'run_id');
+}
+
+/**
  * spec §4：payload 必须带 from/to，且与 guard 判定的顶层 from/to 一致。
  * - 缺失 → 用顶层值补齐（调用方只需写一份，落库形状仍然合规）；
  * - 存在但不一致 → TransitionPayloadMismatchError（不允许静默写出矛盾事件）。
@@ -371,23 +999,15 @@ function mergeTransitionPayload(
   from: string,
   to: string,
 ): Record<string, unknown> {
-  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+  if (!isPlainObject(payload)) {
     throw new TransitionPayloadError(
-      `状态迁移事件的 payload 必须是对象（收到 ${payload === null ? 'null' : typeof payload}），才能承载 from/to`,
+      `状态迁移事件的 payload 必须是 plain object（收到 ${describePayloadShape(payload)}），才能承载 from/to`,
     );
   }
-  const proto = Object.getPrototypeOf(payload);
-  if (proto !== Object.prototype && proto !== null) {
-    // 与 canonicalJson 的 plain object 契约一致：不能把 Date/Map 等展开成空对象后静默丢内容
-    throw new TransitionPayloadError(
-      `状态迁移事件的 payload 必须是 plain object（收到 ${Object.prototype.toString.call(payload)}），才能承载 from/to`,
-    );
-  }
-  const record = payload as Record<string, unknown>;
-  const merged: Record<string, unknown> = { ...record };
+  const merged: Record<string, unknown> = { ...payload };
   for (const field of ['from', 'to'] as const) {
     const expected = field === 'from' ? from : to;
-    const actual = Object.hasOwn(record, field) ? record[field] : undefined;
+    const actual = Object.hasOwn(payload, field) ? payload[field] : undefined;
     if (actual === undefined) {
       merged[field] = expected;
     } else if (actual !== expected) {
@@ -395,6 +1015,39 @@ function mergeTransitionPayload(
     }
   }
   return merged;
+}
+
+/**
+ * F7：spec §4 要求 TaskLifecycleChanged 的 payload 带「触发事件 id」。
+ * 来源优先级：payload.trigger_event_id > 入参 trigger_event_id > 信封 causation_id。
+ * 三者都没有 → 拒绝（不编造一个无意义的 id）。
+ */
+function withTransitionTrigger(
+  payload: Record<string, unknown>,
+  type: EventType,
+  fallbackTriggerId: string | null,
+  explicitTriggerId?: string,
+): Record<string, unknown> {
+  if (type !== 'TaskLifecycleChanged') return payload;
+
+  const existing = payload.trigger_event_id;
+  if (existing !== undefined) {
+    if (typeof existing !== 'string' || existing.length === 0) {
+      throw new TransitionPayloadError(
+        'TaskLifecycleChanged.payload.trigger_event_id 必须是非空字符串（spec §4）',
+      );
+    }
+    return payload;
+  }
+
+  const trigger = explicitTriggerId ?? fallbackTriggerId;
+  if (typeof trigger !== 'string' || trigger.length === 0) {
+    throw new TransitionPayloadError(
+      'TaskLifecycleChanged.payload 必须带 trigger_event_id（触发事件 id，spec §4）：' +
+        '可直接写入 payload.trigger_event_id，或提供 causation_id 供内核补齐',
+    );
+  }
+  return { ...payload, trigger_event_id: trigger };
 }
 
 export interface ChainVerification {
@@ -407,21 +1060,51 @@ export interface ChainVerification {
   stream_exists: boolean;
 }
 
+/** REQ-RUN-6①：记取消意图（TaskCancelRequested）并级联收尾 Decision/Assignment。 */
+export interface RequestTaskCancellationInput {
+  stream_id: ProjectId;
+  task_id: string;
+  actor_id: string;
+  actor_kind: EventEnvelope['actor_kind'];
+  causation_id: string | null;
+  correlation_id: string;
+  idempotency_key: string | null;
+  reason?: string;
+}
+
+export interface TaskCancellationResult {
+  /** 本次新写入的 TaskCancelRequested；重复请求 / 已终态时为 null。 */
+  cancel_requested: EventEnvelope | null;
+  already_requested: boolean;
+  /** 本次级联直接置 canceled 的未启动 Run 事件。 */
+  runs_canceled: EventEnvelope[];
+  /** 全部 Run 已终态并完成正式取消时的收尾证据；否则 null。 */
+  closure: TransitionClosure | null;
+  finalized: boolean;
+  task_lifecycle: TaskLifecycle | null;
+}
+
 /** 事务内的 store 视图：append / appendStateTransition 共享调用方开启的同一 client 与事务。 */
 export interface PgEventStoreTx extends EventStore {
-  /** 校验器嵌在写路径：先 guardTransition，拒绝则抛 TransitionDeniedError 且不写任何行。 */
-  appendStateTransition(
-    input: AppendStateTransitionInput,
-  ): Promise<{ event: EventEnvelope; guard: GuardResult }>;
+  /**
+   * 校验器嵌在写路径：先按事件流派生期望 from（F1），再 guardTransition，
+   * 拒绝则抛 TransitionDeniedError / TransitionStateError 且不写任何行。
+   * 迁入 accepted/canceled 时同事务自动执行 INV-11 / REQ-RUN-6 收尾（F2/F4）。
+   */
+  appendStateTransition(input: AppendStateTransitionInput): Promise<AppendStateTransitionResult>;
+  /** REQ-RUN-6 取消级联入口：意图 + Decision/Assignment 收尾 + 未启动 Run 取消。 */
+  requestTaskCancellation(input: RequestTaskCancellationInput): Promise<TaskCancellationResult>;
   /** 读全流、用 payload_canonical 重算链，返回首个断点（不在 append/replay 热路径）。 */
-  verifyChain(stream_id: string): Promise<ChainVerification>;
+  verifyChain(stream_id: ProjectId): Promise<ChainVerification>;
 }
 
 export interface PgEventStore extends PgEventStoreTx {
   /**
-   * INV-11 的同事务收尾入口：fn 内的 append / appendStateTransition 共享同一 client，
+   * 显式同事务入口：fn 内的 append / appendStateTransition 共享同一 client，
    * fn 抛错（或 COMMIT 失败）则整体回滚，零事件落库。
-   * accepted/canceled 的 required_effects 必须在本入口内与 lifecycle 迁移一起提交。
+   *
+   * 注意：INV-11/REQ-RUN-6 收尾已由 appendStateTransition 自行在同一事务内完成，
+   * 调用方无需（也不应）再手工补发 WaitConditionCanceled / TaskWaitStateChanged。
    */
   withTransaction<T>(fn: (tx: PgEventStoreTx) => Promise<T>): Promise<T>;
 }
@@ -438,24 +1121,103 @@ interface PreparedAppend {
   payload_canonical: string;
 }
 
-/** 写前校验（与事务无关，两种入口共用）：类型封闭集、payload 可规范化、格级纵深防御。 */
-function prepareAppend(input: Parameters<EventStore['append']>[0]): PreparedAppend {
+interface PrepareAppendOptions {
+  /** 仅内核收尾路径可用：允许直接写 TaskLifecycleChanged→accepted/canceled。 */
+  allowTerminalLifecycle?: boolean;
+}
+
+/**
+ * 写前校验（与事务无关，两种入口共用）：
+ * 类型封闭集、payload 必须 plain object（F8）、TaskLifecycleChanged 的 from/to/trigger
+ * 形状（F7）与格级纵深防御、payload 可规范化。
+ */
+function prepareAppend(
+  input: Parameters<EventStore['append']>[0],
+  options: PrepareAppendOptions = {},
+): PreparedAppend {
   if (!(EVENT_TYPES as readonly string[]).includes(input.type)) {
     throw new UnknownEventTypeError(String(input.type));
   }
 
-  const payload_canonical = canonicalJson(input.payload);
+  // F8：通用 append 的 payload 一律要求 plain object（array/null/Date/Map 拒绝）。
+  if (!isPlainObject(input.payload)) {
+    throw new PayloadNotPlainObjectError(describePayloadShape(input.payload));
+  }
 
-  // 纵深防御（plan §5）：TaskLifecycleChanged 的 payload 带 from/to 时复核格合法性。
+  // F13：§4 / INV-12 —— stream 必须是 Project，不能是主体 id。
+  assertProjectStreamId(input.stream_id, input.payload);
+
+  // F2/F7：TaskLifecycleChanged 的形状与终态路径。
   // 这里只查矩阵格，不评估前置条件（前置条件由 appendStateTransition 负责）。
   if (input.type === 'TaskLifecycleChanged') {
-    const payload = input.payload as { from?: unknown; to?: unknown } | null;
-    if (typeof payload?.from === 'string' && typeof payload?.to === 'string') {
-      const check = isMatrixCellAllowed('task', payload.from, payload.to);
-      if (!check.allowed) throw new TransitionDeniedError(check);
+    const payload = input.payload;
+    const from = payload.from;
+    const to = payload.to;
+    if (typeof from !== 'string' || typeof to !== 'string') {
+      throw new TransitionPayloadError(
+        'TaskLifecycleChanged.payload 必须带 from/to（spec §4 派生规则），' +
+          '否则无法重演生命周期迁移',
+      );
+    }
+    const trigger = payload.trigger_event_id;
+    if (typeof trigger !== 'string' || trigger.length === 0) {
+      throw new TransitionPayloadError(
+        'TaskLifecycleChanged.payload 必须带 trigger_event_id（触发事件 id，spec §4）',
+      );
+    }
+    const check = isMatrixCellAllowed('task', from, to);
+    if (!check.allowed) throw new TransitionDeniedError(check);
+
+    // F2：accepted/canceled 的 INV-11 收尾必须与迁移同事务，通用 append 不得绕过。
+    if (!options.allowTerminalLifecycle && (to === 'accepted' || to === 'canceled')) {
+      throw new TerminalClosureRequiredError(
+        payloadField(payload, 'task_id') ?? '<unknown>',
+        to,
+      );
     }
   }
 
+  // F12：TaskWaitStateChanged 是 wait_state 的唯一事件源（spec §4 派生规则声明）。
+  // payload 必须带 from/to、置位 actor 与 reason；写入时再校验 from 与流派生一致，
+  // 并过 guardWaitStateChange（终态 / 自环拒绝）。
+  if (input.type === 'TaskWaitStateChanged') {
+    const payload = input.payload;
+    if (typeof payload.task_id !== 'string' || payload.task_id.length === 0) {
+      throw new TransitionPayloadError('TaskWaitStateChanged.payload 必须带非空 task_id');
+    }
+    for (const field of ['from', 'to'] as const) {
+      if (typeof payload[field] !== 'string' || payload[field].length === 0) {
+        throw new TransitionPayloadError(
+          `TaskWaitStateChanged.payload 必须带非空 ${field}（spec §4：wait_state 每次变更必有 from/to）`,
+        );
+      }
+    }
+    if (typeof payload.reason !== 'string' || payload.reason.length === 0) {
+      throw new TransitionPayloadError(
+        'TaskWaitStateChanged.payload 必须带非空 reason（spec §4：wait_state 变更须记录原因）',
+      );
+    }
+    const actorId = payload.actor_id;
+    const actorKind = payload.actor_kind;
+    if (typeof actorId !== 'string' || actorId.length === 0) {
+      throw new TransitionPayloadError(
+        'TaskWaitStateChanged.payload 必须带非空 actor_id（spec §4：wait_state 变更须记录置位 actor）',
+      );
+    }
+    if (typeof actorKind !== 'string' || actorKind.length === 0) {
+      throw new TransitionPayloadError(
+        'TaskWaitStateChanged.payload 必须带非空 actor_kind（spec §4：wait_state 变更须记录置位 actor）',
+      );
+    }
+    if (actorId !== input.actor_id || actorKind !== input.actor_kind) {
+      throw new TransitionPayloadError(
+        `TaskWaitStateChanged.payload 的 actor 与事件信封不一致：` +
+          `payload=${actorId}/${actorKind}，envelope=${input.actor_id}/${input.actor_kind}`,
+      );
+    }
+  }
+
+  const payload_canonical = canonicalJson(input.payload);
   return { input, payload_canonical };
 }
 
@@ -499,11 +1261,48 @@ async function appendWithin(
     );
     if (existing.rows.length > 0) {
       const row = existing.rows[0];
-      if (row.type !== input.type || row.payload_canonical !== payload_canonical) {
+      if (idempotencyContentMismatch(row, input, payload_canonical)) {
         throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
       }
       return rowToEnvelope(row);
     }
+  }
+
+  // F12：wait_state 变更必须在锁内与流派生状态对账，并过 guardWaitStateChange。
+  // 幂等快路径已在此之前返回，重放不会被状态校验误伤。
+  if (input.type === 'TaskWaitStateChanged') {
+    const payload = input.payload as Record<string, unknown>;
+    const task_id = payload.task_id as string;
+    const facts = await deriveStreamFacts(client, input.stream_id);
+    const lifecycle = deriveTaskLifecycle(facts, task_id);
+    if (lifecycle === null) {
+      throw new TransitionStateError({
+        reason: 'subject_not_found',
+        entity: 'task',
+        subject_id: task_id,
+        provided_from: payload.from as string,
+        detail: 'stream 内没有 TaskCaptured / TaskLifecycleChanged（F12）',
+      });
+    }
+    const expected_from = currentWaitState(facts, task_id);
+    const provided_from = payload.from as string;
+    if (expected_from !== provided_from) {
+      throw new TransitionStateError({
+        reason: 'from_mismatch',
+        entity: 'task',
+        subject_id: task_id,
+        expected_from,
+        provided_from,
+        detail: 'payload.from 与流派生 wait_state 不一致（F12）',
+      });
+    }
+    const waitGuard = guardWaitStateChange({
+      lifecycle,
+      from: expected_from,
+      to: payload.to as string,
+      reason: typeof payload.reason === 'string' ? payload.reason : undefined,
+    });
+    if (!waitGuard.allowed) throw new TransitionDeniedError(waitGuard);
   }
 
   const seq = last_seq + 1;
@@ -568,18 +1367,25 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
   function makeScoped(client: PoolClient | null): PgEventStoreTx {
     const reader = client ?? pool;
 
+    /** 在指定连接上写一条事件（调用方负责事务边界）。 */
+    async function appendOn(
+      conn: PoolClient,
+      input: Parameters<EventStore['append']>[0],
+      prepareOptions: PrepareAppendOptions = {},
+    ): Promise<EventEnvelope> {
+      return appendWithin(conn, prepareAppend(input, prepareOptions), idFactory, clock);
+    }
+
     async function append(
       input: Parameters<EventStore['append']>[0],
     ): Promise<EventEnvelope> {
-      const prepared = prepareAppend(input);
-
       // 事务内：直接复用调用方连接，失败由 withTransaction 整体回滚
-      if (client) return appendWithin(client, prepared, idFactory, clock);
+      if (client) return appendOn(client, input);
 
       const conn = await pool.connect();
       try {
         await conn.query('BEGIN');
-        const event = await appendWithin(conn, prepared, idFactory, clock);
+        const event = await appendOn(conn, input);
 
         // 快路径命中已存在事件时事务是只读的，COMMIT 同样安全
         await conn.query('COMMIT');
@@ -597,10 +1403,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             [input.stream_id, input.idempotency_key],
           );
           if (rows.length === 1) {
-            if (
-              rows[0].type !== input.type ||
-              rows[0].payload_canonical !== prepared.payload_canonical
-            ) {
+            if (idempotencyContentMismatch(rows[0], input, canonicalJson(input.payload))) {
               throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
             }
             return rowToEnvelope(rows[0]);
@@ -620,7 +1423,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       }
     }
 
-    async function readStream(stream_id: string, from_seq = 1): Promise<EventEnvelope[]> {
+    async function readStream(stream_id: ProjectId, from_seq = 1): Promise<EventEnvelope[]> {
       const { rows } = await reader.query<EventRow>(
         `SELECT * FROM events
          WHERE stream_id = $1 AND seq >= $2
@@ -642,7 +1445,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       return rows.map(rowToEnvelope);
     }
 
-    async function verifyChain(stream_id: string): Promise<ChainVerification> {
+    async function verifyChain(stream_id: ProjectId): Promise<ChainVerification> {
       // 单条 SELECT = 单快照：链头与 events 在同一快照内读取，避免并发 append 造成假红。
       const { rows } = await reader.query<{
         head_last_seq: string;
@@ -707,6 +1510,34 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             stream_exists: true,
           };
         }
+        // F14：payload_canonical 必须是重新规范化后的逐字节文本，否则拒绝报绿。
+        let recanonicalized: string;
+        try {
+          recanonicalized = canonicalJson(JSON.parse(row.payload_canonical));
+        } catch (error) {
+          return {
+            ok: false,
+            stream_id,
+            length: eventRows.length,
+            broken_at_seq: seq,
+            reason:
+              `payload_canonical 无法重新规范化：` +
+              (error instanceof Error ? error.message : String(error)),
+            stream_exists: true,
+          };
+        }
+        if (recanonicalized !== row.payload_canonical) {
+          return {
+            ok: false,
+            stream_id,
+            length: eventRows.length,
+            broken_at_seq: seq,
+            reason:
+              `payload_canonical 非规范形式（F14）：` +
+              `重规范化=${recanonicalized}，库中=${row.payload_canonical}`,
+            stream_exists: true,
+          };
+        }
         const recomputed = computeEventHash(row.prev_hash, row.payload_canonical, seq);
         if (recomputed !== row.hash) {
           return {
@@ -756,42 +1587,612 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       };
     }
 
-    async function appendStateTransition(
+    // -----------------------------------------------------------------------
+    // 事务与锁
+    // -----------------------------------------------------------------------
+
+    async function withStoreTransaction<T>(
+      fn: (conn: PoolClient) => Promise<T>,
+    ): Promise<T> {
+      if (client) return fn(client);
+
+      const conn = await pool.connect();
+      try {
+        await conn.query('BEGIN');
+        const result = await fn(conn);
+        await conn.query('COMMIT');
+        return result;
+      } catch (error) {
+        await conn.query('ROLLBACK').catch(() => undefined);
+        throw error;
+      } finally {
+        conn.release();
+      }
+    }
+
+    /** 同 stream 串行化入口：派生状态与写入必须在同一把行锁内完成（F1）。 */
+    async function ensureAndLockStream(conn: PoolClient, stream_id: string): Promise<void> {
+      await conn.query(
+        `INSERT INTO event_streams (stream_id, last_seq, last_hash)
+         VALUES ($1, 0, $2)
+         ON CONFLICT (stream_id) DO NOTHING`,
+        [stream_id, GENESIS_HASH],
+      );
+      const head = await conn.query<{ last_seq: string }>(
+        `SELECT last_seq FROM event_streams WHERE stream_id = $1 FOR UPDATE`,
+        [stream_id],
+      );
+      if (head.rows.length !== 1) {
+        throw new StoreInvariantError(`event_streams 缺少 stream=${stream_id} 的链头行`);
+      }
+    }
+
+    async function findByIdempotencyKey(
+      conn: PoolClient,
+      stream_id: string,
+      key: string | null,
+    ): Promise<EventEnvelope | null> {
+      if (key === null) return null;
+      const { rows } = await conn.query<EventRow>(
+        `SELECT * FROM events WHERE stream_id = $1 AND idempotency_key = $2`,
+        [stream_id, key],
+      );
+      return rows.length > 0 ? rowToEnvelope(rows[0]) : null;
+    }
+
+    // -----------------------------------------------------------------------
+    // F2/F4：终态收尾（同事务）
+    // -----------------------------------------------------------------------
+
+    type EmitBase = Pick<
+      Parameters<EventStore['append']>[0],
+      'stream_id' | 'actor_id' | 'actor_kind' | 'causation_id' | 'correlation_id'
+    >;
+
+    interface PreClosureResult {
+      wait_conditions_canceled: string[];
+      wait_state_reset_from: TaskWaitState | null;
+      decisions_expired: string[];
+      assignments_ended: string[];
+      effects_applied: GuardEffect[];
+    }
+
+    async function emitClosureEvent(
+      conn: PoolClient,
+      base: EmitBase,
+      type: EventType,
+      payload: Record<string, unknown>,
+    ): Promise<EventEnvelope> {
+      return appendOn(
+        conn,
+        {
+          stream_id: base.stream_id,
+          type,
+          actor_id: base.actor_id,
+          actor_kind: base.actor_kind,
+          causation_id: base.causation_id,
+          correlation_id: base.correlation_id,
+          idempotency_key: null,
+          payload,
+        },
+        { allowTerminalLifecycle: true },
+      );
+    }
+
+    /**
+     * INV-11 收尾顺序（spec §3.1）：
+     * active WaitCondition → canceled；wait_state → none；随后（调用方）lifecycle 迁移。
+     * REQ-RUN-6 额外在正式取消前收尾 pending Decision / active Assignment。
+     */
+    async function applyTerminalPreClosure(
+      conn: PoolClient,
+      base: EmitBase,
+      facts: StreamFacts,
+      task_id: string,
+      to: 'accepted' | 'canceled',
+    ): Promise<PreClosureResult> {
+      const result: PreClosureResult = {
+        wait_conditions_canceled: [],
+        wait_state_reset_from: null,
+        decisions_expired: [],
+        assignments_ended: [],
+        effects_applied: [],
+      };
+
+      if (to === 'canceled') {
+        // REQ-RUN-6①：pending Decision → expired(task_canceled)
+        for (const decision of facts.decisions.values()) {
+          if (!decision.pending) continue;
+          if (decision.task_id !== task_id && decision.subject_ref !== task_id) continue;
+          await emitClosureEvent(conn, base, 'DecisionExpired', {
+            decision_id: decision.id,
+            subject_ref: task_id,
+            reason: 'task_canceled',
+          });
+          result.decisions_expired.push(decision.id);
+        }
+        result.effects_applied.push('expire_pending_decisions');
+
+        // REQ-RUN-6①：active Assignment → ended(task_canceled)
+        for (const assignment of facts.assignments.values()) {
+          if (!assignment.active || assignment.task_id !== task_id) continue;
+          await emitClosureEvent(conn, base, 'AssignmentEnded', {
+            assignment_id: assignment.id,
+            task_id,
+            reason: 'task_canceled',
+          });
+          result.assignments_ended.push(assignment.id);
+        }
+        result.effects_applied.push('end_active_assignments');
+      }
+
+      // INV-11：active WaitCondition → canceled
+      for (const waitCondition of facts.waitConditions.values()) {
+        if (!waitCondition.active || waitCondition.task_id !== task_id) continue;
+        await emitClosureEvent(conn, base, 'WaitConditionCanceled', {
+          wait_condition_id: waitCondition.id,
+          task_id,
+          reason: to === 'canceled' ? 'task_canceled' : 'task_accepted',
+        });
+        result.wait_conditions_canceled.push(waitCondition.id);
+      }
+      result.effects_applied.push('cancel_active_wait_conditions');
+
+      // INV-11：wait_state → none（每次变更必有 TaskWaitStateChanged 事件源）
+      const waitState = currentWaitState(facts, task_id);
+      if (waitState !== 'none') {
+        await emitClosureEvent(conn, base, 'TaskWaitStateChanged', {
+          task_id,
+          from: waitState,
+          to: 'none',
+          reason: to === 'canceled' ? 'task_canceled' : 'task_accepted',
+          actor_id: base.actor_id,
+          actor_kind: base.actor_kind,
+        });
+        result.wait_state_reset_from = waitState;
+      }
+      result.effects_applied.push('reset_wait_state_none');
+
+      return result;
+    }
+
+    /** REQ-RUN-6①：记取消意图时的级联收尾（Decision/Assignment）。 */
+    async function applyCancellationIntentCascade(
+      conn: PoolClient,
+      base: EmitBase,
+      facts: StreamFacts,
+      task_id: string,
+    ): Promise<{ decisions_expired: string[]; assignments_ended: string[] }> {
+      const decisions_expired: string[] = [];
+      for (const decision of facts.decisions.values()) {
+        if (!decision.pending) continue;
+        if (decision.task_id !== task_id && decision.subject_ref !== task_id) continue;
+        await emitClosureEvent(conn, base, 'DecisionExpired', {
+          decision_id: decision.id,
+          subject_ref: task_id,
+          reason: 'task_canceled',
+        });
+        decisions_expired.push(decision.id);
+      }
+
+      const assignments_ended: string[] = [];
+      for (const assignment of facts.assignments.values()) {
+        if (!assignment.active || assignment.task_id !== task_id) continue;
+        await emitClosureEvent(conn, base, 'AssignmentEnded', {
+          assignment_id: assignment.id,
+          task_id,
+          reason: 'task_canceled',
+        });
+        assignments_ended.push(assignment.id);
+      }
+
+      return { decisions_expired, assignments_ended };
+    }
+
+    // -----------------------------------------------------------------------
+    // 状态迁移写路径
+    // -----------------------------------------------------------------------
+
+    async function appendStateTransitionOn(
+      conn: PoolClient,
       input: AppendStateTransitionInput,
-    ): Promise<{ event: EventEnvelope; guard: GuardResult }> {
+    ): Promise<AppendStateTransitionResult> {
       const entity = input.entity ?? 'task';
-      // ① 事件类型必须属于该实体的迁移事件家族（spec §4）
+      // ① 事件类型必须属于该实体的迁移事件家族（spec §4）；格级匹配由 guard 再查（F6）
       assertTransitionEventType(entity, input.type);
 
+      // ② payload.from/to 缺失补齐、矛盾拒绝
+      const mergedPayload = mergeTransitionPayload(input.payload, input.from, input.to);
+
+      // F13：先于流读取给出明确拒绝（否则只会得到模糊的 subject_not_found）。
+      assertProjectStreamId(input.stream_id, mergedPayload);
+
+      // F7：TaskLifecycleChanged 补 trigger_event_id
+      const payload = withTransitionTrigger(
+        mergedPayload,
+        input.type,
+        input.causation_id,
+        input.trigger_event_id,
+      );
+
+      const subject_id = subjectIdFor(entity, payload);
+      if (subject_id === null) {
+        throw new TransitionStateError({
+          reason: 'subject_id_missing',
+          entity,
+          subject_id: null,
+          provided_from: input.from,
+          detail: entity === 'task' ? 'payload.task_id 缺失' : 'payload.run_id 缺失',
+        });
+      }
+
+      // 锁内：先做幂等重放检查（避免重放被 F1 的 from 校验误伤），再派生流状态。
+      const payload_canonical = canonicalJson(payload);
+      await ensureAndLockStream(conn, input.stream_id);
+
+      const existing = await findByIdempotencyKey(conn, input.stream_id, input.idempotency_key);
+      if (existing !== null && input.idempotency_key !== null) {
+        if (
+          idempotencyContentMismatch(
+            { ...existing, payload_canonical: canonicalJson(existing.payload) },
+            input,
+            payload_canonical,
+          )
+        ) {
+          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+        }
+        return {
+          event: existing,
+          guard: guardTransitionReplay({
+            entity,
+            from: input.from,
+            to: input.to,
+            event_type: input.type,
+          }),
+          closure: null,
+        };
+      }
+
+      // ③ F1：期望 from 只来自事件流当前状态（最后一条生命周期/状态事件）
+      const facts = await deriveStreamFacts(conn, input.stream_id);
+      let expected_from: string;
+      if (entity === 'task') {
+        const lifecycle = deriveTaskLifecycle(facts, subject_id);
+        if (lifecycle === null) {
+          throw new TransitionStateError({
+            reason: 'subject_not_found',
+            entity,
+            subject_id,
+            provided_from: input.from,
+            detail: 'stream 内没有 TaskCaptured / TaskLifecycleChanged',
+          });
+        }
+        expected_from = lifecycle;
+      } else {
+        const run = deriveRunState(facts, subject_id);
+        if (run === null) {
+          throw new TransitionStateError({
+            reason: 'subject_not_found',
+            entity,
+            subject_id,
+            provided_from: input.from,
+            detail: 'stream 内没有 RunCreated / Run* 状态事件',
+          });
+        }
+        expected_from = run.state;
+      }
+
+      if (expected_from !== input.from) {
+        throw new TransitionStateError({
+          reason: 'from_mismatch',
+          entity,
+          subject_id,
+          expected_from,
+          provided_from: input.from,
+          detail: '调用方 from 与事件流当前状态不一致（F1）',
+        });
+      }
+
+      // ④ F3/F4/F5：客观 fact 由流派生并覆盖调用方自述
+      const derived =
+        entity === 'task'
+          ? derivedTaskFacts(facts, subject_id)
+          : derivedRunFacts(facts, deriveRunState(facts, subject_id)!);
       const guard = guardTransition({
         entity,
-        from: input.from,
+        from: expected_from,
         to: input.to,
         event_type: input.type,
-        facts: input.facts,
+        facts: mergeFacts(input.facts, derived),
       });
-
-      // 校验不通过：不进入事务、不写任何行
       if (!guard.allowed) throw new TransitionDeniedError(guard);
 
-      // ② payload.from/to 缺失则补齐、矛盾则拒绝；guard 判定与落库内容必须同源
-      const payload = mergeTransitionPayload(input.payload, input.from, input.to);
-
-      const event = await append({
+      const base: EmitBase = {
         stream_id: input.stream_id,
-        type: input.type,
+        actor_id: input.actor_id,
+        actor_kind: input.actor_kind,
+        causation_id: input.causation_id,
+        correlation_id: input.correlation_id,
+      };
+
+      // ⑤ F2/F4：终态迁移的收尾与 lifecycle 同事务落库
+      if (entity === 'task' && (input.to === 'accepted' || input.to === 'canceled')) {
+        const pre = await applyTerminalPreClosure(conn, base, facts, subject_id, input.to);
+
+        const event = await appendOn(
+          conn,
+          {
+            ...input,
+            payload,
+          },
+          { allowTerminalLifecycle: true },
+        );
+
+        let task_canceled_event_id: string | null = null;
+        if (input.to === 'canceled') {
+          const taskCanceled = await emitClosureEvent(conn, base, 'TaskCanceled', {
+            task_id: subject_id,
+            reason: typeof payload.reason === 'string' ? payload.reason : 'task_canceled',
+            lifecycle_event_id: event.id,
+          });
+          task_canceled_event_id = taskCanceled.id;
+          pre.effects_applied.push('emit_task_canceled');
+        }
+
+        return {
+          event,
+          guard,
+          closure: {
+            wait_conditions_canceled: pre.wait_conditions_canceled,
+            wait_state_reset_from: pre.wait_state_reset_from,
+            decisions_expired: pre.decisions_expired,
+            assignments_ended: pre.assignments_ended,
+            task_canceled_event_id,
+            effects_applied: pre.effects_applied,
+          },
+        };
+      }
+
+      const event = await appendOn(conn, { ...input, payload });
+      return { event, guard, closure: null };
+    }
+
+    async function appendStateTransition(
+      input: AppendStateTransitionInput,
+    ): Promise<AppendStateTransitionResult> {
+      return withStoreTransaction((conn) => appendStateTransitionOn(conn, input));
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-RUN-6：取消级联
+    // -----------------------------------------------------------------------
+
+    interface FinalizeOutcome {
+      closure: TransitionClosure | null;
+      finalized: boolean;
+      lifecycle: TaskLifecycle;
+    }
+
+    /** 已记取消意图时，取该 Task 最近一条 TaskCancelRequested 的 id 作为迁移触发事件（F7）。 */
+    async function findCancelRequestedEventId(
+      conn: PoolClient,
+      stream_id: string,
+      task_id: string,
+    ): Promise<string | null> {
+      const { rows } = await conn.query<{ id: string; payload: unknown }>(
+        `SELECT id, payload FROM events
+         WHERE stream_id = $1 AND type = 'TaskCancelRequested'
+         ORDER BY seq DESC`,
+        [stream_id],
+      );
+      for (const row of rows) {
+        if (payloadField(row.payload, 'task_id') === task_id) return row.id;
+      }
+      return null;
+    }
+
+    /** 全部 Run 达终态时执行第③步（收尾 + lifecycle canceled + TaskCanceled）。 */
+    async function finalizeTaskCancellation(
+      conn: PoolClient,
+      input: RequestTaskCancellationInput,
+      causation_id: string | null,
+    ): Promise<FinalizeOutcome> {
+      const facts = await deriveStreamFacts(conn, input.stream_id);
+      const lifecycle = deriveTaskLifecycle(facts, input.task_id);
+      if (lifecycle === null) {
+        throw new TransitionStateError({
+          reason: 'subject_not_found',
+          entity: 'task',
+          subject_id: input.task_id,
+        });
+      }
+      if (lifecycle === 'canceled') {
+        return { closure: null, finalized: true, lifecycle };
+      }
+      if (!allRunsTerminalForTask(facts, input.task_id)) {
+        return { closure: null, finalized: false, lifecycle };
+      }
+
+      // F7：正式取消的触发事件是取消意图；意图已存在时从流里回查，而不是编造 id。
+      const trigger_event_id =
+        causation_id
+        ?? (await findCancelRequestedEventId(conn, input.stream_id, input.task_id))
+        ?? input.causation_id;
+
+      const result = await appendStateTransitionOn(conn, {
+        stream_id: input.stream_id,
+        type: 'TaskLifecycleChanged',
+        entity: 'task',
+        from: lifecycle,
+        to: 'canceled',
+        actor_id: input.actor_id,
+        actor_kind: input.actor_kind,
+        causation_id: causation_id ?? trigger_event_id,
+        correlation_id: input.correlation_id,
+        idempotency_key: null,
+        trigger_event_id: trigger_event_id ?? undefined,
+        payload: { task_id: input.task_id, reason: input.reason ?? 'task_canceled' },
+        facts: {},
+      });
+      return { closure: result.closure, finalized: true, lifecycle: 'canceled' };
+    }
+
+    async function requestTaskCancellationOn(
+      conn: PoolClient,
+      input: RequestTaskCancellationInput,
+    ): Promise<TaskCancellationResult> {
+      // F13：stream 必须是 Project，不能复用 task_id。
+      assertProjectStreamId(input.stream_id, { task_id: input.task_id });
+      await ensureAndLockStream(conn, input.stream_id);
+
+      // 幂等：同 key 已记过取消意图 → 返回首次结果（INV-13）
+      const existing = await findByIdempotencyKey(conn, input.stream_id, input.idempotency_key);
+      if (existing !== null && input.idempotency_key !== null) {
+        if (existing.type !== 'TaskCancelRequested') {
+          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+        }
+        const facts = await deriveStreamFacts(conn, input.stream_id);
+        const lifecycle = deriveTaskLifecycle(facts, input.task_id);
+        return {
+          cancel_requested: existing,
+          already_requested: true,
+          runs_canceled: [],
+          closure: null,
+          finalized: lifecycle === 'canceled',
+          task_lifecycle: lifecycle,
+        };
+      }
+
+      const facts = await deriveStreamFacts(conn, input.stream_id);
+      const lifecycle = deriveTaskLifecycle(facts, input.task_id);
+      if (lifecycle === null) {
+        throw new TransitionStateError({
+          reason: 'subject_not_found',
+          entity: 'task',
+          subject_id: input.task_id,
+        });
+      }
+      if (lifecycle === 'accepted') {
+        throw new TransitionStateError({
+          reason: 'task_already_terminal',
+          entity: 'task',
+          subject_id: input.task_id,
+          expected_from: lifecycle,
+          detail: 'accepted 的 Task 不可取消，须另立 Task',
+        });
+      }
+      if (lifecycle === 'canceled') {
+        return {
+          cancel_requested: null,
+          already_requested: true,
+          runs_canceled: [],
+          closure: null,
+          finalized: true,
+          task_lifecycle: lifecycle,
+        };
+      }
+
+      // 意图已记（不可撤销）：不重复写事件，只尝试推进第③步
+      if (facts.taskCancelRequested.has(input.task_id)) {
+        const finalized = await finalizeTaskCancellation(conn, input, null);
+        return {
+          cancel_requested: null,
+          already_requested: true,
+          runs_canceled: [],
+          closure: finalized.closure,
+          finalized: finalized.finalized,
+          task_lifecycle: finalized.lifecycle,
+        };
+      }
+
+      // REQ-RUN-6①：记取消意图
+      const cancelRequested = await appendOn(conn, {
+        stream_id: input.stream_id,
+        type: 'TaskCancelRequested',
         actor_id: input.actor_id,
         actor_kind: input.actor_kind,
         causation_id: input.causation_id,
         correlation_id: input.correlation_id,
         idempotency_key: input.idempotency_key,
-        payload,
+        payload: {
+          task_id: input.task_id,
+          reason: input.reason ?? 'cancel_requested',
+          cancel_requested_at: clock().toISOString(),
+        },
       });
 
-      return { event, guard };
+      const base: EmitBase = {
+        stream_id: input.stream_id,
+        actor_id: input.actor_id,
+        actor_kind: input.actor_kind,
+        causation_id: cancelRequested.id,
+        correlation_id: input.correlation_id,
+      };
+
+      // REQ-RUN-6①：级联收尾 Decision / Assignment
+      const cascade = await applyCancellationIntentCascade(conn, base, facts, input.task_id);
+
+      // REQ-RUN-6②：未启动的 created/queued/leased Run 直接 canceled
+      const runs_canceled: EventEnvelope[] = [];
+      for (const run of runsOfTask(facts, input.task_id)) {
+        if (run.started) continue;
+        if (run.state !== 'created' && run.state !== 'queued' && run.state !== 'leased') continue;
+        const canceled = await appendStateTransitionOn(conn, {
+          stream_id: input.stream_id,
+          type: 'RunCanceled',
+          entity: 'run',
+          from: run.state,
+          to: 'canceled',
+          actor_id: input.actor_id,
+          actor_kind: input.actor_kind,
+          causation_id: cancelRequested.id,
+          correlation_id: input.correlation_id,
+          idempotency_key: null,
+          payload: { run_id: run.run_id, task_id: input.task_id, reason: 'task_canceled' },
+          facts: {},
+        });
+        runs_canceled.push(canceled.event);
+      }
+
+      // REQ-RUN-6③：全部 Run 已终态则同事务正式取消
+      const finalized = await finalizeTaskCancellation(conn, input, cancelRequested.id);
+
+      // 收尾证据合并：级联发生在正式收尾之前，finalize 时的重派生已看不到这些项。
+      if (finalized.closure !== null) {
+        finalized.closure.decisions_expired = [
+          ...cascade.decisions_expired,
+          ...finalized.closure.decisions_expired,
+        ];
+        finalized.closure.assignments_ended = [
+          ...cascade.assignments_ended,
+          ...finalized.closure.assignments_ended,
+        ];
+      }
+
+      return {
+        cancel_requested: cancelRequested,
+        already_requested: false,
+        runs_canceled,
+        closure: finalized.closure,
+        finalized: finalized.finalized,
+        task_lifecycle: finalized.lifecycle,
+      };
     }
 
-    return { append, readStream, replay, appendStateTransition, verifyChain };
+    async function requestTaskCancellation(
+      input: RequestTaskCancellationInput,
+    ): Promise<TaskCancellationResult> {
+      return withStoreTransaction((conn) => requestTaskCancellationOn(conn, input));
+    }
+
+    return {
+      append,
+      readStream,
+      replay,
+      appendStateTransition,
+      requestTaskCancellation,
+      verifyChain,
+    };
   }
 
   const base = makeScoped(null);
