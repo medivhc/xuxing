@@ -530,18 +530,19 @@ describe('⑥ 验收（Acceptance）', () => {
   });
 });
 
-describe('附：human_light Run 在 §3.2 矩阵上走不通（D9 发现的缺口）', () => {
-  it('REQ-HUM-1 要求的 created→running 被内核矩阵拒绝（illegal_transition）', () => {
+describe('附：human_light Run 走 REQ-HUM-1（D9-J2 由 Batch 2 关闭）', () => {
+  it('run_kind 维度放行 human_light created→running；executor 同格仍按 §3.2 拒绝', () => {
     expect(isMatrixCellAllowed('run', 'created', 'running').allowed).toBe(false);
-    expect(step('附 S7').appendedTypes).toEqual(['RunCreated']);
-    expect(stateAt(18).runs.get(D8.runHumanLight)?.state).toBe('created');
-    expect(step('附 S7').notes.join(' | ')).toContain('FINDING D9-J2');
+    expect(isMatrixCellAllowed('run', 'created', 'running', 'human_light').allowed).toBe(true);
+    expect(step('附 S7').appendedTypes).toEqual(['RunCreated', 'RunStarted']);
+    expect(stateAt(18).runs.get(D8.runHumanLight)?.state).toBe('running');
+    expect(step('附 S7').notes.join(' | ')).toContain('D9-J2 关闭');
   });
 
-  it('旅程不伪造合法迁移：不出现 RunStarted/leased 事件（S3 与 §3.2 需一处修订）', () => {
+  it('human_light 不进 leased/indeterminate/timed_out（REQ-HUM-1）', () => {
     expect(stream.map((e) => e.type)).not.toContain('RunHeartbeat');
     const humanLightEvents = stream.filter((e) => (e.payload as { run_id?: string })?.run_id === D8.runHumanLight);
-    expect(humanLightEvents.map((e) => e.type)).toEqual(['RunCreated']);
+    expect(humanLightEvents.map((e) => e.type)).toEqual(['RunCreated', 'RunStarted']);
   });
 });
 

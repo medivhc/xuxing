@@ -166,6 +166,12 @@ export interface GuardTransitionInput {
   to: string;
   event_type: string;
   facts?: GuardFacts;
+  /**
+   * S3-①：Run 的状态机分两种运行形态。缺省 executor 走 spec §3.2 矩阵；
+   * human_light 走 REQ-HUM-1 的 created → running → succeeded/failed/canceled
+   * （无租约/排队/超时/indeterminate）。该值由事件流派生（RunCreated.payload.run_kind）。
+   */
+  run_kind?: 'executor' | 'human_light';
 }
 
 interface MatrixCell {
@@ -772,13 +778,62 @@ const RUN_MATRIX: Record<string, Record<string, MatrixCell>> = {
   timed_out: TERMINAL_RUN_CELLS,
 };
 
+/**
+ * REQ-HUM-1（S3）：human_light Run 只走 created → running → succeeded/failed/canceled，
+ * 不出现 queued/leased/indeterminate/timed_out。§3.2 矩阵描述的是 executor Run 的租约状态机，
+ * 这里按 spec 明文补上人机轻量形态的格，避免命令层被迫绕过 guard。
+ */
+const HUMAN_LIGHT_RUN_MATRIX: Record<string, Record<string, MatrixCell>> = {
+  created: {
+    queued: { cell: '–', note: 'human_light 无排队（REQ-HUM-1）' },
+    leased: { cell: '–', note: 'human_light 无租约（REQ-HUM-1）' },
+    running: {
+      cell: '✓', trigger: '人类开始执行', requirement: 'REQ-HUM-1',
+      event_types: ['RunStarted'],
+    },
+    succeeded: { cell: '–', note: '未执行不可成功' },
+    failed: { cell: '–', note: '未执行不可失败' },
+    canceled: {
+      cell: '✓', trigger: '未开始直接取消（human_light 无确认环节）',
+      requirement: 'REQ-HUM-1/REQ-RUN-6', event_types: ['RunCanceled'],
+    },
+    timed_out: { cell: '–', note: 'human_light 无超时（REQ-HUM-1）' },
+    indeterminate: { cell: '–', note: 'human_light 不进 indeterminate（REQ-HUM-1）' },
+  },
+  running: {
+    queued: { cell: '–', note: 'human_light 无排队（REQ-HUM-1）' },
+    leased: { cell: '–', note: 'human_light 无租约（REQ-HUM-1）' },
+    running: { cell: '–', note: '自环不算迁移' },
+    succeeded: {
+      cell: '✓', trigger: '绑定该 Run 的 Outcome 入账', requirement: 'REQ-HUM-1/REQ-HUM-2',
+      event_types: ['RunSucceeded'],
+    },
+    failed: { cell: '✓', trigger: '人类执行失败回报', event_types: ['RunFailed'] },
+    canceled: {
+      cell: '✓', trigger: 'human_light 取消无确认环节，直接 canceled',
+      requirement: 'REQ-HUM-1/REQ-RUN-6', event_types: ['RunCanceled'],
+    },
+    timed_out: { cell: '–', note: 'human_light 无超时（REQ-HUM-1）' },
+    indeterminate: { cell: '–', note: 'human_light 不进 indeterminate（REQ-HUM-1）' },
+  },
+};
+
+function runMatrixFor(runKind: 'executor' | 'human_light' | undefined): Record<string, Record<string, MatrixCell>> {
+  // human_light 只有 created/running 两行有专门格；其余行（终态等）沿用 executor 的「不可再迁移」。
+  if (runKind !== 'human_light') return RUN_MATRIX;
+  return { ...RUN_MATRIX, ...HUMAN_LIGHT_RUN_MATRIX };
+}
+
 function isTerminal(entity: GuardEntity, state: string): boolean {
   if (entity === 'task') return state === 'canceled';
   return state === 'succeeded' || state === 'failed' || state === 'canceled' || state === 'timed_out';
 }
 
-function matrixFor(entity: GuardEntity): Record<string, Record<string, MatrixCell>> {
-  return entity === 'task' ? TASK_MATRIX : RUN_MATRIX;
+function matrixFor(
+  entity: GuardEntity,
+  runKind?: 'executor' | 'human_light',
+): Record<string, Record<string, MatrixCell>> {
+  return entity === 'task' ? TASK_MATRIX : runMatrixFor(runKind);
 }
 
 function specRefFor(entity: GuardEntity): '§3.1' | '§3.2' {
@@ -806,6 +861,7 @@ export function isMatrixCellAllowed(
   entity: GuardEntity,
   from: string,
   to: string,
+  runKind?: 'executor' | 'human_light',
 ): GuardResult {
   const spec_ref = specRefFor(entity);
   const states: readonly string[] = entity === 'task' ? TASK_STATES : RUN_STATES;
@@ -818,7 +874,7 @@ export function isMatrixCellAllowed(
     };
   }
 
-  const cell = matrixFor(entity)[from]?.[to];
+  const cell = matrixFor(entity, runKind)[from]?.[to];
   if (!cell) {
     // 表必须逐格完整：缺格是编程错误，大声失败而不是悄悄放行
     throw new Error(`transition matrix incomplete: ${spec_ref} ${from}→${to}`);
@@ -839,10 +895,10 @@ export function isMatrixCellAllowed(
 
 /** 完整校验：矩阵格 + 触发事件类型（F6）+ 前置条件（facts 缺失即拒）。 */
 export function guardTransition(input: GuardTransitionInput): GuardResult {
-  const cellCheck = isMatrixCellAllowed(input.entity, input.from, input.to);
+  const cellCheck = isMatrixCellAllowed(input.entity, input.from, input.to, input.run_kind);
   if (!cellCheck.allowed || cellCheck.reason !== undefined) return cellCheck;
 
-  const cell = matrixFor(input.entity)[input.from][input.to];
+  const cell = matrixFor(input.entity, input.run_kind)[input.from][input.to];
 
   // F6：事件类型必须与该迁移匹配（「created→queued 不许配 RunSucceeded」）。
   const expectedTypes = cell.event_types ?? [];
@@ -907,11 +963,12 @@ export function guardTransitionReplay(input: {
   from: string;
   to: string;
   event_type: string;
+  run_kind?: 'executor' | 'human_light';
 }): GuardResult {
-  const cellCheck = isMatrixCellAllowed(input.entity, input.from, input.to);
+  const cellCheck = isMatrixCellAllowed(input.entity, input.from, input.to, input.run_kind);
   if (!cellCheck.allowed || cellCheck.reason !== undefined) return cellCheck;
 
-  const cell = matrixFor(input.entity)[input.from][input.to];
+  const cell = matrixFor(input.entity, input.run_kind)[input.from][input.to];
   const expectedTypes = cell.event_types ?? [];
   if (expectedTypes.length > 0 && !expectedTypes.includes(input.event_type as EventType)) {
     return {

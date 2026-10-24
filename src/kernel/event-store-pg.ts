@@ -129,8 +129,13 @@ export class EventEntityMismatchError extends Error {
   readonly type: string;
   constructor(entity: 'task' | 'run', type: string) {
     super(
-      `事件类型 ${type} 不属于 ${entity} 状态迁移事件家族：` +
-        `task 用 TaskLifecycleChanged，run 用 Run* 状态事件（spec §4）`,
+      `事件类型 ${type} 不属于 ${entity} 状态迁移事件家族（spec §4）。` +
+        (entity === 'task'
+          ? '生命周期迁移请用 appendStateTransition({entity:"task", type:"TaskLifecycleChanged"})；' +
+            'wait_state 变更（TaskWaitStateChanged）与取消附随事件（TaskCanceled / WaitConditionCanceled）' +
+            '请用 append 或 requestTaskCancellation，它们不走生命周期矩阵。'
+          : 'Run 状态迁移请用 appendRunTransition(...)（内部 appendStateTransition({entity:"run"})）；' +
+            '建 Run 用 appendRunCreated(...)。'),
     );
     this.name = 'EventEntityMismatchError';
     this.entity = entity;
@@ -715,7 +720,8 @@ const DERIVED_EVENT_TYPES: readonly EventType[] = [
   'RunIndeterminate',
 ];
 
-const RUN_STATE_BY_EVENT: Partial<Record<EventType, RunState>> = {
+/** Run 事件 → 它把 Run 迁入的目标状态（S3-①：命令层用同一张表校验 type ↔ to）。 */
+export const RUN_STATE_BY_EVENT: Partial<Record<EventType, RunState>> = {
   RunCreated: 'created',
   RunQueued: 'queued',
   RunLeased: 'leased',
@@ -731,12 +737,16 @@ const TERMINAL_RUN_STATES: ReadonlySet<string> = new Set([
   'succeeded', 'failed', 'canceled', 'timed_out',
 ]);
 
+type RunKind = 'executor' | 'human_light';
+
 interface RunFactsRow {
   run_id: string;
   task_id: string | null;
   state: RunState;
   /** 是否出现过 RunStarted（REQ-RUN-4 的「已启动」判据）。 */
   started: boolean;
+  /** REQ-HUM-1：运行形态（缺省 executor）。由 RunCreated.payload.run_kind 派生。 */
+  run_kind: RunKind;
 }
 
 interface WaitConditionFactsRow {
@@ -948,6 +958,9 @@ async function deriveStreamFacts(
           task_id: existing?.task_id ?? payloadField(payload, 'task_id'),
           state: runState,
           started: started || runState === 'running',
+          run_kind:
+            existing?.run_kind
+            ?? (payloadField(payload, 'run_kind') === 'human_light' ? 'human_light' : 'executor'),
         });
         break;
       }
@@ -973,6 +986,21 @@ function deriveTaskLifecycle(
     });
   }
   return lifecycle as TaskLifecycle;
+}
+
+/** 幂等重放路径的轻量查询：只取 RunCreated 的运行形态，不派生整条流（F2：不在重放路径求值 facts）。 */
+async function deriveRunKind(
+  reader: Pool | PoolClient,
+  stream_id: string,
+  run_id: string,
+): Promise<RunKind> {
+  const { rows } = await reader.query<{ run_kind: string | null }>(
+    `SELECT payload->>'run_kind' AS run_kind FROM events
+     WHERE stream_id = $1 AND type = 'RunCreated' AND payload->>'run_id' = $2
+     LIMIT 1`,
+    [stream_id, run_id],
+  );
+  return rows[0]?.run_kind === 'human_light' ? 'human_light' : 'executor';
 }
 
 function deriveRunState(facts: StreamFacts, run_id: string): RunFactsRow | null {
@@ -2042,6 +2070,10 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             from: input.from,
             to: input.to,
             event_type: input.type,
+            run_kind:
+              entity === 'run'
+                ? await deriveRunKind(conn, input.stream_id, subject_id)
+                : undefined,
           }),
           closure: null,
         };
@@ -2088,16 +2120,16 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       }
 
       // ④ F3/F4/F5：客观 fact 由流派生并覆盖调用方自述
+      const runFacts = entity === 'run' ? deriveRunState(facts, subject_id)! : null;
       const derived =
-        entity === 'task'
-          ? derivedTaskFacts(facts, subject_id)
-          : derivedRunFacts(facts, deriveRunState(facts, subject_id)!);
+        entity === 'task' ? derivedTaskFacts(facts, subject_id) : derivedRunFacts(facts, runFacts!);
       const guard = guardTransition({
         entity,
         from: expected_from,
         to: input.to,
         event_type: input.type,
         facts: mergeFacts(input.facts, derived),
+        run_kind: runFacts?.run_kind,
       });
       if (!guard.allowed) throw new TransitionDeniedError(guard);
 

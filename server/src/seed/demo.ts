@@ -6,6 +6,7 @@
 
 import type { PgEventStore } from '../../../src/kernel/event-store-pg.ts';
 import { asProjectId } from '../../../src/kernel/events.ts';
+import { appendRunCreated, appendRunTransition } from '../../../src/kernel/run-events.ts';
 import type { ProjectionService } from '../projection/service.ts';
 
 /** 与 server/src/app.ts 的 DEFAULT_PROJECT_ID 同源。 */
@@ -253,9 +254,10 @@ export async function seedDemo(input: {
       if (seed.stage === 'ready') return;
 
       if (seed.run !== undefined && seed.run !== 'none') {
-        await tx.append({
+        await appendRunCreated(tx, {
           ...base,
           type: 'RunCreated',
+          run_kind: 'human_light',
           idempotency_key: key('run-created'),
           payload: {
             run_id: `run_${seed.task_id}`,
@@ -273,9 +275,12 @@ export async function seedDemo(input: {
             idempotency_key: key('run'),
           },
         });
-        await tx.append({
+        await appendRunTransition(tx, {
           ...base,
           type: 'RunStarted',
+          entity: 'run',
+          from: 'created',
+          to: 'running',
           idempotency_key: key('run-started'),
           payload: { run_id: `run_${seed.task_id}` },
         });
@@ -303,9 +308,12 @@ export async function seedDemo(input: {
           idempotency_key: key('cancel-requested'),
           payload: { task_id: seed.task_id, requested_by: actor_id, reason: seed.cancel_reason ?? 'seed_canceled' },
         });
-        await tx.append({
+        await appendRunTransition(tx, {
           ...base,
           type: 'RunCanceled',
+          entity: 'run',
+          from: 'running',
+          to: 'canceled',
           idempotency_key: key('run-canceled'),
           payload: { run_id: `run_${seed.task_id}`, reason: 'task_canceled' },
         });
@@ -383,9 +391,12 @@ export async function seedDemo(input: {
           proposal_id: `pc_${seed.task_id}`,
         },
       });
-      await tx.append({
+      await appendRunTransition(tx, {
         ...base,
         type: 'RunSucceeded',
+        entity: 'run',
+        from: 'running',
+        to: 'succeeded',
         idempotency_key: key('run-succeeded'),
         payload: { run_id: `run_${seed.task_id}`, outcome_id },
       });
