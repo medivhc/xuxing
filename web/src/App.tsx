@@ -5,6 +5,7 @@ import { CapturePage } from './pages/CapturePage';
 import { ProposalPage } from './pages/ProposalPage';
 import { MyActionsPage } from './pages/MyActionsPage';
 import { ProjectPage } from './pages/ProjectPage';
+import { ProjectsPage } from './pages/ProjectsPage';
 import { NotFoundPage } from './pages/NotFoundPage';
 
 const navItems = [
@@ -59,7 +60,7 @@ export default function App() {
           <Route path="/capture" element={<CapturePage />} />
           <Route path="/capture/:proposalId" element={<ProposalPage />} />
           <Route path="/actions" element={<MyActionsPage />} />
-          <Route path="/projects" element={<NotFoundPage />} />
+          <Route path="/projects" element={<ProjectsPage />} />
           <Route path="/projects/:projectId" element={<ProjectPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
