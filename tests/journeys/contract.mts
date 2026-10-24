@@ -16,7 +16,7 @@
 //   R-8 项目视图 data 键集 = {project, goal, tasks, acceptance_status, graph, pending_proposals}。
 //   R-9 SSE 帧 kind = 内核事件 PascalCase（捕获反馈是 FeedbackReceived）。
 
-/** POST /api/commands 允许的命令类型（封闭集，R-1 定版）。 */
+/** POST /api/commands 允许的命令类型（封闭集，R-1 定版；K1-A 增补 resolve_decision）。 */
 export const COMMAND_TYPES = [
   'proposal_accept',
   'proposal_reject',
@@ -24,6 +24,7 @@ export const COMMAND_TYPES = [
   'feedback_submit',
   'acceptance_record',
   'task_cancel',
+  'resolve_decision',
 ] as const;
 
 export type CommandType = (typeof COMMAND_TYPES)[number];
@@ -136,16 +137,31 @@ export type HomeResponse = SuccessEnvelope<HomeData>;
 // GET /api/actions（My Actions）
 // ---------------------------------------------------------------------------
 
+/**
+ * K1 §3.6 定版形状：kind 封闭 {task, decision} 的扁平联合条目。
+ * task 条目 decision_* 恒为 null/空；decision 条目任务字段（task_id/title/
+ * lifecycle/wait_state）恒为 null，available_actions 恒 ['resolve_decision']。
+ */
 export interface ActionItem {
-  task_id: string;
+  kind: 'task' | 'decision';
+  item_id: string;
+  rank: number;
+  task_id: string | null;
   project_id: string;
   project_name: string;
-  title: string;
-  lifecycle: TaskLifecycle;
-  wait_state: string;
+  title: string | null;
+  lifecycle: TaskLifecycle | null;
+  wait_state: string | null;
   next_action: string;
   available_actions: CommandType[];
   updated_global_seq: number;
+  decision_id: string | null;
+  subject_ref: { kind: string; id: string } | null;
+  question: string | null;
+  recommendation: string | null;
+  alternatives: string[];
+  evidence_refs: string[];
+  created_at: string | null;
 }
 
 export interface ActionsData extends ProjectionMeta {
@@ -225,10 +241,24 @@ export interface PendingProposal {
   created_at: string;
 }
 
+/** K1-B §4.4：Run 视图（state 事件派生；state_reason 为派发行合成字段）。 */
+export interface ProjectRunRow {
+  run_id: string;
+  task_id: string;
+  run_kind: string;
+  state: string;
+  executor_kind: string | null;
+  side_effect_level: string;
+  side_effect_count: number;
+  state_reason: string | null;
+  updated_global_seq: number;
+}
+
 export interface ProjectData extends ProjectionMeta {
   project: ProjectHeader;
   goal: ProjectGoal | null;
   tasks: ProjectTaskRow[];
+  runs: ProjectRunRow[];
   acceptance_status: ProjectAcceptanceStatus;
   graph: ProjectGraph;
   pending_proposals: PendingProposal[];

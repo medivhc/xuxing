@@ -1,7 +1,8 @@
 // 旅程/联调用的确定性模型桩：实现 proposer 期望的 OpenAI 兼容
 // POST /chat/completions 形态，按 system prompt 区分两类调用：
-//   - 意图解释（capture）：恒返回 assignee_kind="agent" 的任务草稿
+//   - 意图解释（capture）：默认返回 assignee_kind="agent" 的任务草稿
 //     （K1-B 节点旅程需要 agent 任务；真模型/降级路径都不可确定地产出）；
+//     输入文本含标记 HUMAN_TASK 时返回 assignee_kind="human"（回归旅程用）；
 //   - 结果解释（outcome）：恒返回 achieved 的 Outcome 草稿。
 // 只用于测试与联调，不是产品代码；生产 proposer 指向真实网关（magpie）。
 import { createServer } from 'node:http';
@@ -46,9 +47,9 @@ const server = createServer((req, res) => {
           followup_suggestions: [],
         }
       : {
-          title: '节点执行检查任务',
+          title: user.includes('HUMAN_TASK') ? '人工执行任务' : '节点执行检查任务',
           description: user.slice(0, 200) || '由节点执行的检查任务',
-          assignee_kind: 'agent',
+          assignee_kind: user.includes('HUMAN_TASK') ? 'human' : 'agent',
           acceptance_criteria: [{ criterion_ref: 'c1', text: '节点产出可核对的执行结果', auto: false }],
           rationale: 'model-stub 确定性提议（旅程/联调用）',
         };

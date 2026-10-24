@@ -12,6 +12,8 @@ on:
 #      冒烟（真服务 + 真实 web/dist + 真浏览器断言不白屏）进 CI；
 #   ② /api/home 缺 attention 等形状字段、前端读到即崩 → 投影键集单测在
 #      server:test / 根 npm test 内，随全量测试进 CI。
+#   ③ K1（2026-10-25）：J1 决策旅程 / J2 节点执行旅程 / J3 未授权拦截 /
+#      J4 回归护栏与 spec50 同轮真服务执行（E2E 硬门，见 K1-SPEC §6）。
 # 边界（不进 CI，留在部署门）：真 magpie 轮与真服务 degraded 轮依赖用户 PC
 # 在线与网关 caller key（不进 CI secrets），由部署前真服务两轮实跑覆盖。
 # docs-check 在独立 workflow（docs.yml），本文件不重复。
@@ -141,7 +143,17 @@ jobs:
         run: npm run seed:demo
 
       - name: Boot real server in background
+        # K1 旅程装配：模型桩先起（capture 恒产 agent 任务，J2/J4 依赖），
+        # 服务端 proposer 指向桩；节点存活阈值调短让 J2 的 awaiting_node
+        # 在旅程时限内可达（生产缺省 30s/90s 不变）。
+        env:
+          MAGPIE_BASE_URL: http://127.0.0.1:46123
+          MAGPIE_API_KEY: ci-stub-key
+          XUXING_NODE_STALE_SEC: "3"
+          XUXING_NODE_OFFLINE_SEC: "8"
+          XUXING_DISPATCH_MS: "500"
         run: |
+          MODEL_STUB_PORT=46123 nohup node tests/journeys/support/model-stub.mjs > /tmp/xuxing-model-stub.log 2>&1 &
           nohup npm run server > /tmp/xuxing-server.log 2>&1 &
           for i in $(seq 1 60); do
             if curl -sf http://127.0.0.1:8787/api/health > /dev/null; then
@@ -152,11 +164,17 @@ jobs:
           done
           curl -sf http://127.0.0.1:8787/api/health
 
-      - name: Page smoke against real server (spec50)
+      - name: Real-service journeys (spec50 页面冒烟 + K1 的 J1–J4)
         working-directory: tests/journeys
         env:
           JOURNEY_BASE_URL: http://127.0.0.1:8787
-        run: npx playwright test specs/50-page-smoke.pw.mts
+        run: >-
+          npx playwright test
+          specs/50-page-smoke.pw.mts
+          specs/60-decision-journey.pw.mts
+          specs/70-node-journey.pw.mts
+          specs/80-auth-journey.pw.mts
+          specs/90-regression.pw.mts
 
       - name: Upload server log on failure
         if: failure()
