@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { api, bootApp, jsonOf, type BootedApp } from './support/harness.ts';
+import { api, bootApp, jsonOf, TEST_SSE, type BootedApp } from './support/harness.ts';
 import { DEFAULT_PROJECT_ID } from '../src/seed/demo.ts';
+import { COMMAND_TYPES } from '../src/projection/actions.ts';
+import { sseOptionsFromEnv } from '../src/sse/protocol.ts';
 
 let booted: BootedApp;
 
@@ -13,10 +15,29 @@ afterAll(async () => {
 });
 
 describe('§4 HTTP 契约：投影类端点', () => {
-  it('GET /api/health → {ok:true}', async () => {
+  it('GET /api/health → {ok:true,data}（信封统一，health 不裸奔）', async () => {
     const body = await jsonOf(await api(booted, '/api/health'));
     expect(body.ok).toBe(true);
-    expect(body.db).toBe(true);
+    expect(body).not.toHaveProperty('db');
+    expect(body.data.ok).toBe(true);
+    expect(body.data.db).toBe(true);
+    expect(body.data.projection_version).toBe(booted.config.projection.version());
+  });
+
+  it('GET /api/health：limits 从 SSE 配置单点读取（不另写硬编码）', async () => {
+    const body = await jsonOf(await api(booted, '/api/health'));
+    // 测试 harness 用的是自己的 SSE 配置：health 必须原样反映它，而不是任何内置默认值
+    expect(body.data.limits).toEqual({
+      heartbeat_ms: TEST_SSE.heartbeatMs,
+      max_connections: TEST_SSE.maxConnections,
+      max_queue: TEST_SSE.queueLimit,
+    });
+    // 同一份配置也驱动 SSE 实际行为（连接上限）
+    expect(booted.config.sse).toEqual(TEST_SSE);
+  });
+
+  it('SSE 配置默认值（env 缺省）：15000 / 32 / 256', () => {
+    expect(sseOptionsFromEnv({})).toMatchObject({ heartbeatMs: 15_000, maxConnections: 32, queueLimit: 256 });
   });
 
   it('GET /api/home：项目摘要 + 待我处理计数 + 最近活动，带 projection_version', async () => {
@@ -70,8 +91,10 @@ describe('§4 HTTP 契约：投影类端点', () => {
     for (const item of body.data.items) {
       expect(Array.isArray(item.available_actions)).toBe(true);
       expect(item.available_actions.length).toBeGreaterThan(0);
+      // FIX-ROUND-1 R-1：available_actions = canonical command_type 字符串数组，不再发对象
       for (const action of item.available_actions) {
-        expect(action.next === null || action.next.guard === 'allowed').toBe(true);
+        expect(typeof action).toBe('string');
+        expect(COMMAND_TYPES).toContain(action);
       }
     }
   });
@@ -101,7 +124,7 @@ describe('§4 HTTP 契约：POST /api/capture', () => {
     expect(proposal.ok).toBe(true);
     expect(proposal.data).toMatchObject({ status: 'proposed', kind: 'capture_task', degraded: false });
     expect(proposal.data.details.task.title).toContain('李四');
-    expect(proposal.data.available_actions.map((a: any) => a.id)).toEqual(['accept_proposal', 'reject_proposal']);
+    expect(proposal.data.available_actions).toEqual(['proposal_accept', 'proposal_reject']);
 
     const events = await booted.harness.store.readStream(DEFAULT_PROJECT_ID, 1);
     expect(events.some((e) => e.type === 'FeedbackReceived' && (e.payload as Record<string, unknown>)['capture_id'] === body.data.capture_id)).toBe(true);

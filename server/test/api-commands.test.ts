@@ -53,7 +53,7 @@ describe('POST /api/commands：完整旅途（捕获 → 提议 → 接受 → M
     let actions = await jsonOf(await api(booted, '/api/actions'));
     let item = actions.data.items.find((i: any) => i.task_id === task_id);
     expect(item).toBeTruthy();
-    expect(item.available_actions.map((a: any) => a.id)).toContain('next_lifecycle');
+    expect(item.available_actions).toContain('task_advance');
 
     // defined → ready → active（active 同时建 human_light Run）
     const ready = await command({ type: 'task_advance', payload: { task_id }, client_submit_id: 'journey-1-ready' });

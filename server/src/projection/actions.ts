@@ -6,6 +6,18 @@
 import { guardTransition, guardWaitStateChange, type GuardFacts } from '../../../src/kernel/transition-guard.ts';
 import type { ProjectionSnapshot, RunRecord, TaskRecord } from './projection.ts';
 
+/** 命令词表（FIX-ROUND-1 R-1 定版）：HTTP 与 available_actions 只说这 6 个 canonical 值。 */
+export const COMMAND_TYPES = [
+  'proposal_accept',
+  'proposal_reject',
+  'task_advance',
+  'feedback_submit',
+  'acceptance_record',
+  'task_cancel',
+] as const;
+
+export type CommandType = (typeof COMMAND_TYPES)[number];
+
 export type TaskActionId =
   | 'next_lifecycle'
   | 'submit_feedback'
@@ -28,7 +40,7 @@ export interface AvailableAction {
   id: TaskActionId;
   label: string;
   next: NextTransition | null;
-  command_type: string | null;
+  command_type: CommandType | null;
   /** 该动作要求的 verdict（验收类动作） */
   verdict?: 'accepted' | 'rejected' | 'partially_accepted';
 }
@@ -161,20 +173,26 @@ export function computeAvailableActions(
     }
   }
 
-  // wait_state 人工解除（§3.1：非终态可叠加/解除；device 等待归入 blocked）
-  if (['waiting_on_person', 'waiting_until', 'waiting_on_dependency', 'blocked', 'on_hold'].includes(task.wait_state)) {
-    const guard = guardWaitStateChange({ lifecycle: task.lifecycle, from: task.wait_state, to: 'none', reason: '人工解除等待' });
-    if (guard.allowed) {
-      actions.push({
-        id: 'release_block',
-        label: '解除等待',
-        next: { type: 'task_wait_state', from: task.wait_state, to: 'none', guard: 'allowed', facts_needed: [] },
-        command_type: 'wait_state_change',
-      });
-    }
+  // wait_state 人工解除（§3.1：非终态可叠加/解除；device 等待归入 blocked）。
+  // K0 命令词表（FIX-ROUND-1 R-1）里没有 wait_state_change：内部动作不对外暴露，
+  // 否则 available_actions 会出现一条执行不了的命令。解除等待留给 K1 契约补口径。
+  if (resolveWaitStateAllowed(task)) {
+    actions.push({
+      id: 'release_block',
+      label: '解除等待（K0 无对应命令，仅提示）',
+      next: { type: 'task_wait_state', from: task.wait_state, to: 'none', guard: 'allowed', facts_needed: [] },
+      command_type: null,
+    });
   }
 
   return actions;
+}
+
+function resolveWaitStateAllowed(task: TaskRecord): boolean {
+  return (
+    ['waiting_on_person', 'waiting_until', 'waiting_on_dependency', 'blocked', 'on_hold'].includes(task.wait_state) &&
+    guardWaitStateChange({ lifecycle: task.lifecycle, from: task.wait_state, to: 'none', reason: '人工解除等待' }).allowed
+  );
 }
 
 export function hasLiveRun(snapshot: ProjectionSnapshot, task_id: string): boolean {

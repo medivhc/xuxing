@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { Pool } from 'pg';
 import { ulid } from 'ulid';
-import { fail, ok } from './http.ts';
+import { fail, ok, type HealthData, type RuntimeLimits } from './http.ts';
 import { actionsView, homeView, projectView, proposalView } from './views.ts';
 import type { ProjectionService } from '../projection/service.ts';
 import type { Proposer } from '../proposers/proposer.ts';
@@ -29,6 +29,18 @@ export interface AppContext {
   clock: () => Date;
   defaultProjectId: string;
   defaultActorId: string;
+}
+
+/**
+ * health 对外暴露的背压参数（FIX-ROUND-1 R-3）：唯一来源是注入的 SSE 配置（app.ts 里由
+ * sseOptionsFromEnv / 测试显式传入），这里不做任何兜底常量，避免出现第二份硬编码。
+ */
+export function limitsOf(sse: SseOptions): RuntimeLimits {
+  return {
+    heartbeat_ms: sse.heartbeatMs,
+    max_connections: sse.maxConnections,
+    max_queue: sse.queueLimit,
+  };
 }
 
 /** 当前用户（K0 单用户；多用户/权限属 K2，不在这里发明）。 */
@@ -85,6 +97,7 @@ export function createApp(ctx: AppContext): Hono {
   });
 
   // ---- GET /api/health ----
+  // 信封与全部端点一致（FIX-ROUND-1 R-2）：外层 ok 表示"服务在应答"，data 里再区分运行时状态。
   app.get('/api/health', async (c) => {
     let db = false;
     try {
@@ -93,7 +106,14 @@ export function createApp(ctx: AppContext): Hono {
     } catch {
       db = false;
     }
-    return c.json({ ok: true, db, projection_version: ctx.projection.version() });
+    return c.json(
+      ok<HealthData>({
+        ok: db,
+        db,
+        projection_version: ctx.projection.version(),
+        limits: limitsOf(ctx.sse),
+      }),
+    );
   });
 
   // ---- GET /api/home ----

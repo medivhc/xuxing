@@ -17,8 +17,22 @@ export interface ProjectionMeta {
   projection_version: number;
 }
 
-/** 错误响应：code 机器可读，message 人类可读，detail 附可判定依据。 */
-export interface ApiError {
+/** SSE 背压参数的对外投影（FIX-ROUND-1 R-3）：数值一律来自 SseOptions，不另起常量。 */
+export interface RuntimeLimits {
+  heartbeat_ms: number;
+  max_connections: number;
+  max_queue: number;
+}
+
+/** GET /api/health 的 data（FIX-ROUND-1 R-2：health 也走 {ok:true,data} 信封）。 */
+export interface HealthData extends ProjectionMeta {
+  /** 运行时可用性：DB 连得上才算 ok */
+  ok: boolean;
+  db: boolean;
+  limits: RuntimeLimits;
+}
+
+/** 错误响应：code 机器可读，message 人类可读，detail 附可判定依据。 */export interface ApiError {
   ok: false;
   error: {
     code: string;

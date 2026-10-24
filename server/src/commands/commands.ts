@@ -12,7 +12,8 @@ import { IdempotencyKeyConflictError } from '../../../src/kernel/event-store-pg.
 import type { EventEnvelope } from '../../../src/kernel/events.ts';
 import { guardWaitStateChange } from '../../../src/kernel/transition-guard.ts';
 import type { AcceptanceCriterion, CriterionResult, ProjectionSnapshot, TaskRecord } from '../projection/projection.ts';
-import { activeHumanRun, computeAvailableActions } from '../projection/actions.ts';
+import { activeHumanRun, computeAvailableActions, COMMAND_TYPES, type CommandType } from '../projection/actions.ts';
+import { availableCommands } from '../api/views.ts';
 import type { ProjectionService } from '../projection/service.ts';
 import type { Proposer } from '../proposers/proposer.ts';
 
@@ -23,13 +24,7 @@ export interface CommandContext {
   clock: () => Date;
 }
 
-export type CommandType =
-  | 'proposal_accept'
-  | 'proposal_reject'
-  | 'task_advance'
-  | 'feedback_submit'
-  | 'acceptance_record'
-  | 'task_cancel';
+export { COMMAND_TYPES, type CommandType };
 
 export class CommandDeniedError extends Error {
   readonly detail: Record<string, unknown>;
@@ -428,7 +423,7 @@ async function taskAdvance(
       task_id,
       lifecycle: task.lifecycle,
       wait_state: task.wait_state,
-      available_actions: actions.map((a) => a.id),
+      available_actions: availableCommands(actions),
     });
   }
   const to = typeof payload.to === 'string' ? payload.to : (advance.next.type === 'task_lifecycle' ? advance.next.to : null);
@@ -546,7 +541,7 @@ async function feedbackSubmit(
         task_id,
         lifecycle: task.lifecycle,
         wait_state: task.wait_state,
-        available_actions: actions.map((a) => a.id),
+        available_actions: availableCommands(actions),
       },
     );
   }

@@ -2,12 +2,25 @@
 // 视图只做"投影 → 响应"的形状映射，不重算任何状态判定：available_actions 来自 projection/actions.ts（内核 guard）。
 
 import type { ProjectionSnapshot } from '../projection/projection.ts';
-import { computeAvailableActions, isActionableFor } from '../projection/actions.ts';
+import { computeAvailableActions, isActionableFor, type AvailableAction, type CommandType } from '../projection/actions.ts';
 import type { ProjectionMeta } from '../api/http.ts';
 
 export interface Actor {
   /** 当前用户（K0 单用户；由请求头 x-xuxing-actor 注入，缺省 demo 用户） */
   actor_id: string;
+}
+
+/**
+ * available_actions 的对外形态（FIX-ROUND-1 R-1 定版）：canonical command_type 字符串数组。
+ * 去重保序——同一命令可对应多种 verdict（如 acceptance_record 的三档），对外只说"能做这个命令"。
+ */
+export function availableCommands(actions: AvailableAction[]): CommandType[] {
+  const seen: CommandType[] = [];
+  for (const action of actions) {
+    if (action.command_type === null) continue;
+    if (!seen.includes(action.command_type)) seen.push(action.command_type);
+  }
+  return seen;
 }
 
 function taskSummary(task: ProjectionSnapshot['tasks'][number], snapshot: ProjectionSnapshot, actor: Actor) {
@@ -44,7 +57,7 @@ function taskSummary(task: ProjectionSnapshot['tasks'][number], snapshot: Projec
       kind: wc.kind,
       target_ref: wc.target_ref,
     })),
-    available_actions: actions,
+    available_actions: availableCommands(actions),
     updated_global_seq: task.updated_global_seq,
   };
 }
@@ -160,7 +173,7 @@ export interface ActionItem {
   lifecycle: string;
   wait_state: string;
   next_action: string;
-  available_actions: ReturnType<typeof computeAvailableActions>;
+  available_actions: CommandType[];
   updated_global_seq: number;
 }
 
@@ -178,7 +191,7 @@ export function myActionItems(snapshot: ProjectionSnapshot, actor: Actor): Actio
         lifecycle: task.lifecycle,
         wait_state: task.wait_state,
         next_action: actions[0]?.label ?? '',
-        available_actions: actions,
+        available_actions: availableCommands(actions),
         updated_global_seq: task.updated_global_seq,
       };
     })
@@ -290,7 +303,7 @@ export interface ProposalView extends ProjectionMeta {
   };
   details: unknown;
   created_at: string;
-  available_actions: Array<{ id: string; command_type: string }>;
+  available_actions: CommandType[];
 }
 
 export function proposalView(snapshot: ProjectionSnapshot, proposal_id: string): ProposalView | null {
@@ -315,11 +328,6 @@ export function proposalView(snapshot: ProjectionSnapshot, proposal_id: string):
     proposer: proposal.proposer,
     details: proposal.details,
     created_at: proposal.created_at,
-    available_actions: acceptable
-      ? [
-        { id: 'accept_proposal', command_type: 'proposal_accept' },
-        { id: 'reject_proposal', command_type: 'proposal_reject' },
-      ]
-      : [],
+    available_actions: acceptable ? ['proposal_accept', 'proposal_reject'] : [],
   };
 }
