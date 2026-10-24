@@ -53,6 +53,23 @@ export interface CriterionResult {
   evidence_refs: string[];
 }
 
+export interface EvidenceRecord {
+  evidence_id: string;
+  project_id: string;
+  task_id: string | null;
+  source_kind: string;
+  content_ref: string;
+  content_hash: string;
+  verification_status: string;
+  /** 写入通道：direct（通用写路径）/ tool_gateway（INV-6 网关，含 gateway_id 审计）。 */
+  recorded_via: string;
+  gateway_id: string | null;
+  actor_id: string;
+  actor_kind: string;
+  created_at: string;
+  updated_global_seq: number;
+}
+
 export interface AcceptanceRecord {
   acceptance_id: string;
   task_id: string;
@@ -207,6 +224,7 @@ export interface ProjectionSnapshot {
   feedbacks: FeedbackRecord[];
   outcomes: OutcomeRecord[];
   proposals: ProposalRecord[];
+  evidences: EvidenceRecord[];
   /** 最近的全局事件摘要（新到旧，最多 retention 条），供 Home 最近活动使用。 */
   recent_events: EventSummary[];
 }
@@ -261,6 +279,7 @@ export class XuxingProjection {
   private readonly feedbacks = new Map<string, FeedbackRecord>();
   private readonly outcomes = new Map<string, OutcomeRecord>();
   private readonly proposals = new Map<string, ProposalRecord>();
+  private readonly evidences = new Map<string, EvidenceRecord>();
   private recent: EventSummary[] = [];
 
   apply(event: EventEnvelope): void {
@@ -537,6 +556,25 @@ export class XuxingProjection {
         });
         return;
       }
+      case 'EvidenceAdded': {
+        const id = optStr(p, 'evidence_id') ?? optStr(p, 'id') ?? `ev_${event.id}`;
+        this.evidences.set(id, {
+          evidence_id: id,
+          project_id: event.stream_id,
+          task_id: optStr(p, 'task_id'),
+          source_kind: optStr(p, 'source_kind') ?? 'external_doc',
+          content_ref: optStr(p, 'content_ref') ?? '',
+          content_hash: optStr(p, 'content_hash') ?? '',
+          verification_status: optStr(p, 'verification_status') ?? 'unverified',
+          recorded_via: optStr(p, 'recorded_via') ?? 'direct',
+          gateway_id: optStr(p, 'gateway_id'),
+          actor_id: event.actor_id,
+          actor_kind: event.actor_kind,
+          created_at: event.occurred_at,
+          updated_global_seq: event.global_seq,
+        });
+        return;
+      }
       case 'AcceptanceSuperseded': {
         const id = str(p, 'acceptance_id', event);
         const acceptance = this.acceptances.get(id);
@@ -606,7 +644,6 @@ export class XuxingProjection {
       case 'TaskDuplicateResolved':
       case 'EdgeAdded':
       case 'EdgeRemoved':
-      case 'EvidenceAdded':
       case 'EvidenceSuperseded':
       case 'DecisionCreated':
       case 'DecisionResolved':
@@ -671,6 +708,7 @@ export class XuxingProjection {
       feedbacks: byKey([...this.feedbacks.values()], (r) => r.feedback_id),
       outcomes: byKey([...this.outcomes.values()], (r) => r.outcome_id),
       proposals: byKey([...this.proposals.values()], (r) => r.proposal_id),
+      evidences: byKey([...this.evidences.values()], (r) => r.evidence_id),
       recent_events: [...this.recent],
     };
   }

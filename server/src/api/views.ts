@@ -48,6 +48,8 @@ function taskSummary(task: ProjectionSnapshot['tasks'][number], snapshot: Projec
       ? null
       : {
         acceptance_id: acceptance.acceptance_id,
+        acceptor_id: acceptance.acceptor_id,
+        acceptor_kind: acceptance.acceptor_kind,
         verdict: acceptance.verdict,
         criterion_results: acceptance.criterion_results,
         created_at: acceptance.created_at,
@@ -401,6 +403,11 @@ export interface ProjectView extends ProjectionMeta {
     edges: Array<{ from: string; to: string; kind: string }>;
   };
   pending_proposals: Array<{ proposal_id: string; kind: string; status: string; degraded: boolean; rationale: string; created_at: string }>;
+  evidences: Array<{
+    evidence_id: string; task_id: string | null; source_kind: string; content_ref: string;
+    content_hash: string; verification_status: string; recorded_via: string; gateway_id: string | null;
+    actor_id: string; actor_kind: string; created_at: string;
+  }>;
 }
 
 export function projectView(snapshot: ProjectionSnapshot, project_id: string, actor: Actor): ProjectView | null {
@@ -452,6 +459,15 @@ export function projectView(snapshot: ProjectionSnapshot, project_id: string, ac
         degraded: p.proposer.degraded,
         rationale: p.rationale,
         created_at: p.created_at,
+      })),
+    evidences: snapshot.evidences
+      .filter((e) => e.project_id === project_id)
+      .map((e) => ({
+        evidence_id: e.evidence_id, task_id: e.task_id, source_kind: e.source_kind,
+        content_ref: e.content_ref, content_hash: e.content_hash,
+        verification_status: e.verification_status, recorded_via: e.recorded_via,
+        gateway_id: e.gateway_id, actor_id: e.actor_id, actor_kind: e.actor_kind,
+        created_at: e.created_at,
       })),
   };
 }

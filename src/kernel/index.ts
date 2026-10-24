@@ -7,3 +7,5 @@ export * from "./event-store-pg.js";
 export * from "./run-events.js";
 export * from "./scheduler.js";
 export * from "./acceptance.js";
+export * from "./actor-guard.js";
+export * from "./tool-gateway.js";

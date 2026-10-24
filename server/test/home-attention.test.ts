@@ -128,6 +128,7 @@ function makeSnapshot(overrides: Partial<ProjectionSnapshot>): ProjectionSnapsho
     feedbacks: [],
     outcomes: [],
     proposals: [],
+    evidences: [],
     recent_events: [
       { seq: 10, kind: 'TaskLifecycleChanged', stream_id: 'proj-x', task_id: 'task-acc', proposal_id: null, occurred_at: '2026-10-21T09:00:00.000Z' },
     ],

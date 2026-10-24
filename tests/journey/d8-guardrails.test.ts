@@ -402,7 +402,7 @@ describe('INV-13 幂等键：同键同内容是重放，同键不同内容是错
         stream_id: D8.project, type: 'EvidenceAdded', ...KERNEL,
         causation_id: null, correlation_id: 'd9-guardrails', idempotency_key: 'd9-idem-1',
         payload: {
-          evidence_id: 'ev-d9-idem', task_id: D8.importTask, source_kind: 'tool_output',
+          evidence_id: 'ev-d9-idem', task_id: D8.importTask, source_kind: 'device_log',
           content_ref: 'object://d9/other', content_hash: '1'.repeat(64),
           captured_at: FIXED_NOW.toISOString(), environment: 'sandbox', verification_status: 'unverified',
         },
