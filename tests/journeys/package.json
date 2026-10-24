@@ -1,0 +1,21 @@
+{
+  "name": "@xuxing/journey-tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "K0 Web 车道 C：Playwright 旅程 + SSE 协议级测试（对 tests/journeys/mock 跑）",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "mock": "node --experimental-strip-types mock/server.mts",
+    "test": "playwright test -c playwright.config.mts",
+    "test:headed": "playwright test -c playwright.config.mts --headed",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.0"
+  }
+}

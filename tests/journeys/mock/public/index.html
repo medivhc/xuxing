@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>续行 · 旅程控制台（mock）</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">续行 <span class="muted">K0 旅程控制台</span></div>
+      <nav>
+        <a data-testid="nav-home" href="#/home">Home</a>
+        <a data-testid="nav-capture" href="#/capture">Capture</a>
+        <a data-testid="nav-actions" href="#/actions">My Actions</a>
+      </nav>
+    </header>
+    <main id="app" aria-live="polite"></main>
+    <footer class="footer muted">
+      UI 的所有领域状态都来自投影接口；本页不自行推导 lifecycle / goal_status / available_actions。
+    </footer>
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>
