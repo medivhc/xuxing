@@ -3,8 +3,9 @@
 // 纪律（任务书）：
 // - 只拦 /api/*；其余请求（Vite HMR、静态资源等）交还原 fetch；
 // - 与 api/ 客户端严格分离：客户端只见真实 HTTP 语义（状态码/信封/流）；
-// - 错误信封与真实服务端同构：{error:{code,message,request_id,detail}}；
-// - 命令 202 + receipt；409 原样透出原因码；GET 失败给 404/400。
+// - 全端点统一信封（FIX-ROUND-1 R-2）：成功 {ok:true, data}、失败
+//   {ok:false, error:{code,message,request_id,detail}}，health 亦然；
+// - 命令 202 + {ok:true, data:receipt}；409 原样透出原因码；GET 失败给 404/400。
 
 import { ulid } from '../lib/ulid';
 import { assertCommandShape, handleCapture, handleCommand } from './commands';
@@ -29,9 +30,15 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+/** 统一成功信封：{ok:true, data}（R-2：全部端点同一形状）。 */
+function okResponse(data: unknown, status = 200): Response {
+  return jsonResponse({ ok: true, data }, status);
+}
+
 function errorResponse(error: MockHttpError): Response {
   return jsonResponse(
     {
+      ok: false,
       error: {
         code: error.code,
         message: error.message,
@@ -76,17 +83,18 @@ async function route(store: MockStore, url: URL, init?: RequestInit): Promise<Re
 
   if (path === '/api/health' && method === 'GET') {
     await sleep(mockLatency.read);
-    return jsonResponse({ ok: true });
+    // health 亦统一信封：data 内 {ok, db, projection_version}（R-2）
+    return okResponse({ ok: true, db: 'ok', projection_version: store.currentSeq() });
   }
 
   if (path === '/api/home' && method === 'GET') {
     await sleep(mockLatency.read);
-    return jsonResponse(store.homeProjection());
+    return okResponse(store.homeProjection());
   }
 
   if (path === '/api/actions' && method === 'GET') {
     await sleep(mockLatency.read);
-    return jsonResponse(store.actionsProjection());
+    return okResponse(store.actionsProjection());
   }
 
   const projectMatch = path.match(/^\/api\/projects\/([^/]+)$/);
@@ -94,7 +102,7 @@ async function route(store: MockStore, url: URL, init?: RequestInit): Promise<Re
     await sleep(mockLatency.read);
     const projection = store.projectProjection(decodeURIComponent(projectMatch[1]));
     if (!projection) throw MockHttpError.notFound('project_not_found', '项目不存在');
-    return jsonResponse(projection);
+    return okResponse(projection);
   }
 
   const proposalMatch = path.match(/^\/api\/proposals\/([^/]+)$/);
@@ -102,7 +110,7 @@ async function route(store: MockStore, url: URL, init?: RequestInit): Promise<Re
     await sleep(mockLatency.read);
     const projection = store.proposalProjection(decodeURIComponent(proposalMatch[1]));
     if (!projection) throw MockHttpError.notFound('proposal_not_found', '提议不存在');
-    return jsonResponse(projection);
+    return okResponse(projection);
   }
 
   if (path === '/api/capture' && method === 'POST') {
@@ -111,7 +119,7 @@ async function route(store: MockStore, url: URL, init?: RequestInit): Promise<Re
     if (typeof body.client_submit_id !== 'string' || body.client_submit_id.trim() === '') {
       throw MockHttpError.badRequest('invalid_capture', 'capture 缺少 client_submit_id（幂等键）');
     }
-    return jsonResponse(
+    return okResponse(
       handleCapture(store, {
         text: typeof body.text === 'string' ? body.text : '',
         client_submit_id: body.client_submit_id,
@@ -124,7 +132,7 @@ async function route(store: MockStore, url: URL, init?: RequestInit): Promise<Re
     const command = assertCommandShape(await readJsonBody(init));
     const receipt = handleCommand(store, command);
     // 202 = 已受理（P 层待确认），不表示领域动作已完成（§0.5）
-    return jsonResponse(receipt, 202);
+    return okResponse(receipt, 202);
   }
 
   throw MockHttpError.notFound('route_not_found', `mock 未实现的路由：${method} ${path}`);
@@ -132,7 +140,7 @@ async function route(store: MockStore, url: URL, init?: RequestInit): Promise<Re
 
 export function createMockFetch(store: MockStore): typeof fetch {
   const originalFetch = globalThis.fetch.bind(globalThis);
-  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const rawUrl =
       typeof input === 'string'
         ? input

@@ -31,8 +31,9 @@ VITE_API_MOCK=1 npm run build      # mock 编入 bundle（仅开发联调用，�
 ## 边界（任务书红线）
 
 - `api/` 下任何模块**不得** import `mock/`；mock 只在最外层替换 `globalThis.fetch`，
-  客户端（`api/client.ts`）看到的仍是真实 HTTP 语义：状态码、错误信封
-  `{error:{code,message,request_id,detail}}`、202 + receipt、SSE 帧格式。
+  客户端（`api/client.ts`）看到的仍是真实 HTTP 语义：状态码、统一信封
+  （成功 `{ok:true, data}` / 失败 `{ok:false, error:{code,message,request_id,detail}}`，FIX-ROUND-1 R-2）、
+  202 + receipt、SSE 帧格式。
 - mock 不修改内核事件目录：广播的事件 `kind` 全部来自内核封闭集（`src/kernel/events.ts`）。
 - 非 `/api/*` 请求（Vite HMR、静态资源）交还原 fetch。
 
@@ -104,6 +105,6 @@ mock 对「验收 actor == 执行 actor」返回 409 `forbidden`；seed-2 的 `e
 | `store.ts` | 内存事件日志、幂等回执、投影构建、控制面状态 |
 | `commands.ts` | 命令处理（canonical 词表 5 个界面入口；`task_advance` 按生命周期分派开始/完成）+ capture 处理（409 原因码、覆盖完整性、继承锁定、迁移矩阵） |
 | `sse-stream.ts` | SSE 帧格式化、游标补发、心跳、abort 清理 |
-| `handlers.ts` | 8 端点路由、错误信封、模拟时延 |
+| `handlers.ts` | 8 端点路由、统一信封（`{ok,data}`/`{ok:false,error}`）、模拟时延 |
 | `errors.ts` | `MockHttpError`（409/404/400 静态构造） |
 | `install.ts` | fetch 补丁 + `window.__xuxMock` 控制面 + `isMockEnabled()` |

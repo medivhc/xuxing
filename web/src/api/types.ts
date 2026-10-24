@@ -22,6 +22,7 @@ export type TaskWaitState =
   | 'waiting_on_person'
   | 'waiting_until'
   | 'waiting_on_dependency'
+  | 'waiting_until'
   | 'blocked'
   | 'on_hold';
 
@@ -309,6 +310,13 @@ export interface StreamEvent {
   [key: string]: unknown;
 }
 
+/**
+ * health 端点信封内的 data（FIX-ROUND-1 R-2：health 与其他端点同样统一信封，
+ * 响应为 {ok:true, data:{...}}；http 层解包后业务只拿下面的形状）。
+ */
 export interface HealthResponse {
-  ok: true;
+  ok: boolean;
+  /** 数据库连接态（如 'ok'）；K0 界面未消费，仅客户端保留端点封装。 */
+  db: string;
+  projection_version: number;
 }
