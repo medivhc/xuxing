@@ -135,76 +135,83 @@ export interface ActionItem {
 }
 
 // ---------- Project（GET /api/projects/:projectId） ----------
+// 形状以服务端 server/src/api/views.ts 的 ProjectView 为准（FIX-ROUND-3 对齐真投影）。
+// 此前本节按 mock 形状写：acceptance_status 是 {awaiting_task_ids, recorded_count,
+// outstanding}、任务行带 acceptance_summary——真投影两样都没有，项目页一读即崩
+// （CLICK-AUDIT §2-2）。前端不许再造字段：缺的展示信息按契约缺口登记，不前端推断。
 
-/**
- * 项目级验收摘要（FIX-ROUND-1 R-8 新增键）。
- * 口径为内核计算，前端只呈现、不自行统计（与 rank/verdict 同纪律）。
- */
+/** 项目级验收计数（服务端计算：按 lifecycle 与有效 Acceptance 统计，前端只呈现） */
 export interface ProjectAcceptanceStatus {
-  /** awaiting_acceptance 任务 id —— Project 是验收动作落点（OQ-02=A） */
-  awaiting_task_ids: string[];
-  /** 已落 AcceptanceRecorded 最终 verdict 的任务数 */
-  recorded_count: number;
-  /** partially_accepted 且仍有待补判据的任务（部分通过待续） */
-  outstanding: Array<{ task_id: string; title: string; pending_criteria: string[] }>;
+  accepted: number;
+  awaiting: number;
+  rejected: number;
+  total: number;
+  /** 有效验收的逐判据结果汇总（服务端平铺，前端只呈现） */
+  criterion_summary: Array<{ task_id: string; criterion_ref: string; verdict: CriterionVerdict }>;
 }
 
-/**
- * 项目内待处理提议（FIX-ROUND-1 R-8 新增键）：从 Project 直达提议页。
- * 提议只携带 draft（标题 + 验收判据）；task_id 在提议接受后由服务端新发（R-11）。
- */
+/** 项目内待处理提议（真投影无 summary/capture_id/available_actions 键） */
 export interface PendingProposal {
   proposal_id: string;
-  capture_id: string;
-  summary: string;
+  kind: string;
+  status: string;
+  degraded: boolean;
+  /** 提议理由（列表展示文本以此为准） */
+  rationale: string;
   created_at: string;
-  /** 服务端广告的动作（canonical 词表，R-1） */
-  available_actions: string[];
 }
 
 export interface ProjectProjection extends ProjectionMeta {
   projection_id: 'project';
-  /** 项目标识（R-8：原顶层 project_id/name 收入此子对象） */
-  project: { project_id: string; name: string };
+  project: { project_id: string; name: string; policy_id: string; created_by: string };
   goal: {
+    goal_id: string;
     statement: string;
     success_criteria: string;
     stop_conditions: string;
-    status: 'active' | 'achieved' | 'abandoned';
+    status: string;
   } | null;
   tasks: ProjectTaskRow[];
   acceptance_status: ProjectAcceptanceStatus;
-  /** 聚焦子图（R-8：原 focused_subgraph 改名 graph），固定 1-hop depends_on + data_from，只读（OQ-09=A） */
+  /** 聚焦子图（服务端现口径：全部项目任务节点、edges 恒空；节点 id 即 task_id） */
   graph: ProjectGraph | null;
   pending_proposals: PendingProposal[];
 }
 
 export interface ProjectTaskRow {
   task_id: string;
+  project_id: string;
   title: string;
+  description: string;
   lifecycle: TaskLifecycle;
   wait_state: TaskWaitState;
+  assignee_kind: 'human' | 'agent';
+  assigned_by: string | null;
   duplicate_suspect: boolean;
+  capture_id: string | null;
+  proposal_id: string | null;
   current_contract_rev: number;
-  assignee: { actor_id: string; actor_kind: 'human' | 'agent' } | null;
-  active_run: { run_id: string; state: RunState; run_kind: 'executor' | 'human_light' } | null;
   last_outcome_id: string | null;
-  acceptance_summary: {
-    verdict: AcceptanceVerdict | null;
-    pending_criteria: string[];
-  };
+  feedback_count: number;
+  cancel_requested: boolean;
+  acceptance_criteria: AcceptanceCriterion[];
+  /** 最新有效验收摘要（服务端只给四键：id/verdict/逐判据结果/时间，非完整记录） */
+  acceptance: {
+    acceptance_id: string;
+    verdict: AcceptanceVerdict;
+    criterion_results: CriterionResult[];
+    created_at: string;
+  } | null;
+  active_wait_conditions: Array<{ wait_condition_id: string; kind: string; target_ref: string }>;
   available_actions: string[];
   updated_global_seq: number;
-  // [web 层补充] 逐判据验收表单（OQ-03=A）所需；服务端未提供时 UI 降级。
-  acceptance_criteria?: AcceptanceCriterion[];
-  criterion_results?: CriterionResult[];
-  acceptance?: AcceptanceRecord | null;
 }
 
 export interface AcceptanceCriterion {
   criterion_ref: string;
   text: string;
-  kind: 'auto' | 'manual';
+  /** 真形状为布尔（内核 AcceptanceCriterion.auto）；此前 web 按 kind:'auto'|'manual' 写，恒判错 */
+  auto: boolean;
 }
 
 export interface CriterionResult {
@@ -227,37 +234,55 @@ export interface AcceptanceRecord {
 }
 
 export interface ProjectGraph {
-  root_task_id: string;
-  nodes: Array<{ task_id: string; title: string; lifecycle: TaskLifecycle }>;
-  edges: Array<{
-    edge_id: string;
-    from_task: string;
-    to_task: string;
-    kind: 'depends_on' | 'data_from';
-    data_mode?: string;
-    release_override_active?: boolean;
-  }>;
+  nodes: Array<{ id: string; title: string; lifecycle: TaskLifecycle }>;
+  edges: Array<{ from: string; to: string; kind: string }>;
 }
 
 // ---------- Proposal（GET /api/proposals/:proposalId） ----------
+// 形状以服务端 ProposalView 为准（FIX-ROUND-3）：无 proposed/summary 键——草案在
+// details（按 kind 分派的联合）；降级原因在 proposer.degraded_reason；状态词为
+// proposed/applied/rejected/needs_decision。此前 web 按 pending + proposed.* 写，
+// 提议页读 data.proposed.title 直接崩（CLICK-AUDIT §2-3），且 pending 判定恒假。
+
+export type ProposalStatus = 'proposed' | 'applied' | 'rejected' | 'needs_decision';
+
+export type ProposalDetails =
+  | {
+      kind: 'capture_task';
+      task: {
+        title: string;
+        description: string;
+        assignee_kind: 'human' | 'agent';
+        acceptance_criteria: AcceptanceCriterion[];
+      };
+    }
+  | { kind: 'human_light_run'; task_id: string; suggested_run_kind: 'human_light'; next_action: string }
+  | { kind: 'wait_condition'; task_id: string; wait: { kind: string; target_ref: string; reason: string } };
 
 export interface ProposalProjection extends ProjectionMeta {
   projection_id: 'proposal';
   proposal_id: string;
-  capture_id: string;
   project_id: string;
-  /** 降级提议标记（任务书红线：必须在提议卡片上明示，不许隐藏） */
+  kind: string;
+  status: ProposalStatus;
+  status_reason: string | null;
+  capture_id: string | null;
+  /** 接受后服务端新发的任务 id（R-11：未接受时恒 null，本页不预分配） */
+  task_id: string | null;
+  rationale: string;
+  assumptions: string[];
+  risk_level: string;
+  /** 降级标记（任务书红线：必须在提议卡片上明示，不许隐藏） */
   degraded: boolean;
-  degraded_reason?: string | null;
-  status: 'pending' | 'accepted' | 'rejected' | 'expired';
-  created_at: string;
-  summary: string;
-  proposed: {
-    title: string;
-    description: string;
-    acceptance_criteria: AcceptanceCriterion[];
-    assignee_hint?: string | null;
+  proposer: {
+    source: 'model' | 'fallback';
+    model: string | null;
+    degraded: boolean;
+    degraded_reason: string | null;
+    latency_ms: number | null;
   };
+  details: ProposalDetails;
+  created_at: string;
   available_actions: string[];
 }
 

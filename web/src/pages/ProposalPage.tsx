@@ -5,9 +5,10 @@
 // - 接受 → 跳项目页（新任务在 My Actions/Project 可见）；
 // - 拒绝 → 离开提议页（封闭事件目录无「提议拒绝」事件，mock 不广播，
 //   交卷登记项；界面回到 Capture）；
-// - R-11：本页不展示、不预分配任何 task_id——提议只携带 draft（标题 +
-//   验收判据），task_id 在提议被接受后由服务端新发（本页与 mock 均无
-//   task_id 字段；登记见 web/README.md「已知边界」第 5 条）。
+// - R-11：task_id 在提议被接受后由服务端新发；投影 task_id 未接受时恒 null，
+//   本页不预分配、不展示。
+// - 形状（FIX-ROUND-3）：草案读 data.details.task.*（capture_task），降级原因
+//   读 data.proposer.degraded_reason，待处理判定为 status === 'proposed'。
 
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
@@ -63,7 +64,9 @@ export function ProposalPage() {
     );
   }
 
-  const isPending = data.status === 'pending';
+  const isPending = data.status === 'proposed';
+  // 草案在 details（按 kind 分派）：capture_task 才有 task 草案与判据（FIX-ROUND-3）
+  const taskDraft = data.details.kind === 'capture_task' ? data.details.task : null;
 
   return (
     <div className="space-y-5">
@@ -84,54 +87,101 @@ export function ProposalPage() {
               这是降级提议：解释器未能高置信度理解该捕获，接受前请人工核对。
             </p>
           </div>
-          {data.degraded_reason ? (
-            <p className="mt-2 text-body-s text-text-secondary">原因：{data.degraded_reason}</p>
+          {data.proposer.degraded_reason ? (
+            <p className="mt-2 text-body-s text-text-secondary">
+              原因：{data.proposer.degraded_reason}
+            </p>
           ) : null}
         </div>
       ) : null}
 
       <section className="rounded-m border border-border bg-surface p-5 shadow-1">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 className="text-title-s font-semibold text-text-primary">{data.summary}</h2>
+          <h2 className="text-title-s font-semibold text-text-primary">
+            {taskDraft ? taskDraft.title : '提议详情'}
+          </h2>
           <span className="text-caption text-text-tertiary">
             {formatAbsolute(data.created_at)} · 状态 {data.status}
+            {data.status_reason ? `（${data.status_reason}）` : ''}
           </span>
         </div>
-        <dl className="mt-3 space-y-1 text-body-s">
-          <div className="flex gap-2">
-            <dt className="shrink-0 text-text-tertiary">标题</dt>
-            <dd className="text-text-primary">{data.proposed.title}</dd>
-          </div>
-          <div className="flex gap-2">
-            <dt className="shrink-0 text-text-tertiary">描述</dt>
-            <dd className="text-text-secondary">{data.proposed.description}</dd>
-          </div>
-          {data.proposed.assignee_hint ? (
+        {data.rationale ? (
+          <p className="mt-2 text-body-s text-text-secondary">{data.rationale}</p>
+        ) : null}
+
+        {data.details.kind === 'capture_task' ? (
+          <>
+            <dl className="mt-3 space-y-1 text-body-s">
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-text-tertiary">标题</dt>
+                <dd className="text-text-primary">{data.details.task.title}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-text-tertiary">描述</dt>
+                <dd className="text-text-secondary">{data.details.task.description}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-text-tertiary">建议执行者</dt>
+                <dd className="text-body-s text-text-secondary">
+                  {data.details.task.assignee_kind === 'agent' ? 'Agent' : '人类'}
+                </dd>
+              </div>
+            </dl>
+
+            <h3 className="mt-4 text-body-s font-medium text-text-primary">
+              验收判据（{data.details.task.acceptance_criteria.length} 条）
+            </h3>
+            <ul className="mt-1 space-y-1">
+              {data.details.task.acceptance_criteria.map((criterion) => (
+                <li key={criterion.criterion_ref} className="flex gap-2 text-body-s">
+                  <span className="font-mono text-caption text-text-tertiary">
+                    {criterion.criterion_ref}
+                  </span>
+                  <span className="text-text-secondary">{criterion.text}</span>
+                  <span className="shrink-0 text-caption text-text-tertiary">
+                    {criterion.auto ? '自动' : '人工'}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </>
+        ) : data.details.kind === 'human_light_run' ? (
+          <dl className="mt-3 space-y-1 text-body-s">
             <div className="flex gap-2">
-              <dt className="shrink-0 text-text-tertiary">建议执行者</dt>
-              <dd className="font-mono text-body-s text-text-secondary">
-                {data.proposed.assignee_hint}
+              <dt className="shrink-0 text-text-tertiary">类型</dt>
+              <dd className="text-text-secondary">轻量执行建议（human_light）</dd>
+            </div>
+            <div className="flex gap-2">
+              <dt className="shrink-0 text-text-tertiary">关联任务</dt>
+              <dd className="font-mono text-body-s text-text-secondary">{data.details.task_id}</dd>
+            </div>
+            <div className="flex gap-2">
+              <dt className="shrink-0 text-text-tertiary">下一步</dt>
+              <dd className="text-text-secondary">{data.details.next_action}</dd>
+            </div>
+          </dl>
+        ) : (
+          <dl className="mt-3 space-y-1 text-body-s">
+            <div className="flex gap-2">
+              <dt className="shrink-0 text-text-tertiary">类型</dt>
+              <dd className="text-text-secondary">等待条件建议</dd>
+            </div>
+            <div className="flex gap-2">
+              <dt className="shrink-0 text-text-tertiary">关联任务</dt>
+              <dd className="font-mono text-body-s text-text-secondary">{data.details.task_id}</dd>
+            </div>
+            <div className="flex gap-2">
+              <dt className="shrink-0 text-text-tertiary">等待对象</dt>
+              <dd className="text-text-secondary">
+                {data.details.wait.kind} · {data.details.wait.target_ref}
               </dd>
             </div>
-          ) : null}
-        </dl>
-
-        <h3 className="mt-4 text-body-s font-medium text-text-primary">
-          验收判据（{data.proposed.acceptance_criteria.length} 条）
-        </h3>
-        <ul className="mt-1 space-y-1">
-          {data.proposed.acceptance_criteria.map((criterion) => (
-            <li key={criterion.criterion_ref} className="flex gap-2 text-body-s">
-              <span className="font-mono text-caption text-text-tertiary">
-                {criterion.criterion_ref}
-              </span>
-              <span className="text-text-secondary">{criterion.text}</span>
-              <span className="shrink-0 text-caption text-text-tertiary">
-                {criterion.kind === 'auto' ? '自动' : '人工'}
-              </span>
-            </li>
-          ))}
-        </ul>
+            <div className="flex gap-2">
+              <dt className="shrink-0 text-text-tertiary">原因</dt>
+              <dd className="text-text-secondary">{data.details.wait.reason}</dd>
+            </div>
+          </dl>
+        )}
       </section>
 
       {isPending ? (

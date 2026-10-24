@@ -12,7 +12,7 @@
 import { useState } from 'react';
 import type {
   AcceptanceCriterion,
-  AcceptanceRecord,
+  AcceptanceVerdict,
   CriterionResult,
   CriterionVerdict,
 } from '../../api/types';
@@ -76,7 +76,7 @@ function CriterionRow({ taskId, criterion, existing }: CriterionRowProps) {
         <div className="min-w-0">
           <p className="text-body-s text-text-primary">{criterion.text}</p>
           <p className="mt-0.5 text-mono text-caption text-text-tertiary">
-            {criterion.criterion_ref} · {criterion.kind === 'auto' ? '自动判据' : '人工判据'}
+            {criterion.criterion_ref} · {criterion.auto ? '自动判据' : '人工判据'}
           </p>
         </div>
         {existing ? (
@@ -177,7 +177,15 @@ export interface AcceptanceTaskLike {
   lifecycle: string;
   acceptance_criteria?: AcceptanceCriterion[];
   criterion_results?: CriterionResult[];
-  acceptance?: AcceptanceRecord | null;
+  /** 真投影的验收摘要只有 verdict/逐判据结果等少数键（server taskSummary）；
+   * mock 给完整 AcceptanceRecord。acceptor 等键仅在提供时呈现，不前端推断。 */
+  acceptance?: {
+    verdict: AcceptanceVerdict;
+    criterion_results?: CriterionResult[];
+    acceptor_id?: string;
+    contract_rev?: number;
+    superseded?: boolean;
+  } | null;
 }
 
 export function CriterionForm({ task }: { task: AcceptanceTaskLike }) {
@@ -197,7 +205,7 @@ export function CriterionForm({ task }: { task: AcceptanceTaskLike }) {
   }
 
   const criteria = task.acceptance_criteria;
-  const results = task.criterion_results ?? [];
+  const results = task.criterion_results ?? task.acceptance?.criterion_results ?? [];
   const recorded = new Set(results.map((r) => r.criterion_ref));
   const pendingRefs = criteria.filter((c) => !recorded.has(c.criterion_ref));
 
@@ -227,10 +235,12 @@ export function CriterionForm({ task }: { task: AcceptanceTaskLike }) {
               verdict={task.acceptance.verdict}
               testId="acceptance-current-verdict"
             />
-            <span className="text-caption text-text-tertiary">
-              验收者 {task.acceptance.acceptor_id} · 契约 rev {task.acceptance.contract_rev}
-              {task.acceptance.superseded ? ' · 已被新判论 supersede' : ''}
-            </span>
+            {task.acceptance.acceptor_id ? (
+              <span className="text-caption text-text-tertiary">
+                验收者 {task.acceptance.acceptor_id} · 契约 rev {task.acceptance.contract_rev}
+                {task.acceptance.superseded ? ' · 已被新判论 supersede' : ''}
+              </span>
+            ) : null}
           </div>
         ) : (
           <span className="text-text-secondary">尚无验收记录</span>

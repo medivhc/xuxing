@@ -115,7 +115,7 @@ function acceptProposal(store: MockStore, payload: Payload): void {
   const criteria = proposal.proposed.acceptance_criteria.map((criterion, index) => ({
     criterion_ref: `${taskId}/c${index + 1}`,
     text: criterion.text,
-    kind: criterion.kind,
+    auto: criterion.auto,
   }));
   const task: MockTaskState = {
     task_id: taskId,
@@ -492,8 +492,8 @@ export function handleCapture(
       title: text.slice(0, 24),
       description: `由捕获内容生成：${text}`,
       acceptance_criteria: [
-        { criterion_ref: 'c1', text: '产出可被独立核对', kind: 'manual' },
-        { criterion_ref: 'c2', text: '关键步骤有记录', kind: 'manual' },
+        { criterion_ref: 'c1', text: '产出可被独立核对', auto: false },
+        { criterion_ref: 'c2', text: '关键步骤有记录', auto: false },
       ],
       assignee_hint: MOCK_HUMAN_ACTOR,
     },

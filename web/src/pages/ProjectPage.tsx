@@ -1,10 +1,16 @@
 // Project（GET /api/projects/:projectId，契约 §5 P-*）：单项目工作台——
-// 概览（目标/验收摘要/待处理提议）、任务列表、逐判据验收（P-A5/OQ-03=A）、
-// 聚焦子图只读渲染（P-GRAPH/OQ-09=A：固定 1-hop depends_on + data_from，
-// 不显示 conflicts_with/supersedes，不允许编辑）。
+// 概览（目标/验收摘要/待处理提议）、任务列表、逐判据验收（P-A5/OQ-03=A）。
 //
-// 投影键集（FIX-ROUND-1 R-8）：{project, goal, tasks, acceptance_status,
-// graph, pending_proposals}——与真实投影一致，不再有 mock 漂移。
+// 投影键集以服务端 ProjectView 为准（FIX-ROUND-3 对齐真形状）：
+// {project, goal, tasks, acceptance_status{accepted, awaiting, rejected, total,
+// criterion_summary}, graph, pending_proposals}。此前按 mock 形状读
+// acceptance_status.awaiting_task_ids / outstanding 与 task.acceptance_summary，
+// 真投影无此二键，项目页一读即崩（CLICK-AUDIT §2-2）。
+//
+// 已知契约缺口（登记，不前端造字段）：
+// - 任务行无 Run 信息（mock 有 active_run，真 taskSummary 未给）——本页不展示 Run；
+// - graph 服务端现口径为「全项目任务节点 + edges 恒空」，P-GRAPH 的 1-hop
+//   聚焦子图（depends_on/data_from）未在服务端实现，本页按真形状只读呈现。
 //
 // 验收动作只落在 awaiting_acceptance 任务上（OQ-02=A：不进 My Actions，
 // 由 Home attention「待验收」跳转至此）。
@@ -19,6 +25,7 @@ import { useCommand } from '../features/commands/use-command';
 import { CriterionForm } from '../features/acceptance/CriterionForm';
 import {
   AcceptanceVerdictBadge,
+  CriterionVerdictBadge,
   LifecycleBadge,
   SyncBadge,
   WaitStateBadge,
@@ -32,6 +39,12 @@ function TaskCard({ task }: { task: ProjectTaskRow }) {
   const advance = useCommand({ type: 'task_advance' });
   const cancel = useCommand({ type: 'task_cancel' });
   const canStart = task.lifecycle === 'defined' || task.lifecycle === 'ready';
+  // 待补判据：已有有效验收（部分判定）时，判据清单中尚无结果的条数；
+  // 从未判定过的任务不在此冒充「待补」（其覆盖进度在验收表单内呈现）。
+  const recordedRefs = new Set((task.acceptance?.criterion_results ?? []).map((r) => r.criterion_ref));
+  const pendingCriteriaCount = task.acceptance
+    ? task.acceptance_criteria.filter((c) => !recordedRefs.has(c.criterion_ref)).length
+    : 0;
 
   return (
     <li
@@ -50,24 +63,28 @@ function TaskCard({ task }: { task: ProjectTaskRow }) {
                 疑似重复
               </span>
             ) : null}
+            {task.cancel_requested ? (
+              <span className="rounded-s bg-warning-subtle px-2 py-0.5 text-caption font-medium text-warning">
+                已请求取消
+              </span>
+            ) : null}
             <span className="text-caption text-text-tertiary">契约 rev {task.current_contract_rev}</span>
           </div>
           <p className="mt-1 text-body font-medium text-text-primary">{task.title}</p>
           <p className="mt-0.5 font-mono text-caption text-text-tertiary">{task.task_id}</p>
           <p className="mt-0.5 text-caption text-text-tertiary">
-            {task.assignee ? `执行者 ${task.assignee.actor_id}（${task.assignee.actor_kind}）` : '未指派'}
-            {task.active_run ? ` · Run ${task.active_run.run_id} ${task.active_run.state}` : ''}
+            执行者类型 {task.assignee_kind === 'agent' ? 'Agent' : '人类'}
+            {task.assigned_by ? ` · 由 ${task.assigned_by} 指派` : ''}
             {task.last_outcome_id ? ` · 产出 ${task.last_outcome_id}` : ''}
+            {task.feedback_count > 0 ? ` · 反馈 ${task.feedback_count} 条` : ''}
           </p>
         </div>
         <div className="flex shrink-0 flex-col items-end gap-1">
-          {task.acceptance_summary.verdict ? (
-            <AcceptanceVerdictBadge verdict={task.acceptance_summary.verdict} />
+          {task.acceptance?.verdict ? (
+            <AcceptanceVerdictBadge verdict={task.acceptance.verdict} />
           ) : null}
-          {task.acceptance_summary.pending_criteria.length > 0 ? (
-            <span className="text-caption text-warning">
-              待补 {task.acceptance_summary.pending_criteria.length} 条判据
-            </span>
+          {pendingCriteriaCount > 0 ? (
+            <span className="text-caption text-warning">待补 {pendingCriteriaCount} 条判据</span>
           ) : null}
           <span className="text-caption text-text-tertiary">seq {task.updated_global_seq}</span>
         </div>
@@ -166,6 +183,8 @@ export function ProjectPage() {
     );
   }
 
+  const taskTitleById = new Map(data.tasks.map((t) => [t.task_id, t.title]));
+
   return (
     <div className="space-y-6">
       <header className="flex items-center justify-between gap-3">
@@ -213,14 +232,20 @@ export function ProjectPage() {
       <section aria-label="验收摘要" className="rounded-m border border-border bg-surface p-5 shadow-1">
         <h2 className="text-title-s font-semibold text-text-primary">验收</h2>
         <p className="mt-2 text-body-s text-text-secondary">
-          待验收 {data.acceptance_status.awaiting_task_ids.length} 项 · 已记录{' '}
-          {data.acceptance_status.recorded_count} 项
+          已验收 {data.acceptance_status.accepted} 项 · 待验收 {data.acceptance_status.awaiting} 项 ·
+          已拒绝 {data.acceptance_status.rejected} 项 · 共 {data.acceptance_status.total} 项任务
         </p>
-        {data.acceptance_status.outstanding.length > 0 ? (
-          <ul data-testid="acceptance-outstanding" className="mt-2 space-y-1">
-            {data.acceptance_status.outstanding.map((item) => (
-              <li key={item.task_id} className="text-caption text-warning">
-                {item.title}（{item.task_id}）待补 {item.pending_criteria.length} 条判据
+        {data.acceptance_status.criterion_summary.length > 0 ? (
+          <ul data-testid="acceptance-criterion-summary" className="mt-2 space-y-1">
+            {data.acceptance_status.criterion_summary.map((item) => (
+              <li
+                key={`${item.task_id}:${item.criterion_ref}`}
+                className="flex flex-wrap items-center gap-2 text-caption text-text-secondary"
+              >
+                <span>
+                  {taskTitleById.get(item.task_id) ?? item.task_id}（{item.criterion_ref}）
+                </span>
+                <CriterionVerdictBadge verdict={item.verdict} />
               </li>
             ))}
           </ul>
@@ -237,11 +262,16 @@ export function ProjectPage() {
               <li key={proposal.proposal_id} className="flex items-center justify-between gap-2">
                 <Link
                   to={`/capture/${proposal.proposal_id}`}
-                  className="text-body-s text-accent hover:underline"
+                  className="min-w-0 truncate text-body-s text-accent hover:underline"
                 >
-                  {proposal.summary}
+                  {proposal.rationale}
                 </Link>
-                <span className="text-caption text-text-tertiary">
+                {proposal.degraded ? (
+                  <span className="shrink-0 rounded-s bg-warning-subtle px-2 py-0.5 text-caption font-medium text-warning">
+                    降级提议
+                  </span>
+                ) : null}
+                <span className="shrink-0 text-caption text-text-tertiary">
                   {formatAbsolute(proposal.created_at)}
                 </span>
               </li>
@@ -269,31 +299,28 @@ export function ProjectPage() {
 
       {data.graph ? (
         <section aria-label="聚焦子图" className="rounded-m border border-border bg-surface p-5 shadow-1">
-          <h2 className="text-title-s font-semibold text-text-primary">聚焦子图（只读）</h2>
+          <h2 className="text-title-s font-semibold text-text-primary">任务关系（只读）</h2>
           <p className="mt-1 text-caption text-text-tertiary">
-            固定 1-hop depends_on + data_from；不显示 conflicts_with/supersedes，不可编辑。
+            服务端当前仅提供项目任务节点清单（关系边未实现，见页首契约缺口登记）；不可编辑。
           </p>
           <ul data-testid="subgraph-nodes" className="mt-3 space-y-1">
             {data.graph.nodes.map((node) => (
-              <li key={node.task_id} className="flex items-center gap-2 text-body-s">
+              <li key={node.id} className="flex items-center gap-2 text-body-s">
                 <LifecycleBadge lifecycle={node.lifecycle} />
                 <span className="text-text-primary">{node.title}</span>
-                {node.task_id === data.graph?.root_task_id ? (
-                  <span className="text-caption text-text-tertiary">（根）</span>
-                ) : null}
               </li>
             ))}
           </ul>
           {data.graph.edges.length > 0 ? (
             <ul data-testid="subgraph-edges" className="mt-2 space-y-1">
-              {data.graph.edges.map((edge) => (
-                <li key={edge.edge_id} className="font-mono text-caption text-text-secondary">
-                  {edge.from_task} → {edge.to_task}（{edge.kind}）
+              {data.graph.edges.map((edge, index) => (
+                <li key={`${edge.from}-${edge.to}-${edge.kind}-${index}`} className="font-mono text-caption text-text-secondary">
+                  {edge.from} → {edge.to}（{edge.kind}）
                 </li>
               ))}
             </ul>
           ) : (
-            <p className="mt-2 text-caption text-text-tertiary">无关联任务。</p>
+            <p className="mt-2 text-caption text-text-tertiary">暂无关系边。</p>
           )}
         </section>
       ) : null}
