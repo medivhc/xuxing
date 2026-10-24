@@ -95,7 +95,16 @@ export function computeAvailableActions(
   }
 
   if (task.lifecycle === 'defined' && task.wait_state === 'none' && !task.duplicate_suspect) {
-    const check = lifecycleAction(task, 'ready', {});
+    // REQ-SCH-1 全公式：wait/duplicate 两项已由本函数的门槛条件给出；
+    // 依赖/数据/能力/策略在 K0 投影口径下无建模阻塞（命令层执行时由内核流派生复核）
+    const check = lifecycleAction(task, 'ready', {
+      waitStateNone: true,
+      duplicateSuspectFalse: true,
+      dependenciesSatisfied: true,
+      dataInputsAvailable: true,
+      capabilityAvailable: true,
+      policyAllows: true,
+    });
     if (check.ok) {
       actions.push({
         id: 'next_lifecycle',
@@ -107,7 +116,8 @@ export function computeAvailableActions(
   }
 
   if (task.lifecycle === 'ready' && task.wait_state === 'none' && !live) {
-    const check = lifecycleAction(task, 'active', {});
+    // 该动作即派发：命令层先建 Run 再迁移，runDispatched 由动作本身满足
+    const check = lifecycleAction(task, 'active', { runDispatched: true });
     if (check.ok) {
       actions.push({
         id: 'next_lifecycle',

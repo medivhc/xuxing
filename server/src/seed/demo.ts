@@ -241,6 +241,12 @@ export async function seedDemo(input: {
         trigger_event_id: key('trigger-task-ready'),
         from: 'defined',
         to: 'ready',
+        facts: {
+          dependenciesSatisfied: true,
+          dataInputsAvailable: true,
+          capabilityAvailable: true,
+          policyAllows: true,
+        },
         payload: { task_id: seed.task_id },
       });
       if (seed.stage === 'ready') return;
@@ -282,6 +288,7 @@ export async function seedDemo(input: {
         trigger_event_id: key('trigger-run-created'),
         from: 'ready',
         to: 'active',
+        facts: { runDispatched: seed.run !== undefined && seed.run !== 'none' },
         payload: { task_id: seed.task_id },
       });
       if (seed.stage === 'active') return;
@@ -312,12 +319,7 @@ export async function seedDemo(input: {
           facts: { allRunsTerminal: true },
           payload: { task_id: seed.task_id },
         });
-        await tx.append({
-          ...base,
-          type: 'TaskCanceled',
-          idempotency_key: key('canceled'),
-          payload: { task_id: seed.task_id, reason: seed.cancel_reason ?? 'seed_canceled' },
-        });
+        // TaskCanceled 由内核 appendStateTransition 的 REQ-RUN-6 收尾同事务落库（F2），此处不重复补发
         return;
       }
 

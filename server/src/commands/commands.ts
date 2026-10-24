@@ -308,6 +308,7 @@ async function acceptProposal(
       type: 'TaskLifecycleChanged',
       entity: 'task',
       idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc1`,
+      trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc1:trigger`,
       from: 'captured',
       to: 'defined',
       facts: {
@@ -494,13 +495,30 @@ async function taskAdvance(
       }));
     }
 
+    // guard facts 与投影动作判定同源：captured→defined 用任务本体事实；
+    // defined→ready 补 REQ-SCH-1 全公式（wait/duplicate 已由流派生并在上方复核）；
+    // ready→active 的 runDispatched 由本命令先建 Run 满足
+    const advanceFacts =
+      from === 'captured' && to === 'defined'
+        ? {
+            hasTitle: task.title.trim().length > 0,
+            assigneeKind: task.assignee_kind,
+            contractStructured: task.acceptance_criteria.length > 0,
+          }
+        : from === 'defined' && to === 'ready'
+          ? { dependenciesSatisfied: true, dataInputsAvailable: true, capabilityAvailable: true, policyAllows: true }
+          : from === 'ready' && to === 'active'
+            ? { runDispatched: true }
+            : {};
     addEmitted(emitted, (await tx.appendStateTransition({
       ...base,
       type: 'TaskLifecycleChanged',
       entity: 'task',
       idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc`,
+      trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc:trigger`,
       from,
       to,
+      facts: advanceFacts,
       payload: { task_id },
     })).event);
 
@@ -629,6 +647,7 @@ async function feedbackSubmit(
       type: 'TaskLifecycleChanged',
       entity: 'task',
       idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc`,
+      trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc:trigger`,
       from: 'active',
       to: 'awaiting_acceptance',
       payload: { task_id, outcome_id },
@@ -800,6 +819,7 @@ async function acceptanceRecord(
       type: 'TaskLifecycleChanged',
       entity: 'task',
       idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc`,
+      trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc:trigger`,
       from: task.lifecycle,
       to: action.next!.to,
       facts: { acceptanceVerdict: derived, needsReexecution: true, allRunsTerminal: true },
@@ -840,9 +860,10 @@ async function taskCancel(
   const task = snapshot.tasks.find((t) => t.task_id === task_id);
   if (!task) throw new CommandDeniedError(`任务 ${task_id} 不存在`, { reason: 'task_not_found' });
 
-  const actions = computeAvailableActions(task, snapshot, actor.actor_id);
-  const cancel = actions.find((a) => a.id === 'cancel_task');
-  if (!cancel || !cancel.next) {
+  // 取消命令本身就是 REQ-RUN-6 的第一步（落意图）：新 guard 语义下 cancel_task 动作
+  // 要意图已落才出现（见 projection/actions.ts），用动作复核作命令门会自锁；
+  // 故此处以终态判定为门，正式迁移仍由内核在落意图后以流派生 facts 复核。
+  if (task.lifecycle === 'accepted' || task.lifecycle === 'canceled') {
     throw new CommandDeniedError(`任务 ${task_id} 当前不可取消（lifecycle=${task.lifecycle}）`, {
       reason: 'not_in_available_actions',
       task_id,
@@ -856,7 +877,7 @@ async function taskCancel(
   // human_light Run 取消无确认环节，直接置 canceled（REQ-RUN-6②）
   const blocking = liveRuns.filter((r) => r.run_kind !== 'human_light');
   // 对账未结（存在非 human_light 在跑 Run）→ 只记取消意图，不正式置 canceled
-  const lifecycleTarget: string | null = blocking.length > 0 ? null : cancel.next.to;
+  const lifecycleTarget: string | null = blocking.length > 0 ? null : 'canceled';
   const emitted: EmittedEvent[] = [];
   const base = {
     stream_id: task.project_id,
@@ -905,8 +926,9 @@ async function taskCancel(
         type: 'TaskLifecycleChanged',
         entity: 'task',
         idempotency_key: `${receiptIdempotencyKey(client_submit_id)}:lc`,
-        from: task.lifecycle,
-        to: 'canceled',
+      trigger_event_id: `${receiptIdempotencyKey(client_submit_id)}:lc:trigger`,
+      from: task.lifecycle,
+      to: 'canceled',
         facts: { allRunsTerminal: true },
         payload: { task_id },
       })).event);
