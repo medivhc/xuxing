@@ -9,7 +9,7 @@
 import { ulid } from 'ulid';
 import type { PgEventStore, PgEventStoreTx } from '../../../src/kernel/event-store-pg.ts';
 import { IdempotencyKeyConflictError } from '../../../src/kernel/event-store-pg.ts';
-import type { EventEnvelope } from '../../../src/kernel/events.ts';
+import { asProjectId, type EventEnvelope, type ProjectId } from '../../../src/kernel/events.ts';
 import { guardWaitStateChange } from '../../../src/kernel/transition-guard.ts';
 import type { AcceptanceCriterion, CriterionResult, ProjectionSnapshot, TaskRecord } from '../projection/projection.ts';
 import { activeHumanRun, computeAvailableActions, COMMAND_TYPES, type CommandType } from '../projection/actions.ts';
@@ -244,7 +244,7 @@ async function acceptProposal(
   const emitted: EmittedEvent[] = [];
   const correlation_id = newCorrelationId();
   const base = {
-    stream_id: proposal.project_id,
+    stream_id: asProjectId(proposal.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
     causation_id: null,
@@ -340,7 +340,7 @@ async function acceptProposal(
 }
 
 function receipt(
-  base: { stream_id: string; actor_id: string; actor_kind: 'human' | 'agent' | 'system'; causation_id: string | null; correlation_id: string },
+  base: { stream_id: ProjectId; actor_id: string; actor_kind: 'human' | 'agent' | 'system'; causation_id: string | null; correlation_id: string },
   client_submit_id: string,
   command: CommandType,
   requestPayload: Record<string, unknown>,
@@ -381,7 +381,7 @@ async function rejectProposal(
   const reason = typeof payload.reason === 'string' ? payload.reason : 'user_rejected';
   const emitted: EmittedEvent[] = [];
   const base = {
-    stream_id: proposal.project_id,
+    stream_id: asProjectId(proposal.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
     causation_id: null,
@@ -439,7 +439,7 @@ async function taskAdvance(
 
   const emitted: EmittedEvent[] = [];
   const base = {
-    stream_id: task.project_id,
+    stream_id: asProjectId(task.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
     causation_id: null,
@@ -575,7 +575,7 @@ async function feedbackSubmit(
   const outcome_id = `out_${ulid()}`;
   const emitted: EmittedEvent[] = [];
   const base = {
-    stream_id: task.project_id,
+    stream_id: asProjectId(task.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
     causation_id: null,
@@ -766,7 +766,7 @@ async function acceptanceRecord(
   const acceptance_id = `acc_${ulid()}`;
   const emitted: EmittedEvent[] = [];
   const base = {
-    stream_id: task.project_id,
+    stream_id: asProjectId(task.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
     causation_id: null,
@@ -880,7 +880,7 @@ async function taskCancel(
   const lifecycleTarget: string | null = blocking.length > 0 ? null : 'canceled';
   const emitted: EmittedEvent[] = [];
   const base = {
-    stream_id: task.project_id,
+    stream_id: asProjectId(task.project_id),
     actor_id: actor.actor_id,
     actor_kind: actor.actor_kind,
     causation_id: null,

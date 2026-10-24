@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { EventEnvelope, EventType } from '../../src/kernel/events.ts';
+import { asProjectId, type EventEnvelope, type EventType } from '../../src/kernel/events.ts';
 import { XuxingProjection } from '../src/projection/projection.ts';
 import { computeAvailableActions, isActionableFor, COMMAND_TYPES } from '../src/projection/actions.ts';
 import { availableCommands } from '../src/api/views.ts';
@@ -11,7 +11,7 @@ function ev(type: EventType, stream_id: string, payload: unknown, extra: Partial
   seq += 1;
   return {
     id: `evt-${seq}`,
-    stream_id,
+    stream_id: asProjectId(stream_id),
     seq,
     global_seq: seq,
     type,

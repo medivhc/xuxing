@@ -9,7 +9,7 @@
 
 import { ulid } from 'ulid';
 import type { PgEventStore } from '../../../src/kernel/event-store-pg.ts';
-import type { EventEnvelope } from '../../../src/kernel/events.ts';
+import { asProjectId, type EventEnvelope } from '../../../src/kernel/events.ts';
 import type { Proposer } from '../proposers/proposer.ts';
 import type { ProjectionService } from '../projection/service.ts';
 
@@ -79,7 +79,7 @@ export async function runCapture(
 
   // 幂等：同 client_submit_id 重放 → 返回首次的 capture_id / proposal_id，不重复落事件
   const idemKey = captureIdempotencyKey(client_submit_id);
-  const prior = (await ctx.store.readStream(project_id, 1)).filter(
+  const prior = (await ctx.store.readStream(asProjectId(project_id), 1)).filter(
     (e) => e.idempotency_key === idemKey || e.idempotency_key === `${idemKey}:feedback`,
   );
   const first = prior.find((e) => e.idempotency_key === idemKey);
@@ -94,7 +94,7 @@ export async function runCapture(
     if (!proposal) {
       // 回执已入账但投影尚未并入（并发窗口）：直接把事件流增量并入后再查一次
       const current = ctx.projection.version();
-      const events = await ctx.store.readStream(project_id, 1);
+      const events = await ctx.store.readStream(asProjectId(project_id), 1);
       ctx.projection.ingest(events.filter((e) => e.global_seq > current));
     }
     const proposalAfter = ctx.projection.snapshot().proposals.find((p) => p.proposal_id === proposal_id);
@@ -125,7 +125,7 @@ export async function runCapture(
   const proposal_id = `pc_${ulid()}`;
   const now = ctx.clock().toISOString();
   const base = {
-    stream_id: project_id,
+    stream_id: asProjectId(project_id),
     actor_id: input.actor_id,
     actor_kind: 'human' as const,
     causation_id: null,

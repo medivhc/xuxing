@@ -7,7 +7,7 @@
 //   因为 global_seq 是全局序号，别的流先提交会留洞，而水位必须连续推进。
 
 import type { Pool } from 'pg';
-import type { EventEnvelope } from '../../../src/kernel/events.ts';
+import { asProjectId, type EventEnvelope } from '../../../src/kernel/events.ts';
 import type { PgEventStore } from '../../../src/kernel/event-store-pg.ts';
 import { XuxingProjection, type ProjectionSnapshot } from './projection.ts';
 
@@ -79,7 +79,7 @@ export function createProjectionService(pool: Pool, store: PgEventStore): Projec
       return () => listeners.delete(listener);
     },
     async streamSince(stream_id, after_seq) {
-      return store.readStream(stream_id, after_seq + 1);
+      return store.readStream(asProjectId(stream_id), after_seq + 1);
     },
   };
 }
