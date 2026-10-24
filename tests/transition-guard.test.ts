@@ -469,7 +469,7 @@ describe('§3.1/§3.2 前置条件（正向 + 反向）', () => {
       {
         requirement: 'agentContractStructured',
         fact: 'assigneeKind',
-        expected: "assigneeKind='human'|'agent'",
+        expected: "assigneeKind='human'|'agent'|'unassigned'",
       },
     ]);
     expect(result.unmet_requirements).toEqual([]);
@@ -864,5 +864,93 @@ describe('F10：acceptanceInvalidated 三值 OR 语义', () => {
       fact: 'acceptanceSuperseded',
       alternatives: ['declaresRevalidation'],
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 收尾杂项 pF8：unknown_state 区分 from/to 哪侧拼错 + assigneeKind 表达未指派
+// ---------------------------------------------------------------------------
+describe('pF8：unknown_state 区分未知侧', () => {
+  it('只有 from 拼错 → unknown_states 只含 from', () => {
+    const result = guardTransition({
+      entity: 'task', from: 'capturd', to: 'defined', event_type: 'TaskLifecycleChanged',
+    });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe('unknown_state');
+    expect(result.unknown_states).toEqual([{ field: 'from', value: 'capturd' }]);
+    expect(result.basis.note).toContain('from="capturd"');
+    expect(result.basis.note).not.toContain('to=');
+  });
+
+  it('只有 to 拼错 → unknown_states 只含 to', () => {
+    const result = guardTransition({
+      entity: 'task', from: 'captured', to: 'defind', event_type: 'TaskLifecycleChanged',
+    });
+    expect(result.reason).toBe('unknown_state');
+    expect(result.unknown_states).toEqual([{ field: 'to', value: 'defind' }]);
+  });
+
+  it('from/to 都拼错 → 两项都列，顺序 from 先于 to', () => {
+    const result = guardTransition({
+      entity: 'run', from: 'creatd', to: 'qued', event_type: 'RunQueued',
+    });
+    expect(result.reason).toBe('unknown_state');
+    expect(result.unknown_states).toEqual([
+      { field: 'from', value: 'creatd' },
+      { field: 'to', value: 'qued' },
+    ]);
+  });
+
+  it('wait_state 侧拼错 → 区分 lifecycle / wait_from / wait_to', () => {
+    expect(
+      guardWaitStateChange({ lifecycle: 'activ', from: 'none', to: 'blocked' }).unknown_states,
+    ).toEqual([{ field: 'lifecycle', value: 'activ' }]);
+    expect(
+      guardWaitStateChange({ lifecycle: 'active', from: 'non', to: 'blocked' }).unknown_states,
+    ).toEqual([{ field: 'wait_from', value: 'non' }]);
+    expect(
+      guardWaitStateChange({ lifecycle: 'active', from: 'none', to: 'blockd' }).unknown_states,
+    ).toEqual([{ field: 'wait_to', value: 'blockd' }]);
+  });
+
+  it('合法迁移不带 unknown_states', () => {
+    const result = guardTransition({
+      entity: 'task', from: 'captured', to: 'defined', event_type: 'TaskLifecycleChanged',
+      facts: { hasTitle: true, assigneeKind: 'human' },
+    });
+    expect(result.allowed).toBe(true);
+    expect(result.unknown_states).toBeUndefined();
+  });
+});
+
+describe('pF8：assigneeKind 可表达「未指派」', () => {
+  it("assigneeKind='unassigned' → captured→defined 放行（无 Agent 指派不要求结构化契约）", () => {
+    const result = guardTransition({
+      entity: 'task', from: 'captured', to: 'defined', event_type: 'TaskLifecycleChanged',
+      facts: { hasTitle: true, assigneeKind: 'unassigned' },
+    });
+    expect(result.allowed).toBe(true);
+  });
+
+  it('assigneeKind 缺失（undefined）仍是 facts_missing，与显式 unassigned 严格区分', () => {
+    const result = guardTransition({
+      entity: 'task', from: 'captured', to: 'defined', event_type: 'TaskLifecycleChanged',
+      facts: { hasTitle: true },
+    });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toBe('precondition_facts_missing');
+    expect(result.missing_facts).toContainEqual({
+      requirement: 'agentContractStructured',
+      fact: 'assigneeKind',
+      expected: "assigneeKind='human'|'agent'|'unassigned'",
+    });
+  });
+
+  it("assigneeKind='agent' 且无结构化契约 → 仍拒绝（unassigned 不给 agent 开后门）", () => {
+    const result = guardTransition({
+      entity: 'task', from: 'captured', to: 'defined', event_type: 'TaskLifecycleChanged',
+      facts: { hasTitle: true, assigneeKind: 'agent', contractStructured: false },
+    });
+    expect(result.allowed).toBe(false);
   });
 });

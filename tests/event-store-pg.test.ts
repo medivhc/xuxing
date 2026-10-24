@@ -1196,18 +1196,18 @@ describe('F7：TaskLifecycleChanged 的 trigger_event_id', () => {
 });
 
 describe('verifyChain 运维真实性（F-b）', () => {
-  it('不存在的 stream → ok:false / stream_not_found（不冒充健康空流）', async () => {
+  it('不存在的 stream → ok:false / 中文 reason（不冒充健康空流）', async () => {
     expect(await store.verifyChain(asProjectId('proj-TYPO'))).toEqual({
       ok: false,
       stream_id: 'proj-TYPO',
       length: 0,
       broken_at_seq: null,
-      reason: 'stream_not_found',
+      reason: '流不存在：event_streams 无此 stream 的链头行',
       stream_exists: false,
     });
     expect(await store.verifyChain('' as ProjectId)).toMatchObject({
       ok: false,
-      reason: 'stream_not_found',
+      reason: '流不存在：event_streams 无此 stream 的链头行',
       stream_exists: false,
     });
   });
@@ -1240,6 +1240,8 @@ describe('verifyChain 运维真实性（F-b）', () => {
     expect(verification.ok).toBe(false);
     expect(verification.broken_at_seq).toBe(9);
     expect(verification.reason).toContain('链头 last_seq');
+    // pF7：reason 必须点明 broken_at_seq=9 是链头声称值、不是 events 内的真实断点
+    expect(verification.reason).toContain('链头声称值');
   });
 });
 
@@ -1762,5 +1764,81 @@ describe('F16：TRUNCATE 也被 append-only 封堵', () => {
     await expect(ctx.pool.query('TRUNCATE events')).rejects.toThrow(/append-only/i);
     await expect(ctx.pool.query('DELETE FROM events')).rejects.toThrow(/append-only/i);
     expect(await countEvents(ctx.pool)).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 收尾杂项（phase2）：pF7 文案组 + pF8 余项（冲突定位 / listStreams）
+// ---------------------------------------------------------------------------
+describe('收尾杂项 pF7：报错文案点名真实形状', () => {
+  it('array payload → PayloadNotPlainObjectError 且消息点名 array（不许只说 object）', async () => {
+    const error = await store.append(input({ payload: [1, 2, 3] })).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(PayloadNotPlainObjectError);
+    expect((error as Error).message).toContain('收到 array');
+    expect(await countEvents(ctx.pool)).toBe(0);
+  });
+
+  it('null / Date / Map payload → 消息逐一点名形状', async () => {
+    for (const [bad, name] of [
+      [null, 'null'],
+      [new Date(FIXED_NOW), 'Date'],
+      [new Map([['a', 1]]), 'Map'],
+    ] as const) {
+      const error = await store.append(input({ payload: bad })).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(PayloadNotPlainObjectError);
+      expect((error as Error).message).toContain(`收到 ${name}`);
+    }
+    expect(await countEvents(ctx.pool)).toBe(0);
+  });
+
+  it('appendStateTransition 的 array payload → TransitionPayloadError 点名 array', async () => {
+    const error = await store.appendStateTransition({
+      ...transitionBase({ from: 'captured', to: 'defined' }),
+      payload: [1, 2],
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(TransitionPayloadError);
+    expect((error as Error).message).toContain('收到 array');
+  });
+});
+
+describe('收尾杂项 pF8：IdempotencyKeyConflictError 带冲突定位', () => {
+  it('同 key 不同内容 → existing 给出首条事件的 event_id/seq/global_seq/type，消息同步带定位', async () => {
+    const first = await store.append(input({ idempotency_key: 'pf8-loc-1', payload: { task_id: TASK_ID, title: '首条' } }));
+    const error = await store.append(
+      input({ idempotency_key: 'pf8-loc-1', payload: { task_id: TASK_ID, title: '改了内容' } }),
+    ).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(IdempotencyKeyConflictError);
+    const conflict = error as IdempotencyKeyConflictError;
+    expect(conflict.existing).toEqual({
+      event_id: first.id,
+      seq: first.seq,
+      global_seq: first.global_seq,
+      type: first.type,
+    });
+    expect(conflict.message).toContain(`event_id=${first.id}`);
+    expect(conflict.message).toContain(`seq=${first.seq}`);
+    expect(await countEvents(ctx.pool)).toBe(1);
+  });
+});
+
+describe('收尾杂项 pF8：listStreams', () => {
+  it('空库 → 空数组（不冒充有流）', async () => {
+    expect(await store.listStreams()).toEqual([]);
+  });
+
+  it('多流摘要：按 stream_id 升序，last_seq/last_hash 与链头一致', async () => {
+    const other = asProjectId('project-0-other');
+    await store.append(input({ payload: { task_id: TASK_ID, title: '一' } }));
+    const second = await store.append(input({ payload: { task_id: TASK_ID, title: '二' } }));
+    const otherFirst = await store.append(input({ stream_id: other, payload: { task_id: 'task-9', title: '他流' } }));
+
+    const streams = await store.listStreams();
+    expect(streams.map((x) => x.stream_id)).toEqual([other, STREAM]);
+    expect(streams[0]).toEqual({ stream_id: other, last_seq: 1, last_hash: otherFirst.hash });
+    expect(streams[1]).toEqual({ stream_id: STREAM, last_seq: 2, last_hash: second.hash });
+
+    // 摘要口径与 readStream / verifyChain 交叉一致
+    expect(await store.readStream(STREAM)).toHaveLength(streams[1]!.last_seq);
+    expect((await store.verifyChain(STREAM)).ok).toBe(true);
   });
 });

@@ -68,18 +68,51 @@ export class UnknownEventTypeError extends Error {
   }
 }
 
+/** 幂等冲突时已存在事件的定位（pF8：报错必须能直接定位到冲突事件，而不是只报 key）。 */
+export interface IdempotencyConflictExisting {
+  event_id: string;
+  seq: number;
+  global_seq: number;
+  type: string;
+}
+
 /** 同 (stream_id, key) 已有事件且内容不同 —— 客户端 bug，不能伪装成重放。 */
 export class IdempotencyKeyConflictError extends Error {
   readonly stream_id: string;
   readonly idempotency_key: string;
-  constructor(stream_id: string, idempotency_key: string) {
+  /** 已存在事件的定位（event_id/seq/global_seq/type）；拿不到既有行时为 null。 */
+  readonly existing: IdempotencyConflictExisting | null;
+  constructor(
+    stream_id: string,
+    idempotency_key: string,
+    existing: IdempotencyConflictExisting | null = null,
+  ) {
     super(
-      `idempotency_key 冲突：stream=${stream_id} key=${idempotency_key} 已存在不同内容的事件（A3：同 key 不同内容视为错误）`,
+      `idempotency_key 冲突：stream=${stream_id} key=${idempotency_key} 已存在不同内容的事件（A3：同 key 不同内容视为错误）` +
+        (existing !== null
+          ? `；已存在事件定位：event_id=${existing.event_id} seq=${existing.seq} global_seq=${existing.global_seq} type=${existing.type}`
+          : ''),
     );
     this.name = 'IdempotencyKeyConflictError';
     this.stream_id = stream_id;
     this.idempotency_key = idempotency_key;
+    this.existing = existing;
   }
+}
+
+/** 由事件行/信封构造冲突定位（bigint 字段统一过 toSafeNumber）。 */
+function conflictExistingOf(source: {
+  id: string;
+  seq: string | number;
+  global_seq: string | number;
+  type: string;
+}): IdempotencyConflictExisting {
+  return {
+    event_id: source.id,
+    seq: toSafeNumber(source.seq, 'events.seq'),
+    global_seq: toSafeNumber(source.global_seq, 'events.global_seq'),
+    type: source.type,
+  };
 }
 
 /** 存储不变量被破坏（seq 唯一约束命中、bigint 越界等）—— 立即失败，不用重试掩盖。 */
@@ -100,10 +133,13 @@ export class TransitionDeniedError extends Error {
     const expectedTypes = result.expected_event_types?.length
       ? ` expected_event_types=${result.expected_event_types.join('|')}`
       : '';
+    const unknown = result.unknown_states?.length
+      ? ` unknown=${result.unknown_states.map((u) => `${u.field}=${u.value}`).join(',')}`
+      : '';
     super(
       `状态迁移被拒绝：${result.basis.spec_ref} ${result.basis.row}→${result.basis.col} ` +
         `reason=${result.reason ?? 'unknown'}${result.unmet?.length ? ` unmet=${result.unmet.join(',')}` : ''}` +
-        missing + expectedTypes,
+        missing + expectedTypes + unknown,
     );
     this.name = 'TransitionDeniedError';
     this.result = result;
@@ -1050,6 +1086,13 @@ function withTransitionTrigger(
   return { ...payload, trigger_event_id: trigger };
 }
 
+/** listStreams 的单条摘要：链头口径（last_seq = 流内事件数，seq 自 1 连续分配）。 */
+export interface StreamSummary {
+  stream_id: ProjectId;
+  last_seq: number;
+  last_hash: string;
+}
+
 export interface ChainVerification {
   ok: boolean;
   stream_id: string;
@@ -1096,6 +1139,8 @@ export interface PgEventStoreTx extends EventStore {
   requestTaskCancellation(input: RequestTaskCancellationInput): Promise<TaskCancellationResult>;
   /** 读全流、用 payload_canonical 重算链，返回首个断点（不在 append/replay 热路径）。 */
   verifyChain(stream_id: ProjectId): Promise<ChainVerification>;
+  /** 列出全部 stream 的链头摘要（运维/诊断用；按 stream_id 升序，确定性）。 */
+  listStreams(): Promise<StreamSummary[]>;
 }
 
 export interface PgEventStore extends PgEventStoreTx {
@@ -1262,7 +1307,7 @@ async function appendWithin(
     if (existing.rows.length > 0) {
       const row = existing.rows[0];
       if (idempotencyContentMismatch(row, input, payload_canonical)) {
-        throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+        throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, conflictExistingOf(row));
       }
       return rowToEnvelope(row);
     }
@@ -1404,7 +1449,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
           );
           if (rows.length === 1) {
             if (idempotencyContentMismatch(rows[0], input, canonicalJson(input.payload))) {
-              throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+              throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, conflictExistingOf(rows[0]));
             }
             return rowToEnvelope(rows[0]);
           }
@@ -1470,7 +1515,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
           stream_id,
           length: 0,
           broken_at_seq: null,
-          reason: 'stream_not_found',
+          reason: '流不存在：event_streams 无此 stream 的链头行',
           stream_exists: false,
         };
       }
@@ -1560,7 +1605,9 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
           stream_id,
           length: eventRows.length,
           broken_at_seq: headLastSeq,
-          reason: `链头 last_seq 与 events 不一致：last_seq=${headLastSeq}，events 行数=${eventRows.length}`,
+          reason:
+            `链头 last_seq 与 events 不一致：last_seq=${headLastSeq}，events 行数=${eventRows.length}` +
+            `（broken_at_seq=${headLastSeq} 是链头声称值、不是 events 内的真实断点 seq：该 seq 在 events 中并不存在）`,
           stream_exists: true,
         };
       }
@@ -1585,6 +1632,21 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
         reason: null,
         stream_exists: true,
       };
+    }
+
+    async function listStreams(): Promise<StreamSummary[]> {
+      const { rows } = await reader.query<{
+        stream_id: string;
+        last_seq: string;
+        last_hash: string;
+      }>(
+        `SELECT stream_id, last_seq, last_hash FROM event_streams ORDER BY stream_id ASC`,
+      );
+      return rows.map((row) => ({
+        stream_id: row.stream_id as ProjectId,
+        last_seq: toSafeNumber(row.last_seq, 'event_streams.last_seq'),
+        last_hash: row.last_hash,
+      }));
     }
 
     // -----------------------------------------------------------------------
@@ -1839,7 +1901,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             payload_canonical,
           )
         ) {
-          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, conflictExistingOf(existing));
         }
         return {
           event: existing,
@@ -2049,7 +2111,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       const existing = await findByIdempotencyKey(conn, input.stream_id, input.idempotency_key);
       if (existing !== null && input.idempotency_key !== null) {
         if (existing.type !== 'TaskCancelRequested') {
-          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, conflictExistingOf(existing));
         }
         const facts = await deriveStreamFacts(conn, input.stream_id);
         const lifecycle = deriveTaskLifecycle(facts, input.task_id);
@@ -2192,6 +2254,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       appendStateTransition,
       requestTaskCancellation,
       verifyChain,
+      listStreams,
     };
   }
 
