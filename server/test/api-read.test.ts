@@ -57,6 +57,13 @@ describe('§4 HTTP 契约：投影类端点', () => {
     expect(body.data.recent_activity.length).toBeGreaterThan(0);
     expect(body.data.recent_activity[0]).toHaveProperty('seq');
     expect(body.data.recent_activity[0]).toHaveProperty('kind');
+    // 页面契约键集（契约 §2.2 / WHITESCREEN-FIX-1024）：attention 恒在、recent 为页面形状、
+    // 项目带 last_activity_at——缺任一键真实前端都会渲染崩溃，投影层在此钉死。
+    expect(Array.isArray(body.data.attention)).toBe(true);
+    expect(Array.isArray(body.data.recent)).toBe(true);
+    expect(body.data.recent[0]).toHaveProperty('event_id');
+    expect(body.data.recent[0]).toHaveProperty('summary');
+    expect(project).toHaveProperty('last_activity_at');
   });
 
   it('GET /api/projects/:projectId：目标 + 任务图摘要 + 验收状态，带 projection_version', async () => {
@@ -121,6 +128,17 @@ describe('§4 HTTP 契约：投影类端点', () => {
     const home = await jsonOf(await api(booted, '/api/home'));
     expect(home.data.projects.some((p: any) => p.project_id === 'proj-degraded')).toBe(true);
     expect(home.data.proposals.degraded).toBeGreaterThanOrEqual(1);
+    // 待决提议必须进 attention（decision_pending），形状与契约 §2.2 一致
+    const pending = home.data.attention.find(
+      (a: any) => a.kind === 'decision_pending' && a.decision_id === 'prop-degraded-1',
+    );
+    expect(pending).toMatchObject({
+      attention_id: 'attention:decision_pending:prop-degraded-1',
+      project_id: 'proj-degraded',
+      available_actions: ['proposal_accept', 'proposal_reject'],
+    });
+    expect(typeof pending.rank).toBe('number');
+    expect(typeof pending.created_at).toBe('string');
   });
 
   it('种子幂等：重复执行不产生重复实体（含夹具）', async () => {

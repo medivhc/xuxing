@@ -134,7 +134,7 @@ JOURNEY_NO_SANDBOX=1 npm test
 | 方法与路径 | 成功响应 | 要点 |
 | --- | --- | --- |
 | `GET /api/health` | `{ok:true,data:{ok,db,projection_version,limits:{heartbeat_ms,max_connections,max_queue}}}` | R-2：health 也走信封；`data.ok` 才是运行时状态 |
-| `GET /api/home` | `data.{actor_id,projects,my_actions_count,recent_activity,proposals:{pending,degraded}}` | 活动 `kind` 为 PascalCase；`proposals.degraded` 只数**待决**的降级提议 |
+| `GET /api/home` | `data.{actor_id,projects,my_actions_count,recent_activity,proposals:{pending,degraded}}` + 页面契约键 `attention[]` / `recent[]` / 项目 `last_activity_at` | 活动 `kind` 为 PascalCase；`proposals.degraded` 只数**待决**的降级提议；`attention` 为契约 §2.2 六类派生（恒在、空态为空数组），页面级冒烟见 `specs/50-page-smoke.pw.mts` |
 | `GET /api/actions` | `data.items[]` | `next_action` 是**中文标签**，`available_actions` 才是 canonical 命令串 |
 | `GET /api/projects/:id` | `data.{project,goal,tasks,acceptance_status,graph,pending_proposals}` | R-8 键集；`graph.nodes` 只有 `{id,title,lifecycle}`；`goal.status` 为 `active` |
 | `GET /api/proposals/:id` | `data.{…,details:{kind,task:{title,description,assignee_kind,acceptance_criteria}},available_actions}` | R-11：`task_id` 在提议阶段为 `null` |

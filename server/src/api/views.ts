@@ -1,7 +1,7 @@
 // HTTP 视图（§4 契约的响应形状）。投影类响应一律带 projection_version（= 已并入最大 global_seq）。
 // 视图只做"投影 → 响应"的形状映射，不重算任何状态判定：available_actions 来自 projection/actions.ts（内核 guard）。
 
-import type { ProjectionSnapshot } from '../projection/projection.ts';
+import type { ProjectionSnapshot, TaskRecord } from '../projection/projection.ts';
 import { computeAvailableActions, isActionableFor, type AvailableAction, type CommandType } from '../projection/actions.ts';
 import type { ProjectionMeta } from '../api/http.ts';
 
@@ -83,8 +83,20 @@ export interface HomeView extends ProjectionMeta {
     total_tasks: number;
     accepted_tasks: number;
     last_event_at: string | null;
+    /** 页面契约键名（契约 §2.2）；与 last_event_at 同值，last_event_at 为 API 级附加键保留。 */
+    last_activity_at: string | null;
   }>;
   my_actions_count: number;
+  /** 页面契约（契约 §2.2）：需要关注列表，恒在（空态为空数组）。 */
+  attention: AttentionItemView[];
+  /** 页面契约（契约 §2.2）：与 recent_activity 同源（snapshot.recent_events）的页面形状。 */
+  recent: Array<{
+    event_id: string;
+    project_id: string;
+    task_id?: string;
+    summary: string;
+    occurred_at: string;
+  }>;
   recent_activity: Array<{
     seq: number;
     kind: string;
@@ -125,6 +137,162 @@ const ACTIVITY_LABEL: Record<string, string> = {
   WaitConditionCanceled: '等待条件收尾',
 };
 
+export interface AttentionItemView {
+  attention_id: string;
+  kind: 'decision_pending' | 'acceptance_due' | 'run_indeterminate' | 'duplicate_suspect' | 'wait_expired' | 'cancel_pending';
+  project_id: string;
+  task_id?: string;
+  decision_id?: string;
+  rank: number;
+  available_actions: string[];
+  created_at: string;
+}
+
+/** attention 的 kind 优先序（rank 计算的第一键；见 attentionItems 的定版注释）。 */
+const ATTENTION_KIND_ORDER: AttentionItemView['kind'][] = [
+  'decision_pending',
+  'acceptance_due',
+  'run_indeterminate',
+  'cancel_pending',
+  'wait_expired',
+  'duplicate_suspect',
+];
+
+/**
+ * 任务派生 attention 项的 created_at 口径：该任务在投影保留窗口（recent_events）
+ * 内最近一条事件的 occurred_at；窗口内无该任务事件时退到全局最近事件，
+ * 再退到项目 created_at。投影记录本身不带任务创建时间，这是现有证据下的最近似，
+ * 与契约 §2.2 的实现口径注记一致。
+ */
+function attentionCreatedAt(snapshot: ProjectionSnapshot, task: TaskRecord): string {
+  const own = snapshot.recent_events.find((e) => e.task_id === task.task_id);
+  if (own) return own.occurred_at;
+  const latest = snapshot.recent_events[0];
+  if (latest) return latest.occurred_at;
+  return snapshot.projects.find((pr) => pr.project_id === task.project_id)?.created_at ?? '';
+}
+
+/**
+ * Home「需要关注」（attention）派生——契约 docs/interaction-contract.md §2.2 的派生表
+ * 在服务端投影的落地（此前只有契约与前端 mock 实现，真实投影缺失导致整页白屏，
+ * 见 WHITESCREEN-FIX-1024）。六类 kind 的出现/消失条件按 §2.2，映射到投影记录面：
+ *
+ * - decision_pending：DecisionCreated 且 pending。K0 服务端无独立 Decision 实体，
+ *   待裁决面就是提议——ProposalRecord.status ∈ {proposed, needs_decision}；
+ *   decision_id 取 proposal_id（resolve_decision 已下线，裁决走提议命令）。
+ * - acceptance_due：任务 awaiting_acceptance 且最新有效 Acceptance 不存在或
+ *   verdict=partially_accepted（accepted/rejected 即消失；partially 保留「待补判据」）。
+ * - run_indeterminate：RunRecord.state=indeterminate（结果不明且未对账到终态）。
+ * - duplicate_suspect：TaskRecord.duplicate_suspect 且 lifecycle != canceled
+ *   （TaskDuplicateResolved 清标记即消失，TaskCanceled 亦消失）。
+ * - wait_expired：WaitConditionRecord.status=expired 且任务未终态（accepted/canceled）。
+ * - cancel_pending：cancel_requested_by 非空且 lifecycle != canceled
+ *   （TaskCancelRequested 已落、TaskCanceled 未落）。
+ *
+ * attention_id 格式 `attention:<kind>:<entity_id>`：kind 限定保证同一任务多类
+ * 共存时唯一（React key 与行标识）。rank 由服务端计算（OQ-08=A，前端只排序）：
+ * kind 优先序 ATTENTION_KIND_ORDER → created_at 升序 → attention_id 字典序，
+ * 顺序编号 1..n。available_actions 一律走内核 guard（computeAvailableActions）；
+ * 提议与 proposalView 同口径（capture_task 且 proposed 才给 accept/reject）。
+ * 空态恒返回空数组——字段必须在，不能缺（REQ-PJ-1：Home 不制造待办）。
+ */
+export function attentionItems(snapshot: ProjectionSnapshot, actor: Actor): AttentionItemView[] {
+  const raw: Array<Omit<AttentionItemView, 'rank'>> = [];
+  const taskById = new Map(snapshot.tasks.map((t) => [t.task_id, t]));
+  const taskActions = (task: TaskRecord): string[] =>
+    availableCommands(computeAvailableActions(task, snapshot, actor.actor_id));
+
+  for (const proposal of snapshot.proposals) {
+    if (proposal.status !== 'proposed' && proposal.status !== 'needs_decision') continue;
+    raw.push({
+      attention_id: `attention:decision_pending:${proposal.proposal_id}`,
+      kind: 'decision_pending',
+      project_id: proposal.project_id,
+      ...(proposal.task_id ? { task_id: proposal.task_id } : {}),
+      decision_id: proposal.proposal_id,
+      available_actions:
+        proposal.status === 'proposed' && proposal.kind === 'capture_task'
+          ? ['proposal_accept', 'proposal_reject']
+          : [],
+      created_at: proposal.created_at,
+    });
+  }
+
+  for (const task of snapshot.tasks) {
+    if (task.lifecycle === 'awaiting_acceptance') {
+      const acceptance = latestEffectiveAcceptance(snapshot, task.task_id);
+      if (!acceptance || acceptance.verdict === 'partially_accepted') {
+        raw.push({
+          attention_id: `attention:acceptance_due:${task.task_id}`,
+          kind: 'acceptance_due',
+          project_id: task.project_id,
+          task_id: task.task_id,
+          available_actions: taskActions(task),
+          created_at: attentionCreatedAt(snapshot, task),
+        });
+      }
+    }
+    if (task.duplicate_suspect && task.lifecycle !== 'canceled') {
+      raw.push({
+        attention_id: `attention:duplicate_suspect:${task.task_id}`,
+        kind: 'duplicate_suspect',
+        project_id: task.project_id,
+        task_id: task.task_id,
+        available_actions: taskActions(task),
+        created_at: attentionCreatedAt(snapshot, task),
+      });
+    }
+    if (task.cancel_requested_by !== null && task.lifecycle !== 'canceled') {
+      raw.push({
+        attention_id: `attention:cancel_pending:${task.task_id}`,
+        kind: 'cancel_pending',
+        project_id: task.project_id,
+        task_id: task.task_id,
+        available_actions: taskActions(task),
+        created_at: attentionCreatedAt(snapshot, task),
+      });
+    }
+  }
+
+  for (const run of snapshot.runs) {
+    if (run.state !== 'indeterminate') continue;
+    const task = taskById.get(run.task_id);
+    if (!task) continue;
+    raw.push({
+      attention_id: `attention:run_indeterminate:${run.run_id}`,
+      kind: 'run_indeterminate',
+      project_id: task.project_id,
+      task_id: task.task_id,
+      available_actions: taskActions(task),
+      created_at: attentionCreatedAt(snapshot, task),
+    });
+  }
+
+  for (const wc of snapshot.wait_conditions) {
+    if (wc.status !== 'expired') continue;
+    const task = taskById.get(wc.task_id);
+    if (!task) continue;
+    if (task.lifecycle === 'accepted' || task.lifecycle === 'canceled') continue;
+    raw.push({
+      attention_id: `attention:wait_expired:${wc.wait_condition_id}`,
+      kind: 'wait_expired',
+      project_id: task.project_id,
+      task_id: task.task_id,
+      available_actions: taskActions(task),
+      created_at: attentionCreatedAt(snapshot, task),
+    });
+  }
+
+  const order = new Map(ATTENTION_KIND_ORDER.map((kind, i) => [kind, i]));
+  raw.sort((a, b) => {
+    const byKind = (order.get(a.kind) ?? 99) - (order.get(b.kind) ?? 99);
+    if (byKind !== 0) return byKind;
+    if (a.created_at !== b.created_at) return a.created_at < b.created_at ? -1 : 1;
+    return a.attention_id < b.attention_id ? -1 : a.attention_id > b.attention_id ? 1 : 0;
+  });
+  return raw.map((item, i) => ({ ...item, rank: i + 1 }));
+}
+
 export function homeView(snapshot: ProjectionSnapshot, actor: Actor): HomeView {
   const myActions = myActionItems(snapshot, actor);
   const activity = snapshot.recent_events.slice(0, 20).map((entry) => ({
@@ -154,9 +322,18 @@ export function homeView(snapshot: ProjectionSnapshot, actor: Actor): HomeView {
         total_tasks: tasks.length,
         accepted_tasks: counts.accepted ?? 0,
         last_event_at: lastEvent?.occurred_at ?? null,
+        last_activity_at: lastEvent?.occurred_at ?? null,
       };
     }),
     my_actions_count: myActions.length,
+    attention: attentionItems(snapshot, actor),
+    recent: activity.map((entry) => ({
+      event_id: `evt-${entry.seq}`,
+      project_id: entry.project_id,
+      ...(entry.task_id ? { task_id: entry.task_id } : {}),
+      summary: entry.summary,
+      occurred_at: entry.occurred_at,
+    })),
     recent_activity: activity,
     proposals: {
       pending: snapshot.proposals.filter((p) => p.status === 'proposed').length,

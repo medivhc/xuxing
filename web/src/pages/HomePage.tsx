@@ -142,13 +142,13 @@ export function HomePage() {
 
       <section aria-label="需要关注">
         <h2 className="mb-2 text-title-s font-semibold text-text-primary">需要关注</h2>
-        {data.attention.length === 0 ? (
+        {(data.attention ?? []).length === 0 ? (
           <p className="rounded-m border border-border bg-surface px-4 py-3 text-body-s text-text-secondary">
             暂无需要关注的事项。
           </p>
         ) : (
           <ul className="space-y-2">
-            {[...data.attention]
+            {[...(data.attention ?? [])]
               .sort((a, b) => a.rank - b.rank)
               .map((item) => (
                 <AttentionRow key={item.attention_id} item={item} />
