@@ -101,7 +101,11 @@ test('J2：节点领活真执行、离线挂起 awaiting_node、回归续派', a
     60_000,
   );
   expect(project1.tasks.find((t) => t.task_id === first.taskId)?.lifecycle).toBe('awaiting_acceptance');
-  expect(agentLog).toContain('run_result_reported');
+  // agent 日志经子进程 stdout 流式累积，到达时机晚于服务端落账（真服务轮偶发
+  // 先见 Run succeeded、后见日志行）：断言必须轮询等待，不能一次性读。
+  await expect
+    .poll(() => agentLog, { timeout: 15_000, message: "agent 日志应出现 run_result_reported" })
+    .toContain("run_result_reported");
 
   // ③ 杀节点 → 第二单挂起 awaiting_node（节点先翻 offline/stale 不可派）
   await stopAgent();
