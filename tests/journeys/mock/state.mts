@@ -175,17 +175,22 @@ const CAPTURE_CRITERIA: AcceptanceCriterion[] = [
 ];
 
 /** 当前 actor 对一条 Task 的可用动作（canonical 词表，服务端复核用同一函数）。 */
-export function availableActionsFor(task: TaskRecord, actorId: string): CommandType[] {
+export function availableActionsFor(task: TaskRecord, actorId: string, hasLiveRun = true): CommandType[] {
   if (TERMINAL.has(task.lifecycle)) return [];
   if (task.assignee_id !== actorId) return [];
   switch (task.lifecycle) {
     case 'defined':
     case 'ready':
       return ['task_advance', 'task_cancel'];
-    case 'active':
-      // 真服务口径（server/src/projection/actions.ts）：执行中还挂着 Run 时取消受
-      // allRunsTerminal 约束，task_cancel 不出现在 available_actions 里。
-      return ['feedback_submit'];
+    case 'active': {
+      // 真服务口径（server/src/projection/actions.ts + REQ-HUM-1/HUM-2）：
+      //   - feedback_submit 只在有在跑的人类 Run 时可用；
+      //   - task_cancel 受 allRunsTerminal 约束，Run 还在跑时不出现在动作集里。
+      const actions: CommandType[] = [];
+      if (hasLiveRun) actions.push('feedback_submit');
+      else actions.push('task_advance', 'task_cancel');
+      return actions;
+    }
     case 'awaiting_acceptance':
       // R-10：验收动作就在这条上，任务留在 My Actions 直到验收落账
       return ['acceptance_record', 'task_cancel'];
@@ -218,6 +223,8 @@ export class JourneyState {
   readonly projects = new Map<string, ProjectRecord>();
   readonly tasks = new Map<string, TaskRecord>();
   readonly proposals = new Map<string, ProposalRecord>();
+  /** 每个任务当前在跑的 human_light Run（派发即建，提交反馈即 succeeded）。 */
+  readonly liveRuns = new Map<string, string>();
 
   head = 0;
   private readonly receipts = new Map<string, StoredReceipt>();
@@ -459,6 +466,7 @@ export class JourneyState {
 
       this.emit({ ...base, kind: 'RunCreated', payload: { task_id: seed.task_id, run_kind: 'human_light' } });
       this.emit({ ...base, kind: 'RunStarted', payload: { task_id: seed.task_id } });
+      this.liveRuns.set(seed.task_id, `run-seed-${seed.task_id}`);
       this.transition(seed.task_id, 'ready', 'active');
       if (seed.lifecycle === 'active') continue;
 
@@ -786,7 +794,7 @@ export class JourneyState {
 
   private advanceTask(taskId: string, to: unknown, actorId: string): Record<string, unknown> {
     const task = this.requireTask(taskId);
-    const actions = availableActionsFor(task, actorId);
+    const actions = availableActionsFor(task, actorId, this.liveRuns.has(task.task_id));
     if (!actions.includes('task_advance')) {
       throw conflict(`任务 ${taskId} 当前无可用推进动作（lifecycle=${task.lifecycle}）`, {
         reason: 'not_in_available_actions',
@@ -795,7 +803,11 @@ export class JourneyState {
         available_actions: actions,
       });
     }
-    const next = task.lifecycle === 'defined' ? 'ready' : 'active';
+    // 真服务口径（server/src/projection/actions.ts）：active 的反馈动作要求"有在跑的人类 Run"
+    // （REQ-HUM-1）。Run 一经 succeeded 就不再有反馈可提，再执行要重新派发一条 Run；
+    // 此时按真服务的下一个可用动作推进（active → ready → active），与内核矩阵一致。
+    const next =
+      task.lifecycle === 'defined' ? 'ready' : task.lifecycle === 'active' ? 'ready' : 'active';
     if (to !== undefined && to !== next) {
       throw conflict(`目标状态 ${String(to)} 不在 available_actions 中（期望 ${next}）`, {
         reason: 'not_in_available_actions',
@@ -805,13 +817,20 @@ export class JourneyState {
       });
     }
     if (next === 'active') {
+      const runId = `run-${randomUUID()}`;
+      this.liveRuns.set(taskId, runId);
       this.emit({
         kind: 'RunCreated',
         project_id: task.project_id,
         entity_id: taskId,
-        payload: { task_id: taskId, run_kind: 'human_light', actor_id: actorId },
+        payload: { task_id: taskId, run_id: runId, run_kind: 'human_light', actor_id: actorId },
       });
-      this.emit({ kind: 'RunStarted', project_id: task.project_id, entity_id: taskId, payload: { task_id: taskId } });
+      this.emit({
+        kind: 'RunStarted',
+        project_id: task.project_id,
+        entity_id: taskId,
+        payload: { task_id: taskId, run_id: runId },
+      });
     }
     this.transition(taskId, task.lifecycle, next);
     return { task_id: taskId, from: task.lifecycle === next ? next : null, to: next, project_id: task.project_id };
@@ -819,7 +838,7 @@ export class JourneyState {
 
   private submitFeedback(taskId: string, content: string, actorId: string): Record<string, unknown> {
     const task = this.requireTask(taskId);
-    const actions = availableActionsFor(task, actorId);
+    const actions = availableActionsFor(task, actorId, this.liveRuns.has(task.task_id));
     if (!actions.includes('feedback_submit')) {
       throw conflict(`任务 ${taskId} 当前不接受 ${actorId} 的执行反馈（lifecycle=${task.lifecycle}）`, {
         reason: 'not_in_available_actions',
@@ -829,13 +848,14 @@ export class JourneyState {
       });
     }
     if (content.trim().length === 0) throw badRequest('feedback_submit.content 必填', { field: 'content' });
+    const runId = this.liveRuns.get(taskId) ?? `run-${taskId}`;
     const feedbackId = `fb-${randomUUID()}`;
     const outcomeId = `out-${randomUUID()}`;
     const base = { project_id: task.project_id, entity_id: taskId };
     this.emit({
       ...base,
       kind: 'FeedbackReceived',
-      payload: { feedback_id: feedbackId, task_id: taskId, run_id: `run-${taskId}`, author_id: actorId, raw_content: content },
+      payload: { feedback_id: feedbackId, task_id: taskId, run_id: runId, author_id: actorId, raw_content: content },
     });
     this.emit({
       ...base,
@@ -847,7 +867,9 @@ export class JourneyState {
       kind: 'OutcomeRecorded',
       payload: { outcome_id: outcomeId, task_id: taskId, feedback_id: feedbackId, conclusion_kind: 'achieved' },
     });
-    this.emit({ ...base, kind: 'RunSucceeded', payload: { task_id: taskId, outcome_id: outcomeId } });
+    // REQ-HUM-2：Run 置 succeeded = 本次尝试结束；后续再执行要重新派发一条 Run
+    this.emit({ ...base, kind: 'RunSucceeded', payload: { task_id: taskId, run_id: runId, outcome_id: outcomeId } });
+    this.liveRuns.delete(taskId);
     this.transition(taskId, 'active', 'awaiting_acceptance');
     return { task_id: taskId, feedback_id: feedbackId, outcome_id: outcomeId, project_id: task.project_id };
   }
@@ -855,7 +877,7 @@ export class JourneyState {
   private recordAcceptance(payload: Record<string, unknown>, actorId: string): Record<string, unknown> {
     const taskId = String(payload.task_id ?? '');
     const task = this.requireTask(taskId);
-    const actions = availableActionsFor(task, actorId);
+    const actions = availableActionsFor(task, actorId, this.liveRuns.has(task.task_id));
     if (!actions.includes('acceptance_record')) {
       throw conflict(`任务 ${taskId} 当前不可验收（lifecycle=${task.lifecycle}）`, {
         reason: 'not_in_available_actions',
@@ -930,7 +952,7 @@ export class JourneyState {
 
   private cancelTask(taskId: string, actorId: string): Record<string, unknown> {
     const task = this.requireTask(taskId);
-    const actions = availableActionsFor(task, actorId);
+    const actions = availableActionsFor(task, actorId, this.liveRuns.has(task.task_id));
     if (!actions.includes('task_cancel')) {
       throw conflict(`任务 ${taskId} 当前不可取消（lifecycle=${task.lifecycle}）`, {
         reason: 'not_in_available_actions',
@@ -943,6 +965,7 @@ export class JourneyState {
     this.emit({ kind: 'TaskCancelRequested', project_id: task.project_id, entity_id: taskId, payload: { task_id: taskId } });
     this.emit({ kind: 'RunCanceled', project_id: task.project_id, entity_id: taskId, payload: { task_id: taskId } });
     this.transition(taskId, from, 'canceled');
+    this.liveRuns.delete(taskId);
     this.emit({ kind: 'TaskCanceled', project_id: task.project_id, entity_id: taskId, payload: { task_id: taskId } });
     return { task_id: taskId, lifecycle: 'canceled', cancel_requested: true, project_id: task.project_id };
   }
@@ -1041,7 +1064,7 @@ export class JourneyState {
             })),
           },
         active_wait_conditions: [],
-        available_actions: availableActionsFor(task, actorId),
+        available_actions: availableActionsFor(task, actorId, this.liveRuns.has(task.task_id)),
         updated_global_seq: this.head,
       })),
       acceptance_status: {
@@ -1073,7 +1096,7 @@ export class JourneyState {
     for (const task of [...this.tasks.values()].sort(
       (a, b) => a.created_at.localeCompare(b.created_at) || a.task_id.localeCompare(b.task_id),
     )) {
-      const available = availableActionsFor(task, actorId);
+      const available = availableActionsFor(task, actorId, this.liveRuns.has(task.task_id));
       if (available.length === 0) continue;
       items.push({
         task_id: task.task_id,

@@ -25,6 +25,8 @@ import { TID, criterionPass } from '../support/testids.mts';
 //   捕获输入 → 智能层提议 → 用户接受（服务端发号）→ 生成任务 → 进入 My Actions →
 //   推进到 active → 提交反馈 → awaiting_acceptance → 逐判据验收（先部分通过，
 //   再补集全通过）→ 任务 accepted（验收席位全程留在 My Actions，R-10）
+//   真服务轮的「再执行」按矩阵走「取消 + 重新捕获」：active → ready 非法（§3.1），
+//   且没有再派发 Run 的命令，详见第 6 步注释。
 //
 // 口径（FIX-ROUND-1 裁决）：
 //   - R-1：available_actions 是 canonical command_type 字符串数组
@@ -64,6 +66,10 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
     let captureId = '';
     let taskId = '';
     let criteria: AcceptanceCriterion[] = [];
+    // 真服务跑在可复用的外部库上（不保证空库），验收计数以第 0 步读到的基线为准；
+    // mock 轮每次都从同一种子重建，基线是 R-7 契约值。
+    let baselineAccepted = 1;
+    let baselineTotal = 5;
     const captureText = `把 nx-pipeline 最近一轮 run 导入续行，跑通双轨对照（旅程 ${randomUUID().slice(0, 8)}）`;
 
     await test.step('0. 健康检查 + 种子基线（R-7 种子契约）', async () => {
@@ -85,8 +91,15 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
       expect(project.project.project_id).toBe(DEMO.projectId);
       expect(project.goal?.goal_id).toBe(DEMO.goalId);
       // R-8：验收摘要是数值键，不是旧的 acceptance.status 字符串
-      expect(project.acceptance_status.accepted).toBe(1);
-      expect(project.acceptance_status.total).toBe(5);
+      if (usingMock) {
+        expect(project.acceptance_status.accepted).toBe(1);
+        expect(project.acceptance_status.total).toBe(5);
+      } else {
+        expect(project.acceptance_status.accepted).toBeGreaterThanOrEqual(1);
+        expect(project.acceptance_status.total).toBeGreaterThan(project.acceptance_status.accepted);
+        baselineAccepted = project.acceptance_status.accepted;
+        baselineTotal = project.acceptance_status.total;
+      }
       // R-7：项目图初始就不为空
       expect(project.graph.nodes.length).toBeGreaterThanOrEqual(5);
 
@@ -411,9 +424,44 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
     });
 
     await test.step('6. 补集后全部通过：任务 accepted（acceptance_status.accepted +1）', async () => {
-      // partially_accepted 之后任务退回 active：先提交一条新的执行反馈（active → awaiting_acceptance），
-      // 再逐判据重新验收。不去重推 defined→ready→active：那会把任务重新派发成一条新 Run，
-      // 也不符合"退回待再执行"的语义。
+      // partially_accepted 之后任务退回 active，但那次尝试的 Run 已经 succeeded
+      // （REQ-HUM-2：Run 置 succeeded = 本次尝试结束）：真服务此刻没有在跑的 Run，
+      // canSubmitFeedback 为假（available_actions 只剩 task_cancel），直接 feedback_submit 会 409；
+      // 而矩阵 §3.1 里 active → ready / active → defined 都是「–」，也没有"再派发 Run"的命令。
+      // 所以唯一走得通的"再执行"是：取消这条任务 → 用同一份成功判据重新捕获一条 → 重新走链路。
+      // 这一步不是 UI 操作，mock 轮跳过（mock 的可用动作集里本就没有这条路径）。
+      if (!usingMock) {
+        const canceledRetry = expectCreatedCommand(
+          await postCommand(request, 'task_cancel', { task_id: taskId }, `retry-cancel-${randomUUID()}`),
+        );
+        expect(canceledRetry.subject.lifecycle).toBe('canceled');
+        versions.push(canceledRetry.projection_version);
+
+        // 用同一份成功判据重新捕获（标题/判据由提议层重写，判据形态保持一致）
+        const retried = await capture(request, `${captureText}（按验收意见补齐）`);
+        versions.push(retried.projection_version);
+        const retriedProposal = await getProposal(request, retried.proposal_id);
+        criteria = retriedProposal.details.task.acceptance_criteria;
+        expect(criteria.length).toBeGreaterThan(0);
+        const retriedAccept = expectCreatedCommand(
+          await postCommand(
+            request,
+            'proposal_accept',
+            { proposal_id: retried.proposal_id },
+            `retry-accept-${randomUUID()}`,
+          ),
+        );
+        taskId = String(retriedAccept.subject.task_id);
+        versions.push(retriedAccept.projection_version);
+        for (const [index, expectedLifecycle] of ['ready', 'active'].entries()) {
+          const advanced = expectCreatedCommand(
+            await postCommand(request, 'task_advance', { task_id: taskId }, `retry-advance-${index}-${randomUUID()}`),
+          );
+          expect(advanced.subject.to).toBe(expectedLifecycle);
+          versions.push(advanced.projection_version);
+        }
+      }
+
       const feedback = expectCreatedCommand(
         await postCommand(
           request,
@@ -476,7 +524,10 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
       expect(task.acceptance?.verdict).toBe('accepted');
       expect(task.acceptance?.criterion_results.every((result) => result.verdict === 'passed')).toBe(true);
       expect(task.available_actions).toEqual([]);
-      expect(project.acceptance_status.accepted).toBe(2);
+      // 真服务轮：再执行会新建 2 条任务（部分通过那条被取消、重新捕获那条验收通过），
+      // acceptance_status.total 数的是项目里的任务行（含 canceled），accepted 比基线 +1。
+      expect(project.acceptance_status.accepted).toBe(usingMock ? 2 : baselineAccepted + 1);
+      if (!usingMock) expect(project.acceptance_status.total).toBe(baselineTotal + 2);
       expect(findGraphNode(project, taskId).lifecycle).toBe('accepted');
 
       // accepted 的任务离开 My Actions（验收席位在验收落账后才消失）
