@@ -89,13 +89,27 @@ export class UnknownEventTypeError extends Error {
 export class IdempotencyKeyConflictError extends Error {
   readonly stream_id: string;
   readonly idempotency_key: string;
-  constructor(stream_id: string, idempotency_key: string) {
+  /** 冲突定位（杂-2③）：既有事件 id 与首个不一致字段，便于直接排查。 */
+  readonly existing_event_id: string | null;
+  readonly conflicting_fields: string[];
+  constructor(
+    stream_id: string,
+    idempotency_key: string,
+    location: { existing_event_id?: string | null; conflicting_fields?: string[] } = {},
+  ) {
+    const existing_event_id = location.existing_event_id ?? null;
+    const conflicting_fields = location.conflicting_fields ?? [];
     super(
-      `idempotency_key 冲突：stream=${stream_id} key=${idempotency_key} 已存在不同内容的事件（A3：同 key 不同内容视为错误）`,
+      `idempotency_key 冲突：stream=${stream_id} key=${idempotency_key} ` +
+        `已存在不同内容的事件（A3：同 key 不同内容视为错误）` +
+        (existing_event_id !== null ? ` existing_event_id=${existing_event_id}` : '') +
+        (conflicting_fields.length > 0 ? ` 冲突字段=${conflicting_fields.join(',')}` : ''),
     );
     this.name = 'IdempotencyKeyConflictError';
     this.stream_id = stream_id;
     this.idempotency_key = idempotency_key;
+    this.existing_event_id = existing_event_id;
+    this.conflicting_fields = conflicting_fields;
   }
 }
 
@@ -164,7 +178,8 @@ export class TransitionPayloadMismatchError extends Error {
   }
 }
 
-/** payload 形状无法承载 from/to（非 plain object）—— 拒绝写入。 */export class TransitionPayloadError extends Error {
+/** payload 形状无法承载 from/to（非 plain object）—— 拒绝写入。 */
+export class TransitionPayloadError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'TransitionPayloadError';
@@ -534,7 +549,7 @@ function isUniqueViolation(error: unknown, constraint: string): boolean {
  * F15：幂等 key 的「同内容」定义 = type + payload + actor_id + actor_kind +
  * correlation_id + causation_id。任一不同都视为同 key 不同内容，拒绝静默返回首次事件。
  */
-function idempotencyContentMismatch(
+function idempotencyConflictFields(
   existing: {
     type: string;
     payload_canonical: string;
@@ -545,15 +560,15 @@ function idempotencyContentMismatch(
   },
   input: AppendEventInput,
   payload_canonical: string,
-): boolean {
-  return (
-    existing.type !== input.type ||
-    existing.payload_canonical !== payload_canonical ||
-    existing.actor_id !== input.actor_id ||
-    existing.actor_kind !== input.actor_kind ||
-    existing.correlation_id !== input.correlation_id ||
-    existing.causation_id !== input.causation_id
-  );
+): string[] {
+  const fields: string[] = [];
+  if (existing.type !== input.type) fields.push('type');
+  if (existing.payload_canonical !== payload_canonical) fields.push('payload');
+  if (existing.actor_id !== input.actor_id) fields.push('actor_id');
+  if (existing.actor_kind !== input.actor_kind) fields.push('actor_kind');
+  if (existing.correlation_id !== input.correlation_id) fields.push('correlation_id');
+  if (existing.causation_id !== input.causation_id) fields.push('causation_id');
+  return fields;
 }
 
 // ---------------------------------------------------------------------------
@@ -803,6 +818,8 @@ interface WaitConditionFactsRow {
   id: string;
   task_id: string | null;
   active: boolean;
+  /** REQ-SCH-3：定时器持久化在事件里（due_at），Scheduler 从流恢复。 */
+  due_at: string | null;
 }
 
 interface DecisionFactsRow {
@@ -924,6 +941,7 @@ async function deriveStreamFacts(
           id,
           task_id: payloadField(payload, 'task_id'),
           active: true,
+          due_at: payloadField(payload, 'due_at'),
         });
         break;
       }
@@ -941,6 +959,7 @@ async function deriveStreamFacts(
             id,
             task_id: payloadField(payload, 'task_id'),
             active: false,
+            due_at: null,
           });
         }
         break;
@@ -1180,6 +1199,14 @@ function withTransitionTrigger(
   return { ...payload, trigger_event_id: trigger };
 }
 
+/** REQ-SCH-3：到期待触发的 WaitCondition（due_at 来自事件，不靠内存计时）。 */
+export interface DueWaitCondition {
+  stream_id: string;
+  wait_condition_id: string;
+  task_id: string | null;
+  due_at: string;
+}
+
 /** S5：增量消费的一批事件与安全水位。 */
 export interface TailingBatch {
   events: EventEnvelope[];
@@ -1216,6 +1243,8 @@ export interface ChainVerification {
   stream_id: string;
   length: number;
   broken_at_seq: number | null;
+  /** 断点位置（杂-1③）：events 行内 / 链头行本身；ok 为 null。 */
+  broken_in: 'events' | 'stream_head' | null;
   reason: string | null;
   /** event_streams 是否有链头行：区分「不存在的 stream」与「健康的空流」。 */
   stream_exists: boolean;
@@ -1266,6 +1295,8 @@ export interface PgEventStoreTx extends EventStore {
   commitDeliveries(input: CommitDeliveriesInput): Promise<CommitDeliveriesResult>;
   /** 运维：列出全部 stream 的链头与事件数。 */
   listStreams(): Promise<StreamSummary[]>;
+  /** REQ-SCH-3：列出 due_at 已到且仍 active 的 WaitCondition（进程重启后由事件流恢复）。 */
+  listDueWaitConditions(now: Date): Promise<DueWaitCondition[]>;
 }
 
 export interface PgEventStore extends PgEventStoreTx {
@@ -1463,8 +1494,12 @@ async function appendWithin(
     );
     if (existing.rows.length > 0) {
       const row = existing.rows[0];
-      if (idempotencyContentMismatch(row, input, payload_canonical)) {
-        throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+      const conflicting_fields = idempotencyConflictFields(row, input, payload_canonical);
+      if (conflicting_fields.length > 0) {
+        throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, {
+          existing_event_id: row.id,
+          conflicting_fields,
+        });
       }
       return rowToEnvelope(row);
     }
@@ -1694,8 +1729,16 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             [input.stream_id, input.idempotency_key],
           );
           if (rows.length === 1) {
-            if (idempotencyContentMismatch(rows[0], input, canonicalJson(input.payload))) {
-              throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+            const conflicting_fields = idempotencyConflictFields(
+              rows[0],
+              input,
+              canonicalJson(input.payload),
+            );
+            if (conflicting_fields.length > 0) {
+              throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, {
+                existing_event_id: rows[0].id,
+                conflicting_fields,
+              });
             }
             return rowToEnvelope(rows[0]);
           }
@@ -1810,7 +1853,8 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
           stream_id,
           length: 0,
           broken_at_seq: null,
-          reason: 'stream_not_found',
+          broken_in: null,
+          reason: '流不存在：event_streams 里没有该 stream 的链头行（stream_not_found）',
           stream_exists: false,
         };
       }
@@ -1836,6 +1880,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             stream_id,
             length: eventRows.length,
             broken_at_seq: seq,
+            broken_in: 'events',
             reason: `seq 不连续：期望 ${expectedSeq}，实际 ${seq}`,
             stream_exists: true,
           };
@@ -1846,6 +1891,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             stream_id,
             length: eventRows.length,
             broken_at_seq: seq,
+            broken_in: 'events',
             reason: `prev_hash 断链：期望 ${expectedPrev}，实际 ${row.prev_hash}`,
             stream_exists: true,
           };
@@ -1860,6 +1906,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             stream_id,
             length: eventRows.length,
             broken_at_seq: seq,
+            broken_in: 'events',
             reason:
               `payload_canonical 无法重新规范化：` +
               (error instanceof Error ? error.message : String(error)),
@@ -1872,6 +1919,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             stream_id,
             length: eventRows.length,
             broken_at_seq: seq,
+            broken_in: 'events',
             reason:
               `payload_canonical 非规范形式（F14）：` +
               `重规范化=${recanonicalized}，库中=${row.payload_canonical}`,
@@ -1885,6 +1933,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             stream_id,
             length: eventRows.length,
             broken_at_seq: seq,
+            broken_in: 'events',
             reason: `hash 不匹配：重算 ${recomputed}，实际 ${row.hash}`,
             stream_exists: true,
           };
@@ -1895,12 +1944,17 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
 
       // F-b：不只看 events 行，还要校验链头行。链头被改乱/半提交时不能报绿。
       if (headLastSeq !== eventRows.length) {
+        // 断点在链头行本身：broken_at_seq 给 events 的真实末行（不是链头声称的序号），
+        // broken_in 指明位置，reason 同时给出两边数值。
         return {
           ok: false,
           stream_id,
           length: eventRows.length,
-          broken_at_seq: headLastSeq,
-          reason: `链头 last_seq 与 events 不一致：last_seq=${headLastSeq}，events 行数=${eventRows.length}`,
+          broken_at_seq: eventRows.length === 0 ? null : eventRows.length,
+          broken_in: 'stream_head',
+          reason:
+            `链头 last_seq 与 events 不一致：链头声称 last_seq=${headLastSeq}，` +
+            `events 实际行数=${eventRows.length}（断点在链头行，不在 events）`,
           stream_exists: true,
         };
       }
@@ -1910,6 +1964,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
           stream_id,
           length: eventRows.length,
           broken_at_seq: eventRows.length === 0 ? null : eventRows.length,
+          broken_in: 'stream_head',
           reason:
             `链头 last_hash 与 events 末行不一致：` +
             `last_hash=${headLastHash}，期望 ${expectedPrev}`,
@@ -1922,6 +1977,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
         stream_id,
         length: eventRows.length,
         broken_at_seq: null,
+        broken_in: null,
         reason: null,
         stream_exists: true,
       };
@@ -1997,6 +2053,44 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
           watermark: toSafeNumber(watermark.rows[0].last_global_seq, 'consumer_watermarks.last_global_seq'),
         };
       });
+    }
+
+    async function listDueWaitConditions(now: Date): Promise<DueWaitCondition[]> {
+      const cutoff = now.toISOString();
+      const { rows } = await reader.query<{
+        stream_id: string;
+        type: EventType;
+        payload: unknown;
+      }>(
+        `SELECT stream_id, type, payload FROM events
+         WHERE type IN ('WaitConditionCreated','WaitConditionSatisfied','WaitConditionExpired','WaitConditionCanceled')
+         ORDER BY stream_id ASC, seq ASC`,
+      );
+
+      const conditions = new Map<string, DueWaitCondition & { active: boolean }>();
+      for (const row of rows) {
+        const id = payloadId(row.payload, 'wait_condition_id');
+        if (id === null) continue;
+        const key = `${row.stream_id}\u0000${id}`;
+        if (row.type === 'WaitConditionCreated') {
+          const due_at = payloadField(row.payload, 'due_at');
+          conditions.set(key, {
+            stream_id: row.stream_id,
+            wait_condition_id: id,
+            task_id: payloadField(row.payload, 'task_id'),
+            due_at: due_at ?? '',
+            active: true,
+          });
+        } else {
+          const existing = conditions.get(key);
+          if (existing) existing.active = false;
+        }
+      }
+
+      return [...conditions.values()]
+        .filter((item) => item.active && item.due_at.length > 0 && item.due_at <= cutoff)
+        .map(({ active: _active, ...timer }) => timer)
+        .sort((a, b) => a.due_at.localeCompare(b.due_at) || a.wait_condition_id.localeCompare(b.wait_condition_id));
     }
 
     async function listStreams(): Promise<StreamSummary[]> {
@@ -2274,14 +2368,16 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
 
       const existing = await findByIdempotencyKey(conn, input.stream_id, input.idempotency_key);
       if (existing !== null && input.idempotency_key !== null) {
-        if (
-          idempotencyContentMismatch(
-            { ...existing, payload_canonical: canonicalJson(existing.payload) },
-            input,
-            payload_canonical,
-          )
-        ) {
-          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+        const conflicting_fields = idempotencyConflictFields(
+          { ...existing, payload_canonical: canonicalJson(existing.payload) },
+          input,
+          payload_canonical,
+        );
+        if (conflicting_fields.length > 0) {
+          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, {
+            existing_event_id: existing.id,
+            conflicting_fields,
+          });
         }
         return {
           event: existing,
@@ -2500,7 +2596,10 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       const existing = await findByIdempotencyKey(conn, input.stream_id, input.idempotency_key);
       if (existing !== null && input.idempotency_key !== null) {
         if (existing.type !== 'TaskCancelRequested') {
-          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key);
+          throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, {
+            existing_event_id: existing.id,
+            conflicting_fields: ['type'],
+          });
         }
         const facts = await deriveStreamFacts(conn, input.stream_id);
         const lifecycle = deriveTaskLifecycle(facts, input.task_id);
@@ -2649,6 +2748,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       fetchAfterWatermark,
       commitDeliveries,
       listStreams,
+      listDueWaitConditions,
     };
   }
 

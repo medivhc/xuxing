@@ -67,7 +67,7 @@ const { guard } = await store.withTransaction(async (tx) => {
 // guard.required_effects = ['cancel_active_wait_conditions', 'reset_wait_state_none']
 
 const check = await store.verifyChain(projectId);
-// 不存在的 stream：{ ok: false, stream_exists: false, reason: 'stream_not_found' }
+// 不存在的 stream：{ ok: false, stream_exists: false, reason: '流不存在：…（stream_not_found）' }
 // 链头（event_streams.last_hash/last_seq）被改乱：ok=false，定位到断点
 ```
 

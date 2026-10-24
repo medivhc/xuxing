@@ -95,7 +95,8 @@ export interface MissingFactHint {
 export interface GuardFacts {
   // §3.1 captured→defined
   hasTitle?: boolean;
-  assigneeKind?: 'human' | 'agent';
+  /** 'unassigned' = 明确未指派（与「缺失」区分；未指派不要求 Agent 结构化契约）。 */
+  assigneeKind?: 'human' | 'agent' | 'unassigned';
   contractStructured?: boolean;
   // §3.1 defined→ready（REQ-SCH-1 ready 公式逐项）
   dependenciesSatisfied?: boolean;
@@ -155,6 +156,8 @@ export interface GuardResult {
   missing_facts?: MissingFactHint[];
   /** 该格允许的触发事件类型；event_type_mismatch 时供调用方比对。 */
   expected_event_types?: EventType[];
+  /** unknown_state 时点名是哪一侧（杂-2①）：from / to / both。 */
+  unknown_state_side?: 'from' | 'to' | 'both';
   /** INV-11 / REQ-RUN-6：迁入 accepted/canceled 时内核须同事务执行的收尾动作（按序）。 */
   required_effects?: GuardEffect[];
   required_effects_basis?: 'INV-11' | 'REQ-RUN-6';
@@ -261,7 +264,8 @@ const REQUIREMENTS: Record<RequirementId, (facts: GuardFacts) => FactState> = {
   // 「指派 Agent 时另须满足 REQ-TC-1」——人工执行不要求结构化契约
   agentContractStructured: (f) => {
     if (f.assigneeKind === undefined) return 'missing';
-    if (f.assigneeKind === 'human') return 'met';
+    // 人工执行 / 明确未指派都不要求 REQ-TC-1 的结构化契约
+    if (f.assigneeKind === 'human' || f.assigneeKind === 'unassigned') return 'met';
     return flag(f.contractStructured);
   },
   // REQ-SCH-1 ready 公式：depends_on 全部满足
@@ -358,7 +362,7 @@ function missingFactHints(requirementId: RequirementId, facts: GuardFacts): Miss
       add('hasTitle', 'hasTitle=true', facts.hasTitle);
       break;
     case 'agentContractStructured':
-      add('assigneeKind', "assigneeKind='human'|'agent'", facts.assigneeKind);
+      add('assigneeKind', "assigneeKind='human'|'agent'|'unassigned'", facts.assigneeKind);
       if (facts.assigneeKind === 'agent') {
         add('contractStructured', 'contractStructured=true', facts.contractStructured);
       }
@@ -867,10 +871,25 @@ export function isMatrixCellAllowed(
   const states: readonly string[] = entity === 'task' ? TASK_STATES : RUN_STATES;
 
   if (!states.includes(from) || !states.includes(to)) {
+    const fromKnown = states.includes(from);
+    const toKnown = states.includes(to);
+    const side: 'from' | 'to' | 'both' = !fromKnown && !toKnown ? 'both' : !fromKnown ? 'from' : 'to';
     return {
       allowed: false,
-      basis: { spec_ref, row: from, col: to, cell: '–', note: '未知状态（不在该实体的状态枚举内）' },
+      basis: {
+        spec_ref,
+        row: from,
+        col: to,
+        cell: '–',
+        note:
+          side === 'both'
+            ? `未知状态：from=${JSON.stringify(from)} 与 to=${JSON.stringify(to)} 都不在该实体枚举内`
+            : side === 'from'
+              ? `未知状态：from=${JSON.stringify(from)} 不在该实体枚举内（to=${JSON.stringify(to)} 合法）`
+              : `未知状态：to=${JSON.stringify(to)} 不在该实体枚举内（from=${JSON.stringify(from)} 合法）`,
+      },
       reason: 'unknown_state',
+      unknown_state_side: side,
     };
   }
 
@@ -1013,10 +1032,17 @@ export function guardWaitStateChange(input: {
     !(TASK_WAIT_STATES as readonly string[]).includes(from) ||
     !(TASK_WAIT_STATES as readonly string[]).includes(to)
   ) {
+    const fromKnown = (TASK_WAIT_STATES as readonly string[]).includes(from);
+    const toKnown = (TASK_WAIT_STATES as readonly string[]).includes(to);
+    const side: 'from' | 'to' | 'both' = !fromKnown && !toKnown ? 'both' : !fromKnown ? 'from' : 'to';
     return {
       allowed: false,
-      basis: { spec_ref, row: lifecycle, col: to, cell: '–', note: '未知 lifecycle / wait_state' },
+      basis: {
+        spec_ref, row: lifecycle, col: to, cell: '–',
+        note: `未知状态：${side === 'both' ? 'from 与 to' : side} 不在 wait_state 枚举内`,
+      },
       reason: 'unknown_state',
+      unknown_state_side: side,
     };
   }
 

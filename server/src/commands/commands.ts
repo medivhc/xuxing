@@ -92,9 +92,20 @@ function requireClientSubmitId(value: unknown): string {
   return value;
 }
 
+/** 形状点名（杂-1①）：数组/null/Date 等要说清收到的是什么，不要笼统说 object。 */
+function describeShape(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (value instanceof Date) return 'Date';
+  return typeof value;
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new CommandValidationError('payload 必须是对象', { field: 'payload' });
+    throw new CommandValidationError(
+      `payload 必须是 plain object（收到 ${describeShape(value)}）`,
+      { field: 'payload' },
+    );
   }
   return value as Record<string, unknown>;
 }

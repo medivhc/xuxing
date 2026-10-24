@@ -286,6 +286,7 @@ describe('INV-12：哈希链', () => {
     expect(verification).toEqual({
       ok: true,
       stream_id: STREAM,
+      broken_in: null,
       length: 5,
       broken_at_seq: null,
       reason: null,
@@ -1198,18 +1199,19 @@ describe('F7：TaskLifecycleChanged 的 trigger_event_id', () => {
 });
 
 describe('verifyChain 运维真实性（F-b）', () => {
-  it('不存在的 stream → ok:false / stream_not_found（不冒充健康空流）', async () => {
+  it('不存在的 stream → ok:false / 中文 reason（不冒充健康空流，杂-1②）', async () => {
     expect(await store.verifyChain(asProjectId('proj-TYPO'))).toEqual({
       ok: false,
       stream_id: 'proj-TYPO',
       length: 0,
       broken_at_seq: null,
-      reason: 'stream_not_found',
+      broken_in: null,
+      reason: '流不存在：event_streams 里没有该 stream 的链头行（stream_not_found）',
       stream_exists: false,
     });
     expect(await store.verifyChain('' as ProjectId)).toMatchObject({
       ok: false,
-      reason: 'stream_not_found',
+      reason: expect.stringContaining('流不存在'),
       stream_exists: false,
     });
   });
@@ -1240,8 +1242,12 @@ describe('verifyChain 运维真实性（F-b）', () => {
 
     const verification = await store.verifyChain(STREAM);
     expect(verification.ok).toBe(false);
-    expect(verification.broken_at_seq).toBe(9);
+    // 杂-1③：断点在链头行本身；broken_at_seq 给 events 的真实末行而不是链头声称的 9
+    expect(verification.broken_at_seq).toBe(1);
+    expect(verification.broken_in).toBe('stream_head');
     expect(verification.reason).toContain('链头 last_seq');
+    expect(verification.reason).toContain('链头声称 last_seq=9');
+    expect(verification.reason).toContain('断点在链头行');
   });
 });
 

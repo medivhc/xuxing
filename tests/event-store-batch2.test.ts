@@ -4,7 +4,10 @@ import { asProjectId, type EventEnvelope, type EventType, type ProjectId } from 
 import {
   AppendBatchError,
   EventEntityMismatchError,
+  IdempotencyKeyConflictError,
+  PayloadNotPlainObjectError,
   ProjectCreatedRequiredError,
+  TransitionPayloadError,
   TransactionCommitError,
   TransactionScopeError,
   TerminalClosureRequiredError,
@@ -15,7 +18,10 @@ import {
   type AppendBatchEntryInput,
   type PgEventStore,
 } from '../src/kernel/event-store-pg.js';
-import { guardTransition } from '../src/kernel/transition-guard.js';
+import {
+  guardTransition,
+  isMatrixCellAllowed,
+} from '../src/kernel/transition-guard.js';
 import { createTestPg, assertPostgres16, resetEventTables, type TestPg } from './support/pg.js';
 
 // ============================================================================
@@ -625,5 +631,120 @@ describe('S4-② COMMIT 真实结果：吞掉 SQL 错误不得假成功', () => 
     });
     expect(value).toBe('committed');
     expect(await countEvents(ctx.pool)).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 杂-1：文案与运维语义（pF7）
+// ---------------------------------------------------------------------------
+describe('杂-1 pF7 文案组', () => {
+  it('① 数组 payload 点名 array（append 与状态迁移两个入口）', async () => {
+    await seedProject();
+    await expect(store.append(input({ payload: [1, 2] }))).rejects.toSatisfy((error: unknown) => {
+      expect(error).toBeInstanceOf(PayloadNotPlainObjectError);
+      expect((error as Error).message).toContain('array');
+      return true;
+    });
+
+    await expect(
+      store.appendStateTransition({
+        ...transitionEntry(),
+        payload: [1, 2],
+      } as never),
+    ).rejects.toSatisfy((error: unknown) => {
+      expect(error).toBeInstanceOf(TransitionPayloadError);
+      expect((error as Error).message).toContain('array');
+      return true;
+    });
+  });
+
+  it('③ 只有链头行的流：healthy 空流 ok，链头被改乱时 broken_in=stream_head 且 broken_at_seq=null', async () => {
+    const emptyStream = asProjectId('project-head-only');
+    await ctx.pool.query(
+      `INSERT INTO event_streams (stream_id, last_seq, last_hash) VALUES ($1, 0, $2)`,
+      [emptyStream, '0'.repeat(64)],
+    );
+    const healthy = await store.verifyChain(emptyStream);
+    expect(healthy).toMatchObject({
+      ok: true,
+      stream_exists: true,
+      length: 0,
+      broken_at_seq: null,
+      broken_in: null,
+    });
+
+    await ctx.pool.query(
+      `UPDATE event_streams SET last_seq = 3 WHERE stream_id = $1`,
+      [emptyStream],
+    );
+    const broken = await store.verifyChain(emptyStream);
+    expect(broken).toMatchObject({
+      ok: false,
+      stream_exists: true,
+      broken_at_seq: null,
+      broken_in: 'stream_head',
+    });
+    expect(broken.reason).toContain('断点在链头行');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 杂-2：unknown_state 侧别 / assigneeKind 未指派 / 幂等冲突定位
+// ---------------------------------------------------------------------------
+describe('杂-2 pF8 余项', () => {
+  it('① unknown_state 点名 from / to / both', () => {
+    const fromSide = isMatrixCellAllowed('task', 'bogus', 'defined');
+    expect(fromSide.reason).toBe('unknown_state');
+    expect(fromSide.unknown_state_side).toBe('from');
+    expect(fromSide.basis.note).toContain('from=');
+
+    const toSide = isMatrixCellAllowed('task', 'captured', 'bogus');
+    expect(toSide.unknown_state_side).toBe('to');
+
+    const both = isMatrixCellAllowed('run', 'bogus', 'also-bogus');
+    expect(both.unknown_state_side).toBe('both');
+  });
+
+  it('② assigneeKind=unassigned 可表达「未指派」，不要求 Agent 结构化契约', () => {
+    const unassigned = guardTransition({
+      entity: 'task',
+      from: 'captured',
+      to: 'defined',
+      event_type: 'TaskLifecycleChanged',
+      facts: { hasTitle: true, assigneeKind: 'unassigned' },
+    });
+    expect(unassigned.allowed).toBe(true);
+
+    const agentMissingContract = guardTransition({
+      entity: 'task',
+      from: 'captured',
+      to: 'defined',
+      event_type: 'TaskLifecycleChanged',
+      facts: { hasTitle: true, assigneeKind: 'agent' },
+    });
+    expect(agentMissingContract.allowed).toBe(false);
+    expect(agentMissingContract.missing_facts?.map((hint) => hint.fact)).toEqual([
+      'contractStructured',
+    ]);
+  });
+
+  it('③ IdempotencyKeyConflictError 带冲突事件 id 与字段名', async () => {
+    await seedProject();
+    const first = await store.append(input({ idempotency_key: 'idem-misc-1' }));
+
+    await expect(
+      store.append(input({
+        idempotency_key: 'idem-misc-1',
+        payload: { task_id: TASK_ID, title: '不同内容' },
+      })),
+    ).rejects.toSatisfy((error: unknown) => {
+      expect(error).toBeInstanceOf(IdempotencyKeyConflictError);
+      const conflict = error as IdempotencyKeyConflictError;
+      expect(conflict.existing_event_id).toBe(first.id);
+      expect(conflict.conflicting_fields).toEqual(['payload']);
+      expect(conflict.message).toContain(`existing_event_id=${first.id}`);
+      expect(conflict.message).toContain('冲突字段=payload');
+      return true;
+    });
   });
 });

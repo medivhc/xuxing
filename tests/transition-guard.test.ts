@@ -469,7 +469,7 @@ describe('§3.1/§3.2 前置条件（正向 + 反向）', () => {
       {
         requirement: 'agentContractStructured',
         fact: 'assigneeKind',
-        expected: "assigneeKind='human'|'agent'",
+        expected: "assigneeKind='human'|'agent'|'unassigned'",
       },
     ]);
     expect(result.unmet_requirements).toEqual([]);
