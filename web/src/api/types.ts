@@ -101,36 +101,28 @@ export interface RecentActivity {
 // ---------- My Actions（GET /api/actions） ----------
 
 export interface MyActionsProjection extends ProjectionMeta {
-  projection_id: 'my_actions';
+  actor_id: string;
   items: ActionItem[];
 }
 
+// 形状以服务端 server/src/api/views.ts 的 ActionItem / myActionItems 为准
+// （FIX-ROUND-4 对齐真投影，与 tests/journeys/contract.mts 同定义）。
+// 此前本节按 mock 形状写：item_id/kind/task|decision 联合、rank、decision
+// 包装、blocked_reason——真投影一样都没有，已部署「待我处理」页把每条任务
+// 都误判为 decision 行、只渲染下线占位卡（ACTIONS-EMPTY-1024）。真投影是
+// 扁平任务列表：只有任务、只有标题/项目名/下一步标签，不发明投影字段。
+// 决策待办不经此端点（服务端 myActionItems 只产任务）：决策在 Home
+// attention 呈现并跳项目页（FIX-ROUND-3 裁决；resolve_decision 仍属 K1 缺口）。
 export interface ActionItem {
-  item_id: string;
-  kind: 'task' | 'decision';
+  task_id: string;
   project_id: string;
-  task_id?: string;
-  decision_id?: string;
-  task_lifecycle?: TaskLifecycle;
-  task_wait_state?: TaskWaitState;
-  active_run?: {
-    run_id: string;
-    run_kind: 'executor' | 'human_light';
-    state: RunState;
-  };
-  decision?: {
-    question: string;
-    recommendation: string | null;
-    alternatives: string[];
-    evidence_refs: string[];
-    status: 'pending' | 'approved' | 'approved_modified' | 'rejected' | 'deferred' | 'expired';
-    expires_at: string | null;
-  };
-  /** 内核计算（OQ-08=A），前端只排序 */
-  rank: number;
+  project_name: string;
+  title: string;
+  lifecycle: TaskLifecycle;
+  wait_state: TaskWaitState;
+  /** 内核给出的下一步标签（给用户看的文案，不是 command_type） */
+  next_action: string;
   available_actions: string[];
-  /** 如 no_capable_actor、wait_state（§0.4：禁用必须给原因码） */
-  blocked_reason: string | null;
   updated_global_seq: number;
 }
 
