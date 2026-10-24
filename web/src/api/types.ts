@@ -136,21 +136,47 @@ export interface ActionItem {
 
 // ---------- Project（GET /api/projects/:projectId） ----------
 
+/**
+ * 项目级验收摘要（FIX-ROUND-1 R-8 新增键）。
+ * 口径为内核计算，前端只呈现、不自行统计（与 rank/verdict 同纪律）。
+ */
+export interface ProjectAcceptanceStatus {
+  /** awaiting_acceptance 任务 id —— Project 是验收动作落点（OQ-02=A） */
+  awaiting_task_ids: string[];
+  /** 已落 AcceptanceRecorded 最终 verdict 的任务数 */
+  recorded_count: number;
+  /** partially_accepted 且仍有待补判据的任务（部分通过待续） */
+  outstanding: Array<{ task_id: string; title: string; pending_criteria: string[] }>;
+}
+
+/**
+ * 项目内待处理提议（FIX-ROUND-1 R-8 新增键）：从 Project 直达提议页。
+ * 提议只携带 draft（标题 + 验收判据）；task_id 在提议接受后由服务端新发（R-11）。
+ */
+export interface PendingProposal {
+  proposal_id: string;
+  capture_id: string;
+  summary: string;
+  created_at: string;
+  /** 服务端广告的动作（canonical 词表，R-1） */
+  available_actions: string[];
+}
+
 export interface ProjectProjection extends ProjectionMeta {
   projection_id: 'project';
-  project_id: string;
-  name: string;
+  /** 项目标识（R-8：原顶层 project_id/name 收入此子对象） */
+  project: { project_id: string; name: string };
   goal: {
     statement: string;
     success_criteria: string;
     stop_conditions: string;
     status: 'active' | 'achieved' | 'abandoned';
   } | null;
-  plan_rev: number;
-  plan_history: Array<{ rev: number; applied_at: string; diff_summary: string }>;
   tasks: ProjectTaskRow[];
-  /** 固定 1-hop depends_on + data_from，只读（OQ-09=A） */
-  focused_subgraph: FocusedSubgraph | null;
+  acceptance_status: ProjectAcceptanceStatus;
+  /** 聚焦子图（R-8：原 focused_subgraph 改名 graph），固定 1-hop depends_on + data_from，只读（OQ-09=A） */
+  graph: ProjectGraph | null;
+  pending_proposals: PendingProposal[];
 }
 
 export interface ProjectTaskRow {
@@ -200,7 +226,7 @@ export interface AcceptanceRecord {
   superseded?: boolean;
 }
 
-export interface FocusedSubgraph {
+export interface ProjectGraph {
   root_task_id: string;
   nodes: Array<{ task_id: string; title: string; lifecycle: TaskLifecycle }>;
   edges: Array<{

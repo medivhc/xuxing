@@ -90,8 +90,7 @@ export interface MockProjectState {
     stop_conditions: string;
     status: 'active' | 'achieved' | 'abandoned';
   } | null;
-  plan_rev: number;
-  plan_history: Array<{ rev: number; applied_at: string; diff_summary: string }>;
+  // FIX-ROUND-1 R-8：plan_rev/plan_history 已从投影键集移除，mock 内部亦不再保留
 }
 
 /** 种子事件：只描述历史（seq 由 store 分配）；投影状态在 seed.ts 手工给出。 */
