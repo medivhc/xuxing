@@ -209,4 +209,32 @@ describe('POST /api/commands：完整旅途（捕获 → 提议 → 接受 → M
     const project = await jsonOf(await api(booted, `/api/projects/${DEFAULT_PROJECT_ID}`));
     expect(project.data.tasks.some((t: any) => t.proposal_id === captured.proposal_id)).toBe(false);
   });
+
+  it('R-10 回归：任务进入 awaiting_acceptance 后仍留在 /api/actions，且带 acceptance_record', async () => {
+    const captured = await capture('验收席位回归用例', 'r10-cap');
+    const accepted = await command({ type: 'proposal_accept', payload: { proposal_id: captured.proposal_id }, client_submit_id: 'r10-accept' });
+    const task_id = accepted.body.data.subject.task_id as string;
+    await command({ type: 'task_advance', payload: { task_id }, client_submit_id: 'r10-ready' });
+    await command({ type: 'task_advance', payload: { task_id }, client_submit_id: 'r10-active' });
+    await command({ type: 'feedback_submit', payload: { task_id, content: '已交付' }, client_submit_id: 'r10-fb' });
+
+    const task = await taskOf(task_id);
+    expect(task.lifecycle).toBe('awaiting_acceptance');
+
+    const actions = await jsonOf(await api(booted, '/api/actions'));
+    const item = actions.data.items.find((i: any) => i.task_id === task_id);
+    expect(item, '待验收任务必须留在 My Actions').toBeTruthy();
+    expect(item.lifecycle).toBe('awaiting_acceptance');
+    expect(item.available_actions).toContain('acceptance_record');
+
+    // 验收完成后才离开 My Actions
+    const acceptance = await command({
+      type: 'acceptance_record',
+      payload: { task_id, criterion_results: [{ criterion_ref: 'c1', verdict: 'passed' }] },
+      client_submit_id: 'r10-acceptance',
+    });
+    expect(acceptance.status, JSON.stringify(acceptance.body)).toBe(201);
+    const after = await jsonOf(await api(booted, '/api/actions'));
+    expect(after.data.items.some((i: any) => i.task_id === task_id)).toBe(false);
+  });
 });

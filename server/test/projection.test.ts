@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { EventEnvelope, EventType } from '../../src/kernel/events.ts';
 import { XuxingProjection } from '../src/projection/projection.ts';
-import { computeAvailableActions, isActionableFor } from '../src/projection/actions.ts';
+import { computeAvailableActions, isActionableFor, COMMAND_TYPES } from '../src/projection/actions.ts';
+import { availableCommands } from '../src/api/views.ts';
 
 // 投影是纯函数：只喂事件信封即可断言（不碰 PG），验证"状态全部由事件派生"。
 let seq = 0;
@@ -132,5 +133,41 @@ describe('available_actions：由内核 guard 推出', () => {
     const actions = computeAvailableActions(snap.tasks[0], snap, 'user-1');
     const verdicts = actions.filter((a) => a.id === 'record_acceptance').map((a) => a.verdict);
     expect(verdicts).toEqual(['accepted', 'rejected', 'partially_accepted']);
+  });
+
+  // FIX-ROUND-1 R-10 回归：验收席位属于"待我处理"
+  it('R-10 awaiting_acceptance → 仍可执行（isActionableFor 为真，验收动作不消失）', () => {
+    const snap = snapshotWith([
+      ev('TaskCaptured', 'proj-1', {
+        task_id: 't', title: '联系张三', assignee_kind: 'human',
+        acceptance_criteria: [{ criterion_ref: 'c1', text: '确认方案' }],
+      }),
+      ev('TaskLifecycleChanged', 'proj-1', { task_id: 't', from: 'captured', to: 'defined' }),
+      ev('TaskLifecycleChanged', 'proj-1', { task_id: 't', from: 'defined', to: 'ready' }),
+      ev('TaskLifecycleChanged', 'proj-1', { task_id: 't', from: 'ready', to: 'active' }),
+      ev('OutcomeRecorded', 'proj-1', { task_id: 't', outcome_id: 'o-1', conclusion_kind: 'achieved' }),
+      ev('TaskLifecycleChanged', 'proj-1', { task_id: 't', from: 'active', to: 'awaiting_acceptance' }),
+    ]);
+    expect(isActionableFor(snap.tasks[0], snap, 'user-1')).toBe(true);
+    expect(computeAvailableActions(snap.tasks[0], snap, 'user-1').map((a) => a.command_type)).toContain(
+      'acceptance_record',
+    );
+  });
+
+  it('R-1 available_actions 对外只说 canonical command_type（无对象、无词表外值）', () => {
+    const snap = snapshotWith([
+      ev('TaskCaptured', 'proj-1', {
+        task_id: 't', title: '联系张三', assignee_kind: 'human',
+        acceptance_criteria: [{ criterion_ref: 'c1', text: '确认方案' }],
+      }),
+      ev('TaskLifecycleChanged', 'proj-1', { task_id: 't', from: 'captured', to: 'defined' }),
+      ev('TaskLifecycleChanged', 'proj-1', { task_id: 't', from: 'defined', to: 'ready' }),
+      ev('TaskLifecycleChanged', 'proj-1', { task_id: 't', from: 'ready', to: 'active' }),
+      ev('OutcomeRecorded', 'proj-1', { task_id: 't', outcome_id: 'o-1', conclusion_kind: 'achieved' }),
+      ev('TaskLifecycleChanged', 'proj-1', { task_id: 't', from: 'active', to: 'awaiting_acceptance' }),
+    ]);
+    const commands = availableCommands(computeAvailableActions(snap.tasks[0], snap, 'user-1'));
+    expect(commands).toEqual(['acceptance_record', 'task_cancel']);
+    for (const command of commands) expect(COMMAND_TYPES).toContain(command);
   });
 });

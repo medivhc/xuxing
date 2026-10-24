@@ -220,6 +220,10 @@ export function canSubmitFeedback(task: TaskRecord, snapshot: ProjectionSnapshot
 /**
  * REQ-PJ-2：My Actions = actor=当前用户 ∧ (可执行[ready/active 且 wait_state=none] ∨ 待其决策的 Decision)。
  * K0 Web 最小形态只覆盖前半句；Decision 待决项在投影中出现 DecisionCreated 后一并纳入（见 routes）。
+ *
+ * FIX-ROUND-1 R-10：`awaiting_acceptance` 的验收动作属于"待我处理"，必须留在 My Actions 里
+ * （此前漏掉这一形态，任务一进验收就从列表消失）。判定只问"这个人此刻有没有可执行动作"，
+ * 不另立状态规则。
  */
 export function isActionableFor(task: TaskRecord, snapshot: ProjectionSnapshot, actorId: string): boolean {
   if (task.wait_state !== 'none') return false;
@@ -229,5 +233,9 @@ export function isActionableFor(task: TaskRecord, snapshot: ProjectionSnapshot, 
   }
   // 已定义但尚不就绪 / 捕获后未定义：仍是"当前用户"要推进的事（proposal 接受后即在此列）
   if (task.lifecycle === 'captured' || task.lifecycle === 'defined') return true;
+  // 待验收：有 acceptance_record 可做就是"待我处理"
+  if (task.lifecycle === 'awaiting_acceptance') {
+    return computeAvailableActions(task, snapshot, actorId).some((action) => action.command_type === 'acceptance_record');
+  }
   return false;
 }
