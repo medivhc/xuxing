@@ -92,32 +92,72 @@ export class UnknownEventTypeError extends Error {
   }
 }
 
+/** 幂等冲突时已存在事件的定位（pF8：报错必须能直接定位到冲突事件，而不是只报 key）。 */
+export interface IdempotencyConflictExisting {
+  event_id: string;
+  seq: number;
+  global_seq: number;
+  type: string;
+}
+
 /** 同 (stream_id, key) 已有事件且内容不同 —— 客户端 bug，不能伪装成重放。 */
 export class IdempotencyKeyConflictError extends Error {
   readonly stream_id: string;
   readonly idempotency_key: string;
-  /** 冲突定位（杂-2③）：既有事件 id 与首个不一致字段，便于直接排查。 */
+  /** 已存在事件的定位（event_id/seq/global_seq/type）；拿不到既有行时为 null（pF8）。 */
+  readonly existing: IdempotencyConflictExisting | null;
+  /** 冲突定位（杂-2③）：既有事件 id 与不一致字段清单（与 existing 并存的视图）。 */
   readonly existing_event_id: string | null;
   readonly conflicting_fields: string[];
   constructor(
     stream_id: string,
     idempotency_key: string,
-    location: { existing_event_id?: string | null; conflicting_fields?: string[] } = {},
+    location:
+      | IdempotencyConflictExisting
+      | {
+          existing?: IdempotencyConflictExisting | null;
+          existing_event_id?: string | null;
+          conflicting_fields?: string[];
+        }
+      | null = {},
   ) {
-    const existing_event_id = location.existing_event_id ?? null;
-    const conflicting_fields = location.conflicting_fields ?? [];
+    const direct =
+      location !== null && 'event_id' in location ? (location as IdempotencyConflictExisting) : null;
+    const bag = direct === null ? (location ?? {}) : {};
+    const existing = direct ?? ('existing' in bag ? (bag.existing ?? null) : null);
+    const existing_event_id =
+      existing?.event_id ?? ('existing_event_id' in bag ? (bag.existing_event_id ?? null) : null);
+    const conflicting_fields = 'conflicting_fields' in bag ? (bag.conflicting_fields ?? []) : [];
     super(
-      `idempotency_key 冲突：stream=${stream_id} key=${idempotency_key} ` +
-        `已存在不同内容的事件（A3：同 key 不同内容视为错误）` +
+      `idempotency_key 冲突：stream=${stream_id} key=${idempotency_key} 已存在不同内容的事件（A3：同 key 不同内容视为错误）` +
+        (existing !== null
+          ? `；已存在事件定位：event_id=${existing.event_id} seq=${existing.seq} global_seq=${existing.global_seq} type=${existing.type}`
+          : '') +
         (existing_event_id !== null ? ` existing_event_id=${existing_event_id}` : '') +
         (conflicting_fields.length > 0 ? ` 冲突字段=${conflicting_fields.join(',')}` : ''),
     );
     this.name = 'IdempotencyKeyConflictError';
     this.stream_id = stream_id;
     this.idempotency_key = idempotency_key;
+    this.existing = existing;
     this.existing_event_id = existing_event_id;
     this.conflicting_fields = conflicting_fields;
   }
+}
+
+/** 由事件行/信封构造冲突定位（bigint 字段统一过 toSafeNumber）。 */
+function conflictExistingOf(source: {
+  id: string;
+  seq: string | number;
+  global_seq: string | number;
+  type: string;
+}): IdempotencyConflictExisting {
+  return {
+    event_id: source.id,
+    seq: toSafeNumber(source.seq, 'events.seq'),
+    global_seq: toSafeNumber(source.global_seq, 'events.global_seq'),
+    type: source.type,
+  };
 }
 
 /** 存储不变量被破坏（seq 唯一约束命中、bigint 越界等）—— 立即失败，不用重试掩盖。 */
@@ -138,10 +178,13 @@ export class TransitionDeniedError extends Error {
     const expectedTypes = result.expected_event_types?.length
       ? ` expected_event_types=${result.expected_event_types.join('|')}`
       : '';
+    const unknown = result.unknown_states?.length
+      ? ` unknown=${result.unknown_states.map((u) => `${u.field}=${u.value}`).join(',')}`
+      : '';
     super(
       `状态迁移被拒绝：${result.basis.spec_ref} ${result.basis.row}→${result.basis.col} ` +
         `reason=${result.reason ?? 'unknown'}${result.unmet?.length ? ` unmet=${result.unmet.join(',')}` : ''}` +
-        missing + expectedTypes,
+        missing + expectedTypes + unknown,
     );
     this.name = 'TransitionDeniedError';
     this.result = result;
@@ -1562,6 +1605,7 @@ async function appendWithin(
       const conflicting_fields = idempotencyConflictFields(row, input, payload_canonical);
       if (conflicting_fields.length > 0) {
         throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, {
+          existing: conflictExistingOf(row),
           existing_event_id: row.id,
           conflicting_fields,
         });
@@ -1801,6 +1845,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
             );
             if (conflicting_fields.length > 0) {
               throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, {
+                existing: conflictExistingOf(rows[0]),
                 existing_event_id: rows[0].id,
                 conflicting_fields,
               });
@@ -1922,7 +1967,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
           length: 0,
           broken_at_seq: null,
           broken_in: null,
-          reason: '流不存在：event_streams 里没有该 stream 的链头行（stream_not_found）',
+          reason: '流不存在：event_streams 无此 stream 的链头行',
           stream_exists: false,
         };
       }
@@ -2021,8 +2066,8 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
           broken_at_seq: eventRows.length === 0 ? null : eventRows.length,
           broken_in: 'stream_head',
           reason:
-            `链头 last_seq 与 events 不一致：链头声称 last_seq=${headLastSeq}，` +
-            `events 实际行数=${eventRows.length}（断点在链头行，不在 events）`,
+            `链头 last_seq 与 events 不一致：链头声称 last_seq=${headLastSeq}（链头声称值），` +
+            `events 实际行数=${eventRows.length}（断点在链头行，不在 events；broken_at_seq 给 events 真实末行）`,
           stream_exists: true,
         };
       }
@@ -2443,6 +2488,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
         );
         if (conflicting_fields.length > 0) {
           throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, {
+            existing: conflictExistingOf(existing),
             existing_event_id: existing.id,
             conflicting_fields,
           });
@@ -2665,6 +2711,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       if (existing !== null && input.idempotency_key !== null) {
         if (existing.type !== 'TaskCancelRequested') {
           throw new IdempotencyKeyConflictError(input.stream_id, input.idempotency_key, {
+            existing: conflictExistingOf(existing),
             existing_event_id: existing.id,
             conflicting_fields: ['type'],
           });

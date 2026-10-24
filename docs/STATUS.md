@@ -1,20 +1,16 @@
-based_on: c8111057d3b790e8c538611b27b55d012c6d1b38
+based_on: 5aa5aa6840c7bb33fa2cba563fb5cf221d3ca886
 
 # 续行状态（STATUS）
 
 | 项 | 状态 |
 |---|---|
-| 基线 | develop/eventstore-batch1 @ ab1504e（FR4 已合入）+ Batch 2 已合入 + Q12 合入中 |
-| Batch 2（eventstore 硬化批次） | 已合入 develop（merge c811105；评审 APPROVED） |
-| K0-Q12 actor 分离（C6） | 评审 APPROVED（BLOCKER 0），合入 develop 中：REQ-ACC-2 分离拦截 + INV-6 Tool Gateway + actor 写路径校验 |
-| 内核能力 | appendBatch 批量追加 · Run 命令层守卫与派发审计 · 事务作用域与 COMMIT 真实性 · 增量消费水位（落库 + 投递幂等） · Scheduler 定时器（REQ-SCH-3） · Acceptance 重算（REQ-ACC-3） · actor 分离守卫 · Tool Gateway |
+| 基线 | develop/eventstore-batch1 @ ab1504e（FR4 已合入）+ Batch 2/Q12 已合入 + 阶段二合入中 |
+| Batch 2（eventstore 硬化批次） | 已合入 develop（评审 APPROVED） |
+| K0-Q12 actor 分离（C6） | 已合入 develop（评审 APPROVED） |
+| 阶段二（收尾杂项 + A 案自托管） | 合入 develop 中：服务端静态自托管（static.ts + SPA 回退）+ pF7/pF8 余项；与 Batch2 杂-1/杂-2 同名项已按超集口径拼接（见合入记录） |
+| 内核能力 | appendBatch · Run 守卫/审计 · 事务作用域 · 消费水位 · Scheduler · Acceptance 重算 · actor 分离守卫 · Tool Gateway · listStreams |
 | 仍留后续批次 | 生产调度循环、生产投影消费者、C1/C1b 租约对账、G1 全旅程、PlanChange 校验流水线 |
 | D9 交互契约 | v0.2 已合入 develop（D11 裁决落地） |
-| 门禁：根测试（真 PG16） | 合入后复跑回填 |
-| 门禁：server 测试 | 合入后复跑回填 |
-| 门禁：typecheck | 根 + server 均 0 错（合入后复跑确认） |
-| 门禁：web 构建 | 成功（合入后复跑确认） |
-| 门禁：journeys | 合入后复跑回填 |
-| 门禁：docs-check | 本次刷新后通过（based_on 指向合入前 develop tip） |
+| 门禁 | 合入后复跑回填 |
 
 决策见 docs/DECISIONS.md

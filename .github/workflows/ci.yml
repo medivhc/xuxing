@@ -158,6 +158,14 @@ jobs:
           JOURNEY_BASE_URL: http://127.0.0.1:8787
         run: npx playwright test specs/50-page-smoke.pw.mts
 
+      - name: Static hosting journey against real server (spec60, A 案自托管)
+        # 前置同 spec50：web/dist 已构建、真服务已启动；服务按缺省相对定位
+        # 自动托管 web/dist，本 spec 直打服务同源（无测试内静态垫片）。
+        working-directory: tests/journeys
+        env:
+          JOURNEY_BASE_URL: http://127.0.0.1:8787
+        run: npx playwright test specs/60-static-hosting.pw.mts
+
       - name: Upload server log on failure
         if: failure()
         uses: actions/upload-artifact@v4

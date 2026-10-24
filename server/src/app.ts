@@ -8,6 +8,7 @@ import { createProposer, proposerConfigFromEnv, type Proposer, type ProposerConf
 import { createHub, type Hub } from './sse/hub.ts';
 import { sseOptionsFromEnv, type SseOptions } from './sse/protocol.ts';
 import { createApp, type AppContext } from './api/routes.ts';
+import { resolveWebDist } from './api/static.ts';
 
 export interface AppConfig {
   pool: Pool;
@@ -19,6 +20,8 @@ export interface AppConfig {
   clock: () => Date;
   defaultProjectId: string;
   defaultActorId: string;
+  /** A 案静态自托管的 web/dist 目录（resolveWebDist 的结果）；null = 纯 API 形态。 */
+  webDist: string | null;
 }
 
 export interface BuildOptions {
@@ -33,6 +36,11 @@ export interface BuildOptions {
   defaultActorId?: string;
   /** 启动时是否全量重演投影（默认 true）。 */
   rebuild?: boolean;
+  /**
+   * A 案静态自托管：undefined = 按环境解析（XUXING_WEB_DIST / 缺省相对定位）；
+   * 显式 null = 强制纯 API 形态；字符串 = 指定 dist 目录。
+   */
+  webDist?: string | null;
 }
 
 /** 默认演示项目 id（种子脚本写入；与 seed/demo.ts 同源常量）。 */
@@ -58,6 +66,7 @@ export async function buildApp(options: BuildOptions): Promise<{ app: ReturnType
     clock,
     defaultProjectId: options.defaultProjectId ?? DEFAULT_PROJECT_ID,
     defaultActorId: options.defaultActorId ?? DEFAULT_ACTOR_ID,
+    webDist: options.webDist === undefined ? resolveWebDist() : options.webDist,
   };
 
   if (options.rebuild !== false) await projection.rebuild();
