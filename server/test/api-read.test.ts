@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { api, bootApp, jsonOf, TEST_SSE, type BootedApp } from './support/harness.ts';
-import { DEFAULT_PROJECT_ID } from '../src/seed/demo.ts';
+import { DEFAULT_PROJECT_ID, seedDemo } from '../src/seed/demo.ts';
 import { COMMAND_TYPES } from '../src/projection/actions.ts';
 import { sseOptionsFromEnv } from '../src/sse/protocol.ts';
 
@@ -63,12 +63,73 @@ describe('§4 HTTP 契约：投影类端点', () => {
     expect(body.ok).toBe(true);
     expect(body.data.projection_version).toBe(booted.config.projection.version());
     expect(body.data.goal.statement).toContain('张三');
-    expect(body.data.tasks).toHaveLength(4);
-    expect(body.data.graph.nodes).toHaveLength(4);
-    expect(body.data.acceptance_status).toMatchObject({ accepted: 1, total: 4 });
+    // R-7 种子契约：4 条跨生命周期任务 + 1 条已取消夹具
+    expect(body.data.tasks).toHaveLength(5);
+    expect(body.data.graph.nodes).toHaveLength(5);
+    expect(body.data.acceptance_status).toMatchObject({ accepted: 1, total: 5 });
     const accepted = body.data.tasks.find((t: any) => t.task_id === 'task_demo_kickoff');
     expect(accepted.lifecycle).toBe('accepted');
     expect(accepted.acceptance.verdict).toBe('accepted');
+    const canceled = body.data.tasks.find((t: any) => t.task_id === 'task_demo_archived');
+    expect(canceled).toMatchObject({ lifecycle: 'canceled', cancel_requested: true, available_actions: [] });
+  });
+
+  it('R-7 种子契约：4 条 canonical 任务跨生命周期 + 1 条已取消夹具，My Actions 不含已取消项', async () => {
+    const project = await jsonOf(await api(booted, `/api/projects/${DEFAULT_PROJECT_ID}`));
+    const byId = new Map(project.data.tasks.map((t: any) => [t.task_id, t]));
+    expect([...byId.keys()].sort()).toEqual([
+      'task_demo_archived',
+      'task_demo_contact',
+      'task_demo_contract',
+      'task_demo_kickoff',
+      'task_demo_quote',
+    ]);
+    expect(byId.get('task_demo_contact')).toMatchObject({ lifecycle: 'active' });
+    expect(byId.get('task_demo_quote')).toMatchObject({ lifecycle: 'ready' });
+    expect(byId.get('task_demo_contract')).toMatchObject({ lifecycle: 'defined' });
+    expect(byId.get('task_demo_kickoff')).toMatchObject({ lifecycle: 'accepted' });
+    expect(byId.get('task_demo_archived')).toMatchObject({ lifecycle: 'canceled' });
+
+    const events = await booted.harness.store.readStream(DEFAULT_PROJECT_ID, 1);
+    const canceledEvents = events.filter(
+      (e) => e.type === 'TaskCanceled' && (e.payload as Record<string, unknown>)['task_id'] === 'task_demo_archived',
+    );
+    expect(canceledEvents).toHaveLength(1);
+
+    const actions = await jsonOf(await api(booted, '/api/actions'));
+    expect(actions.data.items.map((i: any) => i.task_id)).not.toContain('task_demo_archived');
+  });
+
+  it('R-7② 降级夹具：proj-degraded + prop-degraded-1 预置，degraded 标记透传', async () => {
+    const proposal = await jsonOf(await api(booted, '/api/proposals/prop-degraded-1'));
+    expect(proposal.ok).toBe(true);
+    expect(proposal.data).toMatchObject({
+      project_id: 'proj-degraded',
+      status: 'proposed',
+      kind: 'capture_task',
+      degraded: true,
+    });
+    expect(proposal.data.proposer).toMatchObject({ source: 'fallback', degraded: true, degraded_reason: 'not_configured' });
+    expect(proposal.data.available_actions).toEqual(['proposal_accept', 'proposal_reject']);
+
+    const project = await jsonOf(await api(booted, '/api/projects/proj-degraded'));
+    expect(project.ok).toBe(true);
+    expect(project.data.pending_proposals).toHaveLength(1);
+    expect(project.data.pending_proposals[0]).toMatchObject({ proposal_id: 'prop-degraded-1', degraded: true });
+
+    const home = await jsonOf(await api(booted, '/api/home'));
+    expect(home.data.projects.some((p: any) => p.project_id === 'proj-degraded')).toBe(true);
+    expect(home.data.proposals.degraded).toBeGreaterThanOrEqual(1);
+  });
+
+  it('种子幂等：重复执行不产生重复实体（含夹具）', async () => {
+    const before = booted.config.projection.version();
+    const again = await seedDemo({ store: booted.harness.store, projection: booted.config.projection });
+    // 幂等：不新增任何事件，水位不动
+    expect(again.projection_version).toBe(before);
+    expect(again.tasks).toBe(5);
+    const proposals = await booted.config.projection.snapshot().proposals.filter((p) => p.proposal_id === 'prop-degraded-1');
+    expect(proposals).toHaveLength(1);
   });
 
   it('GET /api/projects/:projectId 不存在 → 404', async () => {

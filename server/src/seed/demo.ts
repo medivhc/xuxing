@@ -12,6 +12,14 @@ export const DEFAULT_PROJECT_ID = 'proj_demo_oq05';
 export const DEFAULT_ACTOR_ID = 'user_demo';
 export const DEFAULT_PG_URL = 'postgres://postgres:postgres@127.0.0.1:55432/xuxing';
 
+/**
+ * 降解场景夹具的固定 id（FIX-ROUND-1 R-7②）。界面与旅程测试按 id 直达，
+ * 用来演示"模型不可达时提议层降级"——该提议在断开 magpie 时同样可达（它只是事件，不回源）。
+ */
+export const DEGRADED_PROJECT_ID = 'proj-degraded';
+export const DEGRADED_PROPOSAL_ID = 'prop-degraded-1';
+export const DEGRADED_GOAL_ID = 'goal-degraded-1';
+
 export const DEMO_PROJECT = {
   project_id: DEFAULT_PROJECT_ID,
   name: '续行演示 · 客户方案落地',
@@ -30,12 +38,14 @@ type SeedTask = {
   title: string;
   description: string;
   criteria: Array<{ criterion_ref: string; text: string; auto: boolean }>;
-  /** 种子内推进到哪个阶段：defined / ready / active / awaiting_acceptance / accepted */
-  stage: 'defined' | 'ready' | 'active' | 'awaiting_acceptance' | 'accepted';
+  /** 种子内推进到哪个阶段：defined / ready / active / awaiting_acceptance / accepted / canceled */
+  stage: 'defined' | 'ready' | 'active' | 'awaiting_acceptance' | 'accepted' | 'canceled';
   run?: 'none' | 'human_light_running' | 'human_light_succeeded';
   feedback?: string;
   outcome?: { conclusion_kind: string; info_obtained: boolean };
   acceptance?: 'accepted';
+  /** stage=canceled 时的收尾说明（记入 TaskCanceled 事件） */
+  cancel_reason?: string;
 };
 
 const DEMO_TASKS: SeedTask[] = [
@@ -75,12 +85,24 @@ const DEMO_TASKS: SeedTask[] = [
     outcome: { conclusion_kind: 'achieved', info_obtained: true },
     acceptance: 'accepted',
   },
+  // FIX-ROUND-1 R-7①：预置一条已取消任务，My Actions 不应出现它
+  {
+    task_id: 'task_demo_archived',
+    title: '复核旧版报价模板',
+    description: '已按客户要求改为使用现行模板，本条作废（种子演示"已取消"状态）。',
+    criteria: [{ criterion_ref: 'c1', text: '模板与现行版本一致', auto: false }],
+    stage: 'canceled',
+    run: 'human_light_running',
+    cancel_reason: 'superseded_by_current_template',
+  },
 ];
 
 export interface SeedResult {
   project_id: string;
   created: boolean;
   tasks: number;
+  /** R-7 夹具：本过程结束时恰好存在的降级夹具提议（重复执行也不重复入账）。 */
+  degraded_fixture: { project_id: string; proposal_id: string };
   projection_version: number;
 }
 
@@ -259,8 +281,41 @@ export async function seedDemo(input: {
         to: 'active',
         payload: { task_id: seed.task_id },
       });
+      if (seed.stage === 'active') return;
 
-      if (seed.stage === 'active' || seed.run !== 'human_light_succeeded') return;
+      // 已取消（FIX-ROUND-1 R-7①）：INV-11 收尾顺序与 task_cancel 命令一致——
+      // 取消意图 → 取消活动 Run → 迁移 canceled（allRunsTerminal）→ TaskCanceled
+      if (seed.stage === 'canceled') {
+        await tx.append({
+          ...base,
+          type: 'TaskCancelRequested',
+          idempotency_key: key('cancel-requested'),
+          payload: { task_id: seed.task_id, requested_by: actor_id, reason: seed.cancel_reason ?? 'seed_canceled' },
+        });
+        await tx.append({
+          ...base,
+          type: 'RunCanceled',
+          idempotency_key: key('run-canceled'),
+          payload: { run_id: `run_${seed.task_id}`, reason: 'task_canceled' },
+        });
+        await tx.appendStateTransition({
+          ...base,
+          type: 'TaskLifecycleChanged',
+          entity: 'task',
+          idempotency_key: key('lc-canceled'),
+          from: 'active',
+          to: 'canceled',
+          facts: { allRunsTerminal: true },
+          payload: { task_id: seed.task_id },
+        });
+        await tx.append({
+          ...base,
+          type: 'TaskCanceled',
+          idempotency_key: key('canceled'),
+          payload: { task_id: seed.task_id, reason: seed.cancel_reason ?? 'seed_canceled' },
+        });
+        return;
+      }
 
       // 完成反馈 → Outcome → Run 成功 → awaiting_acceptance
       const feedback_id = `fb_${seed.task_id}`;
@@ -375,12 +430,96 @@ export async function seedDemo(input: {
   }
 
   await ingest(store, projection, project_id);
+
+  // FIX-ROUND-1 R-7②：降级场景夹具（proj-degraded + prop-degraded-1）。
+  // 只是一条已落账的 degraded 提议：断开 magpie 时同样可达，界面只需读投影就能演示"这不是智能产出"。
+  await seedDegradedFixture({ store, projection, actor_id });
+
   return {
     project_id,
     created: existing === undefined,
     tasks: projection.snapshot().tasks.filter((t) => t.project_id === project_id).length,
+    degraded_fixture: { project_id: DEGRADED_PROJECT_ID, proposal_id: DEGRADED_PROPOSAL_ID },
     projection_version: projection.version(),
   };
+}
+
+/** 降级夹具：一个独立项目 + 一条 degraded=true 的待决提议（幂等键固定，重复执行不重复入账）。 */
+async function seedDegradedFixture(input: {
+  store: PgEventStore;
+  projection: ProjectionService;
+  actor_id: string;
+}): Promise<void> {
+  const { store, projection, actor_id } = input;
+  const snapshot = projection.snapshot();
+  if (snapshot.proposals.some((p) => p.proposal_id === DEGRADED_PROPOSAL_ID)) return;
+
+  const base = {
+    stream_id: DEGRADED_PROJECT_ID,
+    actor_id,
+    actor_kind: 'human' as const,
+    causation_id: null,
+    correlation_id: `seed-${DEGRADED_PROJECT_ID}`,
+  };
+  const key = (suffix: string) => `seed:${DEGRADED_PROJECT_ID}:${suffix}`;
+
+  await store.withTransaction(async (tx) => {
+    if (!snapshot.projects.some((p) => p.project_id === DEGRADED_PROJECT_ID)) {
+      await tx.append({
+        ...base,
+        type: 'ProjectCreated',
+        idempotency_key: key('project'),
+        payload: { name: '续行演示 · 降级场景', policy_id: DEMO_PROJECT.policy_id, created_by: actor_id },
+      });
+      await tx.append({
+        ...base,
+        type: 'GoalCreated',
+        idempotency_key: key('goal'),
+        payload: {
+          goal_id: DEGRADED_GOAL_ID,
+          statement: '模型不可达时，系统仍能把捕获的输入记成可审阅的提议',
+          success_criteria: '用户能看到降级明示，并决定接受或拒绝',
+          stop_conditions: '用户拒绝该提议时停止',
+        },
+      });
+    }
+    await tx.append({
+      ...base,
+      type: 'PlanChangeProposed',
+      idempotency_key: key('proposal'),
+      payload: {
+        change_id: DEGRADED_PROPOSAL_ID,
+        client_proposal_id: 'cap-degraded-1',
+        kind: 'capture_task',
+        capture_id: 'cap-degraded-1',
+        task_id: null,
+        base_plan_rev: 1,
+        ops: [{ op: 'add_task' }],
+        risk_level: 'L0',
+        rationale: '模型不可用，按输入文本生成确定性占位草稿（种子预置）',
+        assumptions: ['模型不可用，任务草稿为确定性占位'],
+        proposer: {
+          source: 'fallback',
+          model: null,
+          degraded: true,
+          degraded_reason: 'not_configured',
+          latency_ms: null,
+        },
+        details: {
+          task: {
+            title: '跟进降级状态下捕获的事项',
+            description: '由种子预置的降级草稿，用于演示"模型不可达时提议层降级"的界面与 API 形态。',
+            assignee_kind: 'human',
+            acceptance_criteria: [{ criterion_ref: 'c1', text: '事项已跟进并留有可核对记录', auto: false }],
+          },
+        },
+        proposed_at: null,
+        seeded: true,
+      },
+    });
+  });
+
+  await ingest(store, projection, DEGRADED_PROJECT_ID);
 }
 
 async function ingest(store: PgEventStore, projection: ProjectionService, project_id: string): Promise<void> {
