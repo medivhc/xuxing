@@ -3,6 +3,10 @@
 // 只在这里读取 JOURNEY_* 环境变量：Playwright 配置、SSE 客户端、mock 服务、
 // 各个 spec 都从本文件取，集成时把 JOURNEY_BASE_URL 指向真服务即可一键切换。
 // 不允许在别处再写死 127.0.0.1 / 端口 / 项目 id。
+//
+// 默认值 = 服务端种子契约（FIX-ROUND-1 R-7，见 server/README.md「种子契约」）：
+// mock 用同一组 ID 播种，因此「默认打 mock」与「JOURNEY_BASE_URL 指向真服务」
+// 两种跑法断言一致，不需要为真服务额外覆盖任何种子变量。
 
 const env = process.env;
 
@@ -24,31 +28,45 @@ export const USING_EXTERNAL_SERVICE = typeof env.JOURNEY_BASE_URL === 'string' &
 export const MOCK_PORT = mockPort;
 
 /** 当前用户：旅程里所有 available_actions / My Actions 都以这个 actor 计算。 */
-export const CURRENT_ACTOR_ID = env.JOURNEY_ACTOR_ID ?? 'actor-human-1';
+export const CURRENT_ACTOR_ID = env.JOURNEY_ACTOR_ID ?? 'user_demo';
 
-/** 主旅程的演示项目（mock 启动时种子化；真服务集成时用 env 指向已种子的项目）。 */
+/**
+ * 主旅程的演示项目（R-7 种子契约）。
+ * 种子初始即有 5 条任务，其中 3 条在 My Actions（contact/quote/contract）；
+ * 「从空开始」的旅程现场走 POST /api/capture 建任务。
+ */
 export const DEMO = {
-  projectId: env.JOURNEY_PROJECT_ID ?? 'proj-demo',
-  goalId: env.JOURNEY_GOAL_ID ?? 'goal-demo',
-  /** 种子里的历史任务：已取消，任何 actor 都无可用动作（用于 409 越权测试）。 */
-  canceledTaskId: env.JOURNEY_SEED_CANCELED_TASK_ID ?? 'task-demo-legacy',
-} as const;
-
-/** 降级旅程的演示项目：种子中已有一条 degraded 提议。 */
-export const DEGRADED = {
-  projectId: env.JOURNEY_DEGRADED_PROJECT_ID ?? 'proj-degraded',
-  proposalId: env.JOURNEY_DEGRADED_PROPOSAL_ID ?? 'prop-degraded-1',
-  taskId: env.JOURNEY_DEGRADED_TASK_ID ?? 'task-degraded-1',
+  projectId: env.JOURNEY_PROJECT_ID ?? 'proj_demo_oq05',
+  goalId: env.JOURNEY_GOAL_ID ?? 'goal_demo_oq05',
+  /** R-7① 已取消夹具：available_actions=[]，用于 409 越权测试。 */
+  canceledTaskId: env.JOURNEY_SEED_CANCELED_TASK_ID ?? 'task_demo_archived',
 } as const;
 
 /**
- * SSE 背压上限（mock 的默认值，也可被 env 覆盖用于集成）。
- * 契约义务：连接数上限、每连接待发队列上限、慢消费者超时断开。
- * 测试从 GET /api/health 读服务端实际生效值；接口没给时回落到这里。
+ * 降级旅程的演示项目（R-7② 夹具）：种子里已有一条 degraded=true 的待决提议。
+ * 提议带的是 draft（标题 + 判据），**不预告 task_id**（R-11）——
+ * 任务 id 只能在接受提议后从响应/投影里取，所以这里没有 taskId 配置项。
+ */
+export const DEGRADED = {
+  projectId: env.JOURNEY_DEGRADED_PROJECT_ID ?? 'proj-degraded',
+  goalId: env.JOURNEY_DEGRADED_GOAL_ID ?? 'goal-degraded-1',
+  proposalId: env.JOURNEY_DEGRADED_PROPOSAL_ID ?? 'prop-degraded-1',
+} as const;
+
+/**
+ * SSE 背压参数。
+ *
+ * 断言口径（R-4）：一律以 GET /api/health 的 `data.limits` 上报值为准——
+ * 真服务是 heartbeat_ms=15000 / max_connections=32 / max_queue=256，mock 由
+ * 下面的 EV 变量控制（默认取更小的值，让背压用例在本地几秒内跑完）。
+ * 这些值只是 mock 的默认值，绝不用于假设真服务的上限。
  */
 export const SSE_LIMITS = {
+  /** mock 连接数上限（真服务读 health.limits.max_connections） */
   maxConnections: Number(env.JOURNEY_SSE_MAX_CONNECTIONS ?? '4'),
+  /** mock 每连接待发队列上限（真服务读 health.limits.max_queue） */
   maxPendingPerConnection: Number(env.JOURNEY_SSE_MAX_QUEUE ?? '64'),
+  /** mock 慢消费者断开阈值（真服务不暴露该值，断言只要求「最终被断开」） */
   slowConsumerTimeoutMs: Number(env.JOURNEY_SSE_SLOW_TIMEOUT_MS ?? '1000'),
   /**
    * mock 的发送泵节拍：每 N ms 从待发队列取一帧。见 README「背压如何可测」。

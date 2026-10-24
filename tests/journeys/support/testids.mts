@@ -1,9 +1,8 @@
 // UI 测试锚点命名契约（与 mock/public/app.js 的 data-testid 一一对应）。
 //
-// 这套名字尽量沿用 tests/e2e/journeys.spec.ts 末尾的 TESTID 骨架：
-// capture-input / capture-submit / task-lifecycle / goal-status /
-// my-actions-row / criterion-pass-* / criterion-fail-* / acceptance-submit /
-// pending-criteria 等；新增的提案与 degraded 锚点在此登记。
+// mock UI 是「投影渲染器」：每个锚点只渲染投影字段。旅程只在 mock 轮断言 UI；
+// 真服务轮（JOURNEY_BASE_URL 指向 8787）没有同款 UI，UI 步骤自动跳过，
+// 领域断言仍全部走投影接口（见各 spec 的 usingMock 判定）。
 
 export const TID = {
   navHome: 'nav-home',
@@ -26,15 +25,14 @@ export const TID = {
 
   myActionsRow: 'my-actions-row',
   actionTaskTitle: 'action-task-title',
-  actionCompleteTask: 'action-complete-task',
+  actionAdvanceTask: 'action-advance-task',
+  actionSubmitFeedback: 'action-submit-feedback',
   actionOpenAcceptance: 'action-open-acceptance',
-  actionDegraded: 'action-degraded',
   actionsEmpty: 'actions-empty',
 
   taskRow: 'task-row',
   taskTitle: 'task-title',
   taskLifecycle: 'task-lifecycle',
-  taskDegraded: 'task-degraded',
   projectTitle: 'project-title',
   goalStatus: 'goal-status',
   projectAcceptanceStatus: 'project-acceptance-status',
@@ -51,7 +49,6 @@ export const TID = {
   homeProjectCard: 'home-project-card',
   homePendingCount: 'home-pending-count',
   homeGoalStatus: 'home-goal-status',
-  homeDegraded: 'home-degraded',
   homeActivityItem: 'home-activity-item',
 
   appError: 'app-error',
@@ -60,13 +57,14 @@ export const TID = {
 export const criterionPass = (ref: string): string => `criterion-pass-${ref}`;
 export const criterionFail = (ref: string): string => `criterion-fail-${ref}`;
 
-/** 旅程里断言的具体判据 id（与 mock/state.mts 的 DEFAULT_CRITERIA 对齐）。 */
-export const DEMO_CRITERIA = {
-  importMapped: 'c-import-mapped',
-  dualTrackReport: 'c-dual-track-report',
-} as const;
-
-export const DEGRADED_CRITERIA = {
-  leadsExport: 'c-leads-export',
-  leadsDedup: 'c-leads-dedup',
+/**
+ * 现场捕获（capture → 提议）生成任务的判据 ref（mock 的确定性提议固定给这两条）。
+ *
+ * 真服务（magpie 开）由模型自由给 ref（实测 c1/c2/c3），所以旅程的判据断言一律
+ * **以提议投影里的 acceptance_criteria 为准**，不假设 ref；这两个常量只用于 mock 轮的
+ * UI 点击锚点（mock 提议在 support/testids.mts 里是唯一来源）。
+ */
+export const JOURNEY_CRITERIA = {
+  primary: 'c-journey-1',
+  secondary: 'c-journey-2',
 } as const;

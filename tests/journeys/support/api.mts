@@ -1,16 +1,20 @@
 import type { APIRequestContext } from '@playwright/test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type {
-  ActionsProjection,
+  ActionItem,
+  ActionsData,
   ApiErrorBody,
-  CaptureResponse,
-  CommandResponse,
+  CaptureData,
+  CommandResultData,
   CommandType,
-  HealthResponse,
-  HomeProjection,
-  ProjectProjection,
-  ProjectTaskNode,
-  ProposalProjection,
+  HealthData,
+  HomeData,
+  HomeProjectSummary,
+  ProjectData,
+  ProjectResponse,
+  ProjectTaskRow,
+  ProposalData,
+  SuccessEnvelope,
 } from '../contract.mts';
 import {
   CURRENT_ACTOR_ID,
@@ -22,8 +26,10 @@ import {
 // ============================================================================
 // 投影接口客户端与轮询断言工具。
 //
-// 纪律：旅程的**领域状态断言只读投影**（home / project / actions / proposal）。
-// 这里不暴露任何 mock 内部结构；协议级 SSE 测试走 sse-client.mts。
+// 纪律（R-2）：全部端点统一信封 {ok:true,data} / {ok:false,error}。
+// 本客户端是**唯一**的解包点：业务函数一律返回 `data`，任何调用方都不再读响应顶层。
+// 旅程的领域状态断言只读投影（home / project / actions / proposal）；
+// 协议级 SSE 测试走 sse-client.mts。
 // ============================================================================
 
 export interface JsonResult<T> {
@@ -53,6 +59,7 @@ export async function requestJson<T>(
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json',
+      'x-xuxing-actor': CURRENT_ACTOR_ID,
       ...(init.headers ?? {}),
     },
   });
@@ -68,54 +75,76 @@ export async function requestJson<T>(
   return { status: response.status(), body: body as T };
 }
 
-export async function getJson<T>(request: APIRequestContext, path: string): Promise<T> {
-  const result = await requestJson<T>(request, path);
+function isSuccessEnvelope<T>(body: unknown): body is SuccessEnvelope<T> {
+  return typeof body === 'object' && body !== null && (body as { ok?: unknown }).ok === true;
+}
+
+function isErrorEnvelope(body: unknown): body is ApiErrorBody {
+  return typeof body === 'object' && body !== null && (body as { ok?: unknown }).ok === false;
+}
+
+/** 拆信封：成功返回 data，失败抛 HttpError（code/message 原样保留）。 */
+export function unwrap<T>(path: string, status: number, body: unknown): T {
+  if (isSuccessEnvelope<T>(body)) return body.data;
+  const detail = isErrorEnvelope(body) ? `${body.error.code}: ${body.error.message}` : JSON.stringify(body);
+  throw new HttpError(status, body, `${path} 失败（HTTP ${status}）：${detail}`);
+}
+
+/**
+ * 读一个 GET 端点：断言 200 + ok:true，返回 data。
+ * 端点不存在时给出可读报错（真服务与 mock 的端点集合必须一致，缺端点算契约缺口）。
+ */
+export async function getData<T>(request: APIRequestContext, path: string): Promise<T> {
+  const result = await requestJson<unknown>(request, path);
   if (result.status !== 200) {
     throw new HttpError(result.status, result.body, `GET ${path} 期望 200，实际 ${result.status}`);
   }
-  return result.body;
+  return unwrap<T>(path, result.status, result.body);
 }
 
-export function getHealth(request: APIRequestContext): Promise<HealthResponse> {
-  return getJson<HealthResponse>(request, '/api/health');
+export function getHealth(request: APIRequestContext): Promise<HealthData> {
+  return getData<HealthData>(request, '/api/health');
 }
 
-export function getHome(request: APIRequestContext): Promise<HomeProjection> {
-  return getJson<HomeProjection>(request, '/api/home');
+export function getHome(request: APIRequestContext): Promise<HomeData> {
+  return getData<HomeData>(request, '/api/home');
 }
 
-export function getActions(request: APIRequestContext): Promise<ActionsProjection> {
-  return getJson<ActionsProjection>(request, '/api/actions');
+export function getActions(request: APIRequestContext): Promise<ActionsData> {
+  return getData<ActionsData>(request, '/api/actions');
 }
 
-export function getProject(request: APIRequestContext, projectId: string): Promise<ProjectProjection> {
-  return getJson<ProjectProjection>(request, `/api/projects/${encodeURIComponent(projectId)}`);
+export function getProject(request: APIRequestContext, projectId: string): Promise<ProjectData> {
+  return getData<ProjectData>(request, `/api/projects/${encodeURIComponent(projectId)}`);
 }
 
-export function getProposal(request: APIRequestContext, proposalId: string): Promise<ProposalProjection> {
-  return getJson<ProposalProjection>(request, `/api/proposals/${encodeURIComponent(proposalId)}`);
+export function getProposal(request: APIRequestContext, proposalId: string): Promise<ProposalData> {
+  return getData<ProposalData>(request, `/api/proposals/${encodeURIComponent(proposalId)}`);
 }
 
+/** POST /api/capture：首次 201、幂等重放 200，均返回 data。 */
 export async function capture(
   request: APIRequestContext,
   text: string,
-): Promise<CaptureResponse> {
-  const result = await requestJson<CaptureResponse>(request, '/api/capture', {
+  options: { projectId?: string } = {},
+): Promise<CaptureData> {
+  const result = await requestJson<unknown>(request, '/api/capture', {
     method: 'POST',
-    data: { text },
+    data: { text, ...(options.projectId ? { project_id: options.projectId } : {}) },
   });
   if (result.status !== 201 && result.status !== 200) {
     throw new HttpError(result.status, result.body, `POST /api/capture 期望 201/200，实际 ${result.status}`);
   }
-  if (!result.body?.capture_id) {
-    throw new Error(`capture 响应缺少 capture_id：${JSON.stringify(result.body)}`);
+  const data = unwrap<CaptureData>('/api/capture', result.status, result.body);
+  if (!data.capture_id) {
+    throw new Error(`capture 响应的 data 缺少 capture_id：${JSON.stringify(result.body)}`);
   }
-  return result.body;
+  return data;
 }
 
 export interface CommandResult {
   status: number;
-  body: CommandResponse | ApiErrorBody;
+  body: unknown;
 }
 
 export async function postCommand(
@@ -124,10 +153,34 @@ export async function postCommand(
   payload: Record<string, unknown>,
   clientSubmitId: string,
 ): Promise<CommandResult> {
-  return requestJson<CommandResponse | ApiErrorBody>(request, '/api/commands', {
+  return requestJson<unknown>(request, '/api/commands', {
     method: 'POST',
     data: { type, payload, client_submit_id: clientSubmitId },
   });
+}
+
+/** R-6：首次成功命令 = 201 + {ok:true,data}；data.replayed === false。 */
+export function expectCreatedCommand(result: CommandResult): CommandResultData {
+  if (result.status !== 201) {
+    throw new Error(`命令期望 201，实际 ${result.status}：${JSON.stringify(result.body)}`);
+  }
+  const data = unwrap<CommandResultData>('/api/commands', result.status, result.body);
+  if (data.replayed !== false) {
+    throw new Error(`首次命令 data.replayed 必须为 false：${JSON.stringify(result.body)}`);
+  }
+  return data;
+}
+
+/** R-6：幂等重放 = 200 + {ok:true,data} + data.replayed === true。 */
+export function expectReplayedCommand(result: CommandResult): CommandResultData {
+  if (result.status !== 200) {
+    throw new Error(`幂等重放期望 200，实际 ${result.status}：${JSON.stringify(result.body)}`);
+  }
+  const data = unwrap<CommandResultData>('/api/commands', result.status, result.body);
+  if (data.replayed !== true) {
+    throw new Error(`幂等重放 data.replayed 必须为 true：${JSON.stringify(result.body)}`);
+  }
+  return data;
 }
 
 /** 轮询投影直到 predicate 为真；超时抛出带最后一次投影的错误。 */
@@ -154,11 +207,12 @@ export async function waitForProjection<T>(
   throw new Error(`等待投影超时：${description}\n${detail}`);
 }
 
-export function findTask(project: ProjectProjection, taskId: string): ProjectTaskNode {
-  const task = project.task_graph.nodes.find((node) => node.task_id === taskId);
+/** R-8：任务在项目视图 `data.tasks` 里（旧读法 task_graph.nodes 已作废）。 */
+export function findTask(project: ProjectData, taskId: string): ProjectTaskRow {
+  const task = project.tasks.find((node) => node.task_id === taskId);
   if (!task) {
     throw new Error(
-      `Project ${project.project_id} 中找不到 task ${taskId}；现有：${project.task_graph.nodes
+      `Project ${project.project.project_id} 中找不到 task ${taskId}；现有：${project.tasks
         .map((node) => node.task_id)
         .join(', ')}`,
     );
@@ -166,30 +220,29 @@ export function findTask(project: ProjectProjection, taskId: string): ProjectTas
   return task;
 }
 
+/** R-8：任务图节点在 `data.graph.nodes`（节点字段是 {id,title,lifecycle}）。 */
+export function findGraphNode(project: ProjectData, taskId: string): ProjectData['graph']['nodes'][number] {
+  const node = project.graph.nodes.find((candidate) => candidate.id === taskId);
+  if (!node) {
+    throw new Error(
+      `Project ${project.project.project_id} 的任务图里找不到节点 ${taskId}；现有：${project.graph.nodes
+        .map((candidate) => candidate.id)
+        .join(', ')}`,
+    );
+  }
+  return node;
+}
+
+/** My Actions 里的某一行（不存在返回 undefined）。 */
+export function findAction(actions: ActionsData, taskId: string): ActionItem | undefined {
+  return actions.items.find((row) => row.task_id === taskId);
+}
+
 /** Home 里某个项目的摘要。 */
-export function projectSummary(home: HomeProjection, projectId: string) {
+export function projectSummary(home: HomeData, projectId: string): HomeProjectSummary {
   const summary = home.projects.find((project) => project.project_id === projectId);
   if (!summary) throw new Error(`Home 投影中找不到 project ${projectId}`);
   return summary;
-}
-
-export async function waitForActiveStreams(
-  request: APIRequestContext,
-  expected: number,
-  timeoutMs = POLL_TIMEOUT_MS,
-): Promise<HealthResponse | null> {
-  const first = await getHealth(request);
-  if (!first.streams || typeof first.streams.active !== 'number') {
-    // 外部真服务的 /api/health 契约只保证 {ok:true}；没有 active 计数时
-    // 跳过这项本地观测，不让 mock 扩展字段成为集成阻塞项。
-    return null;
-  }
-  return waitForProjection(
-    () => getHealth(request),
-    (health) => health.streams?.active === expected,
-    `SSE active streams == ${expected}`,
-    timeoutMs,
-  );
 }
 
 export function currentActorId(): string {
@@ -199,3 +252,6 @@ export function currentActorId(): string {
 export function absoluteUrl(path: string): string {
   return path.startsWith('http') ? path : `${JOURNEY_BASE_URL}${path}`;
 }
+
+// 供 spec 直接引用投影类型（避免各自 import contract）。
+export type { ProjectData, ProjectTaskRow, ProposalData, ActionsData, HomeData };
