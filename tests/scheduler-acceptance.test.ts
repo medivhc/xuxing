@@ -73,6 +73,7 @@ async function seedTaskAtAwaitingAcceptance(): Promise<void> {
   }));
 }
 
+// 合入注记（Batch2×Q12）：受理一致性（REQ-ACC-2）要求信封 actor 与 payload acceptor 同一，本 helper 以验收人本人落账。
 async function recordAcceptance(input: {
   acceptance_id: string;
   verdict: 'accepted' | 'rejected' | 'partially_accepted';
@@ -81,6 +82,8 @@ async function recordAcceptance(input: {
 }): Promise<void> {
   await store.append(base({
     type: 'AcceptanceRecorded',
+    actor_id: 'actor-reviewer',
+    actor_kind: 'human',
     payload: {
       acceptance_id: input.acceptance_id,
       task_id: TASK_ID,
