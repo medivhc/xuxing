@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { migrate, createPgEventStore, type PgEventStore } from '../src/kernel/event-store-pg.js';
-import type { EventType } from '../src/kernel/events.js';
+import { asProjectId, type EventType, type ProjectId } from '../src/kernel/events.js';
 import { createTestPg, resetEventTables, type TestPg } from './support/pg.js';
 import {
   MinimalProjection,
@@ -17,13 +17,13 @@ import {
 // ============================================================================
 
 const FIXED_NOW = new Date('2026-10-21T00:00:00.000Z');
-const PROJECTS = ['proj-alpha', 'proj-beta'] as const;
+const PROJECTS = [asProjectId('proj-alpha'), asProjectId('proj-beta')] as const;
 
 let ctx: TestPg;
 let store: PgEventStore;
 
 function input(
-  stream_id: string,
+  stream_id: ProjectId,
   type: EventType,
   payload: unknown,
   extra: Partial<{ idempotency_key: string | null; causation_id: string | null }> = {},
@@ -49,13 +49,13 @@ async function seedThirtyEvents(): Promise<void> {
 
     await store.append(input(project, 'TaskCaptured', { task_id, title: `任务 ${project}` }));
     await store.append(input(project, 'TaskLifecycleChanged', {
-      task_id, from: 'captured', to: 'defined',
+      task_id, from: 'captured', to: 'defined', trigger_event_id: `seed-${task_id}-defined`,
     }));
     await store.append(input(project, 'TaskLifecycleChanged', {
-      task_id, from: 'defined', to: 'ready',
+      task_id, from: 'defined', to: 'ready', trigger_event_id: `seed-${task_id}-ready`,
     }));
     await store.append(input(project, 'TaskLifecycleChanged', {
-      task_id, from: 'ready', to: 'active',
+      task_id, from: 'ready', to: 'active', trigger_event_id: `seed-${task_id}-active`,
     }));
 
     await store.append(input(project, 'RunCreated', { run_id: run1, task_id }));
@@ -66,9 +66,11 @@ async function seedThirtyEvents(): Promise<void> {
 
     await store.append(input(project, 'TaskWaitStateChanged', {
       task_id, from: 'none', to: 'waiting_on_person', reason: '等待对方回复',
+      actor_id: 'actor-human-1', actor_kind: 'human',
     }));
     await store.append(input(project, 'TaskWaitStateChanged', {
       task_id, from: 'waiting_on_person', to: 'none', reason: '已回复',
+      actor_id: 'actor-human-1', actor_kind: 'human',
     }));
 
     await store.append(input(project, 'OutcomeRecorded', {
@@ -77,6 +79,7 @@ async function seedThirtyEvents(): Promise<void> {
 
     await store.append(input(project, 'TaskLifecycleChanged', {
       task_id, from: 'active', to: 'awaiting_acceptance',
+      trigger_event_id: `seed-${task_id}-awaiting_acceptance`,
     }));
 
     await store.append(input(project, 'RunCreated', { run_id: run2, task_id }));

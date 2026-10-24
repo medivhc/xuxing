@@ -1,5 +1,5 @@
 // 测试用 PG 供给：容器确保/启动/就绪等待、外部 PG 复用、每 suite 独立 schema、afterAll 清理。
-// 纪律（plan §6 / §8）：docker 不可用时**大声失败**并给出处置指引，绝不 skip 或用内存 mock 顶替。
+// 纪律：docker 不可用时**大声失败**并给出处置指引，绝不 skip 或用内存 mock 顶替。
 //
 // 供给优先级：
 //   1. XUXING_TEST_PG_URL 已设置 → 直接复用该 PG（外部兜底路径），不碰容器；
@@ -10,6 +10,7 @@
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { Client, Pool } from 'pg';
+import { migrate } from '../../src/kernel/event-store-pg.js';
 
 export const PG_CONTAINER = 'xuxing-pg-test';
 export const DEFAULT_PG_URL = 'postgres://postgres:postgres@127.0.0.1:55432/xuxing_test';
@@ -39,7 +40,7 @@ function guidance(cause: unknown): Error {
   return new Error(
     [
       `PG 测试供给失败：${detail}`,
-      '处置路径（按 plan §8，三条按成本排序）：',
+      '处置路径（按成本排序）：',
       '  ① 设置 XUXING_TEST_PG_URL 指向一个可用的 PostgreSQL 16（外部兜底，成本≈0）：',
       `       XUXING_TEST_PG_URL=postgres://user:pass@host:5432/db npm test`,
       '  ② 复用现有容器并加端口映射 127.0.0.1:55432→5432（需重启该容器，成本中，可能影响其它服务）',
@@ -142,9 +143,11 @@ export async function createTestPg(): Promise<TestPg> {
   };
 }
 
-/** 清空事件表（append-only 触发器拦 UPDATE/DELETE，TRUNCATE 留给测试清理）。 */
+/** 清空事件表。F16：TRUNCATE 已被语句级触发器封堵（生产语义），测试清理改走
+ * admin DDL：DROP TABLE + migrate 重建；不通过放宽线上约束给测试开后门。 */
 export async function resetEventTables(pool: Pool): Promise<void> {
-  await pool.query('TRUNCATE events, event_streams RESTART IDENTITY');
+  await pool.query('DROP TABLE IF EXISTS events, event_streams CASCADE');
+  await migrate(pool);
 }
 
 /** 断言底层确实是 PostgreSQL 16（防「跑到了 mock/别的库」）。 */
