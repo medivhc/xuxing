@@ -4,7 +4,10 @@
 // - 离线/网络失败：先落 P 层传输缓冲（append-only），界面显示「已记录（待同步）」，
 //   不同步不回滚本地显示，只更新同步徽标（REQ-FB-2）；
 // - 恢复后重放缓冲条目（复用同一 client_submit_id），成功置 synced；
-// - 回执区分「已记录，整理中」（无 proposal_id）与「已成提议」（有 proposal_id）。
+// - 回执区分「已记录，整理中」（无 proposal_id）与「已成提议」（有 proposal_id）；
+// - R-11：捕获/提议链路上不出现 task_id——CaptureResponse 只有 capture_id 与
+//   proposal_id；任务 id 只在提议被接受后由服务端新发（登记见
+//   web/README.md「已知边界」第 5 条）。
 
 import { useCallback, useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';

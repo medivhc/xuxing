@@ -110,6 +110,7 @@ function acceptProposal(store: MockStore, payload: Payload): void {
   }
 
   // OQ-01=A 落点链：FeedbackReceived → FeedbackInterpreted → TaskCaptured（直接成 Task）
+  // R-11：task_id 只在接受此刻新发（此前提议投影/界面均无 task_id 字段）
   const taskId = store.newId('task');
   const criteria = proposal.proposed.acceptance_criteria.map((criterion, index) => ({
     criterion_ref: `${taskId}/c${index + 1}`,
