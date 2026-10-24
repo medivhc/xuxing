@@ -199,6 +199,39 @@ export class TerminalClosureRequiredError extends Error {
   }
 }
 
+/**
+ * S4-②（reverify-R2）：事务结果必须真实反映 COMMIT 状态。
+ * fn 吞掉 SQL 错误后 PG 把事务置为 aborted，COMMIT 实际执行 ROLLBACK 且不抛错；
+ * 不检查 command tag 就会「返回成功但零落库」。
+ */
+export class TransactionCommitError extends Error {
+  readonly command: string | null;
+  constructor(command: string | null) {
+    super(
+      `事务提交未成功：COMMIT 返回 ${command ?? '<无 command tag>'}（PG 对 aborted 事务会隐式 ROLLBACK）。` +
+        `fn 内若吞掉了 SQL 错误，请重新抛出而不是继续 return`,
+    );
+    this.name = 'TransactionCommitError';
+    this.command = command;
+  }
+}
+
+/**
+ * S4-①：事务进行中误用外层 store 写同一 stream 会因链头行锁自锁挂起。
+ * 这里在写之前立即显式拒绝，把「静默挂起」变成「可定位的编程错误」。
+ */
+export class TransactionScopeError extends Error {
+  readonly stream_id: string;
+  constructor(stream_id: string) {
+    super(
+      `store 事务作用域误用：stream ${JSON.stringify(stream_id)} 已在 withTransaction 的 tx 内被写入；` +
+        `事务内请只用 tx.append / tx.appendStateTransition（用外层 store 会等待自己持有的行锁而挂起）`,
+    );
+    this.name = 'TransactionScopeError';
+    this.stream_id = stream_id;
+  }
+}
+
 export type TransitionStateDenialReason =
   /** payload 里找不到 task_id / run_id，无法定位迁移主体。 */
   | 'subject_id_missing'
@@ -1530,12 +1563,26 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
   const idFactory = options.idFactory ?? (() => ulid());
   const requireProjectCreated = options.requireProjectCreated ?? true;
 
+  /** 正在事务内被写入的 stream（S4-①：外层 store 写同 stream 立即报错，不等锁）。 */
+  const activeTxStreams = new Map<string, number>();
+
+  function assertNotWritingActiveTxStream(stream_id: string): void {
+    if (activeTxStreams.has(stream_id)) throw new TransactionScopeError(stream_id);
+  }
+
   /**
    * 构造一个 store 视图。client = null 时每次写各自开事务（pool 路径）；
    * client 非空时所有读写都走该连接（withTransaction 路径），共享同一事务。
    */
-  function makeScoped(client: PoolClient | null): PgEventStoreTx {
+  function makeScoped(client: PoolClient | null, txStreams?: Set<string>): PgEventStoreTx {
     const reader = client ?? pool;
+
+    /** 事务内写入/加锁的 stream 登记到 store 级别（供外层 store 快速拒绝）。 */
+    function trackTxStream(stream_id: string): void {
+      if (txStreams === undefined || txStreams.has(stream_id)) return;
+      txStreams.add(stream_id);
+      activeTxStreams.set(stream_id, (activeTxStreams.get(stream_id) ?? 0) + 1);
+    }
 
     /** 在指定连接上写一条事件（调用方负责事务边界）。 */
     async function appendOn(
@@ -1543,6 +1590,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       input: AppendEventInput,
       prepareOptions: PrepareAppendOptions = {},
     ): Promise<EventEnvelope> {
+      trackTxStream(input.stream_id);
       return appendWithin(conn, prepareAppend(input, prepareOptions), idFactory, clock, requireProjectCreated);
     }
 
@@ -1552,13 +1600,19 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       // 事务内：直接复用调用方连接，失败由 withTransaction 整体回滚
       if (client) return appendOn(client, input);
 
+      // S4-①：外层 store 不得写正在事务内被写入的 stream（否则等自己的行锁挂起）
+      assertNotWritingActiveTxStream(input.stream_id);
+
       const conn = await pool.connect();
       try {
         await conn.query('BEGIN');
         const event = await appendOn(conn, input);
 
         // 快路径命中已存在事件时事务是只读的，COMMIT 同样安全
-        await conn.query('COMMIT');
+        const committed = await conn.query('COMMIT');
+        if (committed.command !== 'COMMIT') {
+          throw new TransactionCommitError(committed.command ?? null);
+        }
         return event;
       } catch (error) {
         await conn.query('ROLLBACK').catch(() => undefined);
@@ -1635,7 +1689,8 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
 
     async function appendBatch(entries: AppendBatchEntryInput[]): Promise<PgAppendBatchResult> {
       // 形状预校验放在开事务之前：非法批次零 DB 动作。
-      batchStreamId(entries);
+      const batch_stream = batchStreamId(entries);
+      if (client === null) assertNotWritingActiveTxStream(batch_stream);
       for (const entry of entries) prevalidateBatchEntry(entry);
 
       return withStoreTransaction((conn) => appendBatchOn(conn, entries));
@@ -1818,7 +1873,10 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       try {
         await conn.query('BEGIN');
         const result = await fn(conn);
-        await conn.query('COMMIT');
+        const committed = await conn.query('COMMIT');
+        if (committed.command !== 'COMMIT') {
+          throw new TransactionCommitError(committed.command ?? null);
+        }
         return result;
       } catch (error) {
         await conn.query('ROLLBACK').catch(() => undefined);
@@ -1830,6 +1888,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
 
     /** 同 stream 串行化入口：派生状态与写入必须在同一把行锁内完成（F1）。 */
     async function ensureAndLockStream(conn: PoolClient, stream_id: string): Promise<number> {
+      trackTxStream(stream_id);
       await conn.query(
         `INSERT INTO event_streams (stream_id, last_seq, last_hash)
          VALUES ($1, 0, $2)
@@ -2186,6 +2245,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     async function appendStateTransition(
       input: AppendStateTransitionInput,
     ): Promise<AppendStateTransitionResult> {
+      if (client === null) assertNotWritingActiveTxStream(input.stream_id);
       return withStoreTransaction((conn) => appendStateTransitionOn(conn, input));
     }
 
@@ -2411,6 +2471,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     async function requestTaskCancellation(
       input: RequestTaskCancellationInput,
     ): Promise<TaskCancellationResult> {
+      if (client === null) assertNotWritingActiveTxStream(input.stream_id);
       return withStoreTransaction((conn) => requestTaskCancellationOn(conn, input));
     }
 
@@ -2431,15 +2492,26 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     fn: (tx: PgEventStoreTx) => Promise<T>,
   ): Promise<T> {
     const client = await pool.connect();
+    const txStreams = new Set<string>();
+    const tx = makeScoped(client, txStreams);
     try {
       await client.query('BEGIN');
-      const result = await fn(makeScoped(client));
-      await client.query('COMMIT');
+      const result = await fn(tx);
+      const committed = await client.query('COMMIT');
+      if (committed.command !== 'COMMIT') {
+        throw new TransactionCommitError(committed.command ?? null);
+      }
       return result;
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw error;
     } finally {
+      // 结束（无论成败）后解除 stream 占用：失败路径事务已回滚，锁已释放
+      for (const stream_id of txStreams) {
+        const next = (activeTxStreams.get(stream_id) ?? 1) - 1;
+        if (next <= 0) activeTxStreams.delete(stream_id);
+        else activeTxStreams.set(stream_id, next);
+      }
       client.release();
     }
   }

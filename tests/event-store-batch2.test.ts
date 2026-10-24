@@ -5,6 +5,8 @@ import {
   AppendBatchError,
   EventEntityMismatchError,
   ProjectCreatedRequiredError,
+  TransactionCommitError,
+  TransactionScopeError,
   TerminalClosureRequiredError,
   TransitionDeniedError,
   TransitionStateError,
@@ -13,6 +15,7 @@ import {
   type AppendBatchEntryInput,
   type PgEventStore,
 } from '../src/kernel/event-store-pg.js';
+import { guardTransition } from '../src/kernel/transition-guard.js';
 import { createTestPg, assertPostgres16, resetEventTables, type TestPg } from './support/pg.js';
 
 // ============================================================================
@@ -428,5 +431,198 @@ describe('S3-② 无 ProjectCreated 事实的流不得写入（两路 + batch）
     });
     const event = await fixtureStore.append(input({ stream_id: asProjectId('project-fixture') }));
     expect(event.seq).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S3-确认乙（pF6 残留）：anyOf 短路——OR 一侧已满足时不得再要求补另一侧
+// ---------------------------------------------------------------------------
+describe('S3-确认乙 pF6：guard anyOf 与 store 报错文案同步短路', () => {
+  it('guard 层：leased→indeterminate 已给 externalSideEffectCalled=true → 放行，missing_facts 为空', () => {
+    const result = guardTransition({
+      entity: 'run',
+      from: 'leased',
+      to: 'indeterminate',
+      event_type: 'RunIndeterminate',
+      facts: { leaseExpired: true, started: true, externalSideEffectCalled: true },
+    });
+
+    expect(result.allowed).toBe(true);
+    expect(result.missing_facts).toEqual([]);
+    expect(result.unmet_requirements).toEqual([]);
+  });
+
+  it('guard 层：同格 sideEffectLevel=L2 也满足 OR；两侧都缺时才给 alternatives', () => {
+    expect(
+      guardTransition({
+        entity: 'run',
+        from: 'leased',
+        to: 'indeterminate',
+        event_type: 'RunIndeterminate',
+        facts: { leaseExpired: true, started: true, sideEffectLevel: 'L2' },
+      }).allowed,
+    ).toBe(true);
+
+    const missing = guardTransition({
+      entity: 'run',
+      from: 'leased',
+      to: 'indeterminate',
+      event_type: 'RunIndeterminate',
+      facts: { leaseExpired: true, started: true },
+    });
+    expect(missing.allowed).toBe(false);
+    expect(missing.missing_facts?.map((hint) => hint.fact)).toEqual([
+      'sideEffectLevel',
+      'externalSideEffectCalled',
+    ]);
+  });
+
+  it('store 层：accepted→awaiting_acceptance 只给 acceptanceSuperseded=true → 放行（不再要求 declaresRevalidation）', async () => {
+    await seedTaskAt('awaiting_acceptance');
+    await store.appendStateTransition({
+      ...transitionEntry({
+        from: 'awaiting_acceptance',
+        to: 'accepted',
+        facts: { acceptanceVerdict: 'accepted' },
+      }),
+      payload: { task_id: TASK_ID, trigger_event_id: 'trigger-b2' },
+    } as never);
+
+    const result = await store.appendStateTransition({
+      ...transitionEntry({
+        from: 'accepted',
+        to: 'awaiting_acceptance',
+        facts: { acceptanceSuperseded: true },
+      }),
+      payload: { task_id: TASK_ID, trigger_event_id: 'trigger-reopen' },
+    } as never);
+
+    expect(result.guard.allowed).toBe(true);
+    expect(result.event.type).toBe('TaskLifecycleChanged');
+    expect((await store.verifyChain(STREAM)).ok).toBe(true);
+  });
+
+  it('store 层：两侧都缺时错误文案同时给出两个可选 fact（而不是只报一个）', async () => {
+    await seedTaskAt('awaiting_acceptance');
+    await store.appendStateTransition({
+      ...transitionEntry({
+        from: 'awaiting_acceptance',
+        to: 'accepted',
+        facts: { acceptanceVerdict: 'accepted' },
+      }),
+      payload: { task_id: TASK_ID, trigger_event_id: 'trigger-b2' },
+    } as never);
+
+    await expect(
+      store.appendStateTransition({
+        ...transitionEntry({
+          from: 'accepted',
+          to: 'awaiting_acceptance',
+          facts: {},
+        }),
+        payload: { task_id: TASK_ID, trigger_event_id: 'trigger-reopen' },
+      } as never),
+    ).rejects.toSatisfy((error: unknown) => {
+      expect(error).toBeInstanceOf(TransitionDeniedError);
+      const denied = error as TransitionDeniedError;
+      expect(denied.message).toContain("acceptanceSuperseded=true");
+      expect(denied.message).toContain('declaresRevalidation');
+      return true;
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S4-① 事务作用域：外层 store 写同 stream → 立即报错，不挂起
+// ---------------------------------------------------------------------------
+describe('S4-① 事务内误用外层 store：立即 TransactionScopeError（有耗时上界）', () => {
+  it('tx 已写 stream 后，外层 store 写同 stream → 1.5s 内显式报错，且不留半提交', async () => {
+    await seedProject();
+    const before = await countEvents(ctx.pool);
+    const started = Date.now();
+
+    await expect(
+      store.withTransaction(async (tx) => {
+        await tx.append(input());
+        // 误用外层 store（而不是 tx）：旧行为是等 tx 自己持有的链头行锁 → 挂起
+        await store.append(input({ payload: { task_id: TASK_ID, title: '外层误写' } }));
+      }),
+    ).rejects.toBeInstanceOf(TransactionScopeError);
+
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeLessThan(1500);
+    // tx 内的写入随异常回滚；外层写入根本没执行
+    expect(await countEvents(ctx.pool)).toBe(before);
+  });
+
+  it('不同 stream 的外层写入不被误伤（检查按 stream 粒度）', async () => {
+    await seedProject();
+    const other = asProjectId('project-other-b2');
+
+    await store.withTransaction(async (tx) => {
+      await tx.append(input());
+      const wrote = await store.append(projectCreated({ stream_id: other }));
+      expect(wrote.stream_id).toBe(other);
+    });
+
+    expect((await store.readStream(other)).map((e) => e.type)).toEqual(['ProjectCreated']);
+  });
+
+  it('appendStateTransition 走外层 store 写同 stream 同样立即报错', async () => {
+    await seedProject();
+    await store.append(input());
+    const started = Date.now();
+
+    await expect(
+      store.withTransaction(async (tx) => {
+        await tx.append(input({ payload: { task_id: TASK_ID, title: '登记 stream' } }));
+        await store.appendStateTransition({
+          ...transitionEntry(),
+          payload: { task_id: TASK_ID, trigger_event_id: 'trigger-outer' },
+        } as never);
+      }),
+    ).rejects.toBeInstanceOf(TransactionScopeError);
+    expect(Date.now() - started).toBeLessThan(1500);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S4-② withTransaction 检查 COMMIT command tag（reverify-R2）
+// ---------------------------------------------------------------------------
+describe('S4-② COMMIT 真实结果：吞掉 SQL 错误不得假成功', () => {
+  it('fn 吞掉 SQL 错误 → COMMIT 隐式 ROLLBACK → TransactionCommitError，零落库', async () => {
+    await seedProject();
+    const before = await countEvents(ctx.pool);
+
+    // 用一条临时 CHECK 约束制造真 SQL 错误（不是 JS 层校验失败）
+    await ctx.pool.query(
+      "ALTER TABLE events ADD CONSTRAINT batch2_block_goal CHECK (type <> 'GoalCreated')",
+    );
+    try {
+      await expect(
+        store.withTransaction(async (tx) => {
+          try {
+            await tx.append(input({ type: 'GoalCreated', payload: { goal_id: 'goal-blocked' } }));
+          } catch {
+            // 吞掉 SQL 错误继续返回 —— 旧实现会让调用方误以为提交成功
+          }
+          return 'fn-returned-ok';
+        }),
+      ).rejects.toBeInstanceOf(TransactionCommitError);
+    } finally {
+      await ctx.pool.query('ALTER TABLE events DROP CONSTRAINT IF EXISTS batch2_block_goal');
+    }
+
+    expect(await countEvents(ctx.pool)).toBe(before);
+  });
+
+  it('正常事务仍返回 fn 结果并真实提交', async () => {
+    await seedProject();
+    const value = await store.withTransaction(async (tx) => {
+      await tx.append(input());
+      return 'committed';
+    });
+    expect(value).toBe('committed');
+    expect(await countEvents(ctx.pool)).toBe(2);
   });
 });
