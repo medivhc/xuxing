@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+# 不提交 lockfile：沙盒 npm 镜像会把 resolved 改写为 mirrors.tencent.com，
+# 公开仓库安装会绑定镜像地址；CI/其他环境请用官方 registry 重新生成。
+package-lock.json
+.env
+.env.local
