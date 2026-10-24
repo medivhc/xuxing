@@ -1292,6 +1292,7 @@ async function resolveDecision(
       });
     }
   }
+  let disposition: 'executed' | 'not_executed' | 'cancel_run' | null = null;
   if (subjectKind === 'run_reconciliation') {
     const run = snapshot.runs.find((r) => r.run_id === decision.subject_ref.id);
     if (!run) {
@@ -1303,6 +1304,19 @@ async function resolveDecision(
     }
     runState = run.state;
     runTask = snapshot.tasks.find((t) => t.task_id === run.task_id) ?? null;
+    // m-03：disposition 的 400 字段校验先于 Run 状态前置——组合错误
+    // （Run 已非 indeterminate 且 disposition 缺失）先报 400 schema_invalid，
+    // 与 §3.5 的校验口径一致（单点行为不变）。
+    if (verdict === 'approved') {
+      const d = payload.disposition;
+      if (d !== 'executed' && d !== 'not_executed' && d !== 'cancel_run') {
+        throw new CommandValidationError('Run 对账 verdict=approved 时 disposition 必填且必须是 executed / not_executed / cancel_run', {
+          reason: 'schema_invalid',
+          field: 'disposition',
+        });
+      }
+      disposition = d;
+    }
     if (verdict === 'approved' && run.state !== 'indeterminate') {
       throw new CommandDeniedError(`Run ${run.run_id} 当前状态为 ${run.state}，不处于待对账（indeterminate）`, {
         reason: 'precondition_unmet',
@@ -1311,17 +1325,6 @@ async function resolveDecision(
         run_state: run.state,
       });
     }
-  }
-  let disposition: 'executed' | 'not_executed' | 'cancel_run' | null = null;
-  if (subjectKind === 'run_reconciliation' && verdict === 'approved') {
-    const d = payload.disposition;
-    if (d !== 'executed' && d !== 'not_executed' && d !== 'cancel_run') {
-      throw new CommandValidationError('Run 对账 verdict=approved 时 disposition 必填且必须是 executed / not_executed / cancel_run', {
-        reason: 'schema_invalid',
-        field: 'disposition',
-      });
-    }
-    disposition = d;
   }
   if (subjectKind === 'duplicate_suspect') {
     suspectTask = snapshot.tasks.find((t) => t.task_id === decision.subject_ref.id) ?? null;
@@ -1396,7 +1399,7 @@ async function resolveDecision(
       );
     }
     if (subjectKind === 'duplicate_suspect' && suspectTask !== null) {
-      await applyDecisionToDuplicate(tx, base, keyPrefix, decision, suspectTask, verdict, snapshot, actor, emitted, subject);
+      await applyDecisionToDuplicate(tx, base, keyPrefix, decision, suspectTask, verdict, snapshot, actor, now, emitted, subject);
     }
 
     addEmitted(emitted, await tx.append(receipt(base, client_submit_id, 'resolve_decision', payload, subject, now)));
@@ -1664,6 +1667,7 @@ async function applyDecisionToDuplicate(
   verdict: 'approved' | 'rejected' | 'deferred',
   snapshot: ProjectionSnapshot,
   actor: CommandActor,
+  now: string,
   emitted: EmittedEvent[],
   subject: Record<string, unknown>,
 ): Promise<void> {
@@ -1705,7 +1709,8 @@ async function applyDecisionToDuplicate(
     subject.awaiting_run_termination = blocking.map((r) => r.run_id);
     return;
   }
-  for (const wc of snapshot.wait_conditions.filter((w) => w.task_id === task.task_id && w.status === 'active')) {
+  const activeWaits = snapshot.wait_conditions.filter((w) => w.task_id === task.task_id && w.status === 'active');
+  for (const wc of activeWaits) {
     addEmitted(emitted, await tx.append({
       ...base,
       type: 'WaitConditionCanceled',
@@ -1741,6 +1746,64 @@ async function applyDecisionToDuplicate(
   }
   subject.cascade = 'completed';
   subject.merged_into = decision.duplicate_of;
+
+  // §3.4 / REQ-DD-2：被疑 Task 的未决事项以 PlanChange 并入目标 Task——
+  // 同事务生成一条以目标 Task 为 subject 的 PlanChange：ops 机器可读地
+  // 枚举被带走的未决事项（活跃等待条件逐条 + 验收标准），details 以
+  // wait_condition 形状指向被合并 Task；client_proposal_id 与响应
+  // subject.merged_change_id 使其在 DecisionResolved 审计链上可溯。
+  // 仅在级联真正完成时生成（在飞 Run 未终态时不假装已合并）。
+  const targetTaskId = decision.duplicate_of;
+  if (typeof targetTaskId === 'string' && targetTaskId !== '') {
+    const mergedChangeId = `pc_${ulid()}`;
+    addEmitted(emitted, await tx.append({
+      ...base,
+      type: 'PlanChangeProposed',
+      idempotency_key: `${keyPrefix}:merge-change`,
+      payload: {
+        change_id: mergedChangeId,
+        client_proposal_id: `merge:${decision.decision_id}`,
+        kind: 'wait_condition',
+        capture_id: null,
+        task_id: targetTaskId,
+        base_plan_rev: currentPlanRev(snapshot, task.project_id),
+        ops: [
+          { op: 'merge_task', from_task_id: task.task_id, into_task_id: targetTaskId, decision_id: decision.decision_id },
+          ...activeWaits.map((wc) => ({
+            op: 'carry_wait_condition',
+            wait_condition_id: wc.wait_condition_id,
+            kind: wc.kind,
+            target_ref: wc.target_ref,
+          })),
+          ...(task.acceptance_criteria.length > 0
+            ? [{ op: 'carry_acceptance_criteria', criteria: task.acceptance_criteria }]
+            : []),
+        ],
+        risk_level: 'L0',
+        rationale: `疑似重复合并（Decision ${decision.decision_id} 裁决）：被疑 Task ${task.task_id} 的未决事项并入目标 Task ${targetTaskId}`,
+        assumptions: [],
+        proposer: {
+          source: 'fallback',
+          model: null,
+          degraded: true,
+          degraded_reason: 'duplicate_merged：裁决驱动的系统并入，非模型提议',
+          latency_ms: null,
+        },
+        details: {
+          kind: 'wait_condition',
+          task_id: targetTaskId,
+          wait: {
+            kind: 'dependency',
+            target_ref: task.task_id,
+            reason: `duplicate_merged：未决事项自被合并 Task ${task.task_id} 并入（清单见 ops）`,
+          },
+        },
+        proposed_at: now,
+      },
+    }));
+    subject.merged_change_id = mergedChangeId;
+    subject.carried_wait_conditions = activeWaits.map((wc) => wc.wait_condition_id);
+  }
 }
 
 // ---------------------------------------------------------------------------
