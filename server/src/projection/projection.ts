@@ -76,6 +76,10 @@ export interface RunRecord {
   state: 'created' | 'queued' | 'leased' | 'running' | 'succeeded' | 'failed' | 'canceled' | 'timed_out' | 'indeterminate';
   actor_id: string;
   side_effect_level: string;
+  /** K1-B：执行器种类（agent_hands_shell 等；human_light 为 null）。 */
+  executor_kind: string | null;
+  /** K1-B：已落账的副作用记录条数（REQ-RUN-4 分界依据之一）。 */
+  side_effect_count: number;
   updated_global_seq: number;
 }
 
@@ -186,6 +190,50 @@ export interface OutcomeDraft {
   degraded_reason: string | null;
 }
 
+/** Decision 主题引用（冻结 spec §2.7 subject_ref；K1 §3.4 按 kind 封闭分流）。 */
+export interface DecisionSubjectRef {
+  kind: string;
+  id: string;
+}
+
+export type DecisionStatus = 'pending' | 'approved' | 'approved_modified' | 'rejected' | 'deferred' | 'expired';
+
+export interface DecisionWakeCondition {
+  kind: 'at_time' | 'on_event';
+  /** kind=at_time 时的唤起时刻（ISO8601） */
+  at: string | null;
+  /** kind=on_event 时的事件类型 */
+  event_type: string | null;
+}
+
+/**
+ * Decision 读模型（K1-A）：K0 时 DecisionCreated/Resolved/Expired 在投影中是
+ * no-op（无独立实体，attention 以提议近似派生）；K1 起按冻结 spec §2.7 落
+ * 独立记录，My Actions 与 Home attention 的 decision 条目同源于此（§3.6）。
+ */
+export interface DecisionRecord {
+  decision_id: string;
+  project_id: string;
+  subject_ref: DecisionSubjectRef;
+  question: string;
+  recommendation: string | null;
+  alternatives: string[];
+  evidence_refs: string[];
+  status: DecisionStatus;
+  decided_by: string | null;
+  decided_at: string | null;
+  verdict: string | null;
+  reason: string | null;
+  wake_condition: DecisionWakeCondition | null;
+  disposition: string | null;
+  /** 疑似重复 Decision 的合并目标 Task（DecisionCreated.payload.duplicate_of）。 */
+  duplicate_of: string | null;
+  expires_at: string | null;
+  created_at: string;
+  created_global_seq: number;
+  updated_global_seq: number;
+}
+
 export interface EventSummary {
   seq: number;
   kind: EventType;
@@ -207,6 +255,8 @@ export interface ProjectionSnapshot {
   feedbacks: FeedbackRecord[];
   outcomes: OutcomeRecord[];
   proposals: ProposalRecord[];
+  /** K1-A：Decision 实体（冻结 spec §2.7）。 */
+  decisions: DecisionRecord[];
   /** 最近的全局事件摘要（新到旧，最多 retention 条），供 Home 最近活动使用。 */
   recent_events: EventSummary[];
 }
@@ -261,6 +311,7 @@ export class XuxingProjection {
   private readonly feedbacks = new Map<string, FeedbackRecord>();
   private readonly outcomes = new Map<string, OutcomeRecord>();
   private readonly proposals = new Map<string, ProposalRecord>();
+  private readonly decisions = new Map<string, DecisionRecord>();
   private recent: EventSummary[] = [];
 
   apply(event: EventEnvelope): void {
@@ -416,8 +467,17 @@ export class XuxingProjection {
           state: 'created',
           actor_id: str(p, 'actor_id', event),
           side_effect_level: optStr(p, 'side_effect_level') ?? 'L0',
+          executor_kind: optStr(p, 'executor_kind'),
+          side_effect_count: 0,
           updated_global_seq: event.global_seq,
         });
+        return;
+      }
+      case 'RunSideEffectRecorded': {
+        // K1-B §4.4：节点回报的副作用记录（REQ-RUN-4 租约过期分界依据）。
+        const run = this.mustRun(str(p, 'run_id', event), event);
+        run.side_effect_count += 1;
+        run.updated_global_seq = event.global_seq;
         return;
       }
       case 'RunQueued':
@@ -601,17 +661,83 @@ export class XuxingProjection {
         task.updated_global_seq = event.global_seq;
         return;
       }
+      case 'TaskDuplicateSuspected': {
+        const task = this.mustTask(str(p, 'task_id', event), event);
+        task.duplicate_suspect = true;
+        task.updated_global_seq = event.global_seq;
+        return;
+      }
+      case 'TaskDuplicateResolved': {
+        const task = this.mustTask(str(p, 'task_id', event), event);
+        task.duplicate_suspect = false;
+        task.updated_global_seq = event.global_seq;
+        return;
+      }
+      case 'DecisionCreated': {
+        const decision_id = str(p, 'decision_id', event);
+        if (this.decisions.has(decision_id)) {
+          throw new Error(`DecisionCreated@${event.global_seq} 重复创建 Decision ${decision_id}`);
+        }
+        const subject = (p.subject_ref ?? {}) as Record<string, unknown>;
+        this.decisions.set(decision_id, {
+          decision_id,
+          project_id,
+          subject_ref: {
+            kind: typeof subject.kind === 'string' ? subject.kind : 'unknown',
+            id: typeof subject.id === 'string' ? subject.id : '',
+          },
+          question: optStr(p, 'question') ?? '',
+          recommendation: optStr(p, 'recommendation'),
+          alternatives: strArray(p.alternatives),
+          evidence_refs: strArray(p.evidence_refs),
+          status: 'pending',
+          decided_by: null,
+          decided_at: null,
+          verdict: null,
+          reason: null,
+          wake_condition: null,
+          disposition: null,
+          duplicate_of: optStr(p, 'duplicate_of'),
+          expires_at: optStr(p, 'expires_at'),
+          created_at: event.occurred_at,
+          created_global_seq: event.global_seq,
+          updated_global_seq: event.global_seq,
+        });
+        return;
+      }
+      case 'DecisionResolved': {
+        const decision = this.decisions.get(str(p, 'decision_id', event));
+        if (!decision) throw new Error(`DecisionResolved@${event.global_seq} 引用不存在的 Decision`);
+        decision.status = expectEnum(p, 'verdict', ['approved', 'approved_modified', 'rejected', 'deferred'], event);
+        decision.verdict = decision.status;
+        decision.decided_by = optStr(p, 'decided_by') ?? event.actor_id;
+        decision.decided_at = optStr(p, 'resolved_at') ?? event.occurred_at;
+        decision.reason = optStr(p, 'reason');
+        decision.disposition = optStr(p, 'disposition');
+        decision.wake_condition = wakeConditionOf(p.wake_condition);
+        decision.updated_global_seq = event.global_seq;
+        return;
+      }
+      case 'DecisionExpired': {
+        const decision = this.decisions.get(str(p, 'decision_id', event));
+        if (!decision) throw new Error(`DecisionExpired@${event.global_seq} 引用不存在的 Decision`);
+        // 过期只作用于未裁决态（pending / deferred 的唤起未达）；已裁决记录不受影响。
+        if (decision.status === 'pending' || decision.status === 'deferred') {
+          decision.status = 'expired';
+        }
+        decision.updated_global_seq = event.global_seq;
+        return;
+      }
       case 'TaskCanceled':
-      case 'TaskDuplicateSuspected':
-      case 'TaskDuplicateResolved':
       case 'EdgeAdded':
       case 'EdgeRemoved':
       case 'EvidenceAdded':
       case 'EvidenceSuperseded':
-      case 'DecisionCreated':
-      case 'DecisionResolved':
-      case 'DecisionExpired':
       case 'PlanRevisionCreated':
+      case 'NodeRegistered':
+      case 'NodeOffline':
+        // K1-B：节点事件落在 $system 保留流，不参与项目投影（节点读面走注册表）。
+        return;
       case 'ReleaseOverrideSet':
       case 'ReleaseOverrideInvalidated':
       case 'RunReconciled':
@@ -671,6 +797,7 @@ export class XuxingProjection {
       feedbacks: byKey([...this.feedbacks.values()], (r) => r.feedback_id),
       outcomes: byKey([...this.outcomes.values()], (r) => r.outcome_id),
       proposals: byKey([...this.proposals.values()], (r) => r.proposal_id),
+      decisions: byKey([...this.decisions.values()], (r) => r.decision_id),
       recent_events: [...this.recent],
     };
   }
@@ -698,6 +825,18 @@ const RUN_STATE_BY_EVENT: Partial<Record<EventType, RunRecord['state']>> = {
   RunTimedOut: 'timed_out',
   RunIndeterminate: 'indeterminate',
 };
+
+function wakeConditionOf(value: unknown): DecisionWakeCondition | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (record.kind === 'at_time') {
+    return { kind: 'at_time', at: typeof record.at === 'string' ? record.at : null, event_type: null };
+  }
+  if (record.kind === 'on_event') {
+    return { kind: 'on_event', at: null, event_type: typeof record.event_type === 'string' ? record.event_type : null };
+  }
+  return null;
+}
 
 function expectEnum<T extends string>(p: Record<string, unknown>, field: string, allowed: readonly T[], event: EventEnvelope): T {
   const value = p[field];

@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { attentionItems, homeView } from '../src/api/views.ts';
 import type {
   AcceptanceRecord,
+  DecisionRecord,
   ProjectionSnapshot,
   ProposalRecord,
   RunRecord,
@@ -96,6 +97,33 @@ function makeRun(overrides: Partial<RunRecord>): RunRecord {
     state: 'running',
     actor_id: 'agent-exec-1',
     side_effect_level: 'L0',
+    executor_kind: null,
+    side_effect_count: 0,
+    updated_global_seq: 1,
+    ...overrides,
+  };
+}
+
+function makeDecision(overrides: Partial<DecisionRecord>): DecisionRecord {
+  return {
+    decision_id: 'dec-x',
+    project_id: 'proj-x',
+    subject_ref: { kind: 'plan_change', id: 'prop-x' },
+    question: '是否批准该变更？',
+    recommendation: null,
+    alternatives: [],
+    evidence_refs: [],
+    status: 'pending',
+    decided_by: null,
+    decided_at: null,
+    verdict: null,
+    reason: null,
+    wake_condition: null,
+    disposition: null,
+    duplicate_of: null,
+    expires_at: null,
+    created_at: T0,
+    created_global_seq: 1,
     updated_global_seq: 1,
     ...overrides,
   };
@@ -128,6 +156,7 @@ function makeSnapshot(overrides: Partial<ProjectionSnapshot>): ProjectionSnapsho
     feedbacks: [],
     outcomes: [],
     proposals: [],
+    decisions: [],
     recent_events: [
       { seq: 10, kind: 'TaskLifecycleChanged', stream_id: 'proj-x', task_id: 'task-acc', proposal_id: null, occurred_at: '2026-10-21T09:00:00.000Z' },
     ],
@@ -143,27 +172,26 @@ describe('home attention 派生（契约 §2.2）', () => {
     expect(view.recent).toEqual([]);
   });
 
-  it('decision_pending：proposed / needs_decision 的提议入列，applied / rejected 不入', () => {
+  it('decision_pending：K1 口径——status=pending 的 Decision 入列，已裁决/过期不入；提议本身不再派生', () => {
     const items = attentionItems(
       makeSnapshot({
-        proposals: [
-          makeProposal({ proposal_id: 'prop-a', status: 'proposed' }),
-          makeProposal({ proposal_id: 'prop-b', status: 'needs_decision' }),
-          makeProposal({ proposal_id: 'prop-c', status: 'applied' }),
-          makeProposal({ proposal_id: 'prop-d', status: 'rejected' }),
+        // K0 近似口径下会产生 decision_pending 的提议，K1 起不得再派生（同源同数看 Decision）
+        proposals: [makeProposal({ proposal_id: 'prop-a', status: 'needs_decision' })],
+        decisions: [
+          makeDecision({ decision_id: 'dec-a', status: 'pending' }),
+          makeDecision({ decision_id: 'dec-b', status: 'approved' }),
+          makeDecision({ decision_id: 'dec-c', status: 'expired' }),
+          makeDecision({ decision_id: 'dec-d', status: 'deferred' }),
         ],
       }),
       ACTOR,
     );
     const decisions = items.filter((i) => i.kind === 'decision_pending');
-    expect(decisions.map((i) => i.decision_id).sort()).toEqual(['prop-a', 'prop-b']);
-    const a = decisions.find((i) => i.decision_id === 'prop-a')!;
-    expect(a.attention_id).toBe('attention:decision_pending:prop-a');
+    expect(decisions.map((i) => i.decision_id)).toEqual(['dec-a']);
+    const a = decisions[0]!;
+    expect(a.attention_id).toBe('attention:decision_pending:dec-a');
     expect(a.project_id).toBe('proj-x');
-    // 与 proposalView 同口径：capture_task + proposed 才给裁决动作
-    expect(a.available_actions).toEqual(['proposal_accept', 'proposal_reject']);
-    const b = decisions.find((i) => i.decision_id === 'prop-b')!;
-    expect(b.available_actions).toEqual([]);
+    expect(a.available_actions).toEqual(['resolve_decision']);
     expect(a.created_at).toBe(T0);
   });
 
@@ -225,7 +253,7 @@ describe('home attention 派生（契约 §2.2）', () => {
   it('键集与 rank：每项必带六键，rank 按 kind 优先序 1..n 顺序编号', () => {
     const items = attentionItems(
       makeSnapshot({
-        proposals: [makeProposal({ proposal_id: 'prop-a' })],
+        decisions: [makeDecision({ decision_id: 'dec-a' })],
         tasks: [
           makeTask({ task_id: 'task-acc', lifecycle: 'awaiting_acceptance' }),
           makeTask({ task_id: 'task-run', lifecycle: 'active' }),

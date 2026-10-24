@@ -10,6 +10,8 @@ import type { EventEnvelope } from '../../../src/kernel/events.ts';
 import { MAX_OUTSTANDING_WRITES, type Hub, type SseConnection } from '../sse/hub.ts';
 import {
   CommandDeniedError,
+  CommandForbiddenError,
+  CommandNotFoundError,
   CommandValidationError,
   IdempotencyConflictError,
   runCommand,
@@ -59,7 +61,31 @@ function actorOf(header: string | undefined, fallback: string): CommandActor {
   return { actor_id: value && value.length > 0 ? value : fallback, actor_kind: 'human' };
 }
 
+/**
+ * 命令信封 actor（K1 §3.2）：body.actor 若带合法 actor_id/actor_kind 则以其
+ * 为准（resolve_decision 的 actor_not_human 校验据此）；缺省回落请求头口径。
+ * 其余命令不读 body.actor，行为不变。
+ */
+function envelopeActorOf(body: Record<string, unknown>, header: string | undefined, fallback: string): CommandActor {
+  const raw = body.actor;
+  if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+    const record = raw as Record<string, unknown>;
+    const kind = record.actor_kind;
+    const id = record.actor_id;
+    if ((kind === 'human' || kind === 'agent' || kind === 'system') && typeof id === 'string' && id.trim() !== '') {
+      return { actor_id: id, actor_kind: kind };
+    }
+  }
+  return actorOf(header, fallback);
+}
+
 function errorResponse(error: unknown): Response {
+  if (error instanceof CommandForbiddenError) {
+    return Response.json(fail('forbidden', error.message, error.detail), { status: 403 });
+  }
+  if (error instanceof CommandNotFoundError) {
+    return Response.json(fail('not_found', error.message, error.detail), { status: 404 });
+  }
   if (error instanceof CommandDeniedError) {
     return Response.json(fail('conflict', error.message, error.detail), { status: 409 });
   }
@@ -226,7 +252,7 @@ export function createApp(ctx: AppContext): Hono {
   app.post('/api/commands', async (c) => {
     const body = await readJsonObject(c);
     if (body === null) return c.json(fail('bad_request', '请求体必须是 JSON 对象'), 400);
-    const actor = actorOf(c.req.header('x-xuxing-actor'), ctx.defaultActorId);
+    const actor = envelopeActorOf(body, c.req.header('x-xuxing-actor'), ctx.defaultActorId);
     try {
       const execution = await runCommand(ctx, {
         type: typeof body.type === 'string' ? body.type : '',

@@ -105,33 +105,33 @@ export interface MyActionsProjection extends ProjectionMeta {
   items: ActionItem[];
 }
 
+/**
+ * My Actions 条目（形状以服务端 server/src/api/views.ts 的 ActionItem 为准，
+ * K1 §3.6 定版）：封闭联合 kind ∈ {task, decision}。task 条目是 K0 扁平字段
+ * （title/project_name/lifecycle/wait_state/next_action）；decision 条目带
+ * subject_ref/question/recommendation/alternatives/evidence_refs/created_at，
+ * available_actions 恒为 ["resolve_decision"]。rank 由服务端统一计算。
+ */
 export interface ActionItem {
-  item_id: string;
   kind: 'task' | 'decision';
-  project_id: string;
-  task_id?: string;
-  decision_id?: string;
-  task_lifecycle?: TaskLifecycle;
-  task_wait_state?: TaskWaitState;
-  active_run?: {
-    run_id: string;
-    run_kind: 'executor' | 'human_light';
-    state: RunState;
-  };
-  decision?: {
-    question: string;
-    recommendation: string | null;
-    alternatives: string[];
-    evidence_refs: string[];
-    status: 'pending' | 'approved' | 'approved_modified' | 'rejected' | 'deferred' | 'expired';
-    expires_at: string | null;
-  };
-  /** 内核计算（OQ-08=A），前端只排序 */
+  item_id: string;
   rank: number;
+  task_id: string | null;
+  project_id: string;
+  project_name: string;
+  title: string | null;
+  lifecycle: TaskLifecycle | null;
+  wait_state: TaskWaitState | null;
+  next_action: string;
   available_actions: string[];
-  /** 如 no_capable_actor、wait_state（§0.4：禁用必须给原因码） */
-  blocked_reason: string | null;
   updated_global_seq: number;
+  decision_id: string | null;
+  subject_ref: { kind: string; id: string } | null;
+  question: string | null;
+  recommendation: string | null;
+  alternatives: string[];
+  evidence_refs: string[];
+  created_at: string | null;
 }
 
 // ---------- Project（GET /api/projects/:projectId） ----------
@@ -323,7 +323,8 @@ export type CommandType =
   | 'task_advance'
   | 'feedback_submit'
   | 'acceptance_record'
-  | 'task_cancel';
+  | 'task_cancel'
+  | 'resolve_decision';
 
 /** canonical 词表全量（单一来源：mock 校验命令体形状以此为准）。 */
 export const CANONICAL_COMMAND_TYPES: readonly CommandType[] = [
@@ -333,6 +334,7 @@ export const CANONICAL_COMMAND_TYPES: readonly CommandType[] = [
   'feedback_submit',
   'acceptance_record',
   'task_cancel',
+  'resolve_decision',
 ];
 
 export interface CommandRequest {

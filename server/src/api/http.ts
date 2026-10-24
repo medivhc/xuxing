@@ -50,6 +50,7 @@ export interface HealthData extends ProjectionMeta {
 export const ERROR_CODES = {
   bad_request: 400,
   unauthorized: 401,
+  forbidden: 403,
   not_found: 404,
   conflict: 409,
   range_not_satisfiable: 416,

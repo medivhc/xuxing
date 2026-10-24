@@ -18,6 +18,10 @@ await migrate(pool);
 
 const { app, config } = await buildApp({ pool, defaultProjectId: DEFAULT_PROJECT_ID, defaultActorId: DEFAULT_ACTOR_ID });
 
+// K1-A：deferred 唤起/过期扫描（缺省 5s；XUXING_DECISION_WAKE_MS=0 关闭）。
+const wakeMs = Number(process.env.XUXING_DECISION_WAKE_MS ?? '5000');
+if (Number.isFinite(wakeMs) && wakeMs > 0) config.decisionWake.start(wakeMs);
+
 const server = serve({ fetch: app.fetch, port, hostname }, (info) => {
   console.log(
     JSON.stringify({
@@ -36,6 +40,7 @@ const server = serve({ fetch: app.fetch, port, hostname }, (info) => {
 
 async function shutdown(signal: string): Promise<void> {
   console.log(JSON.stringify({ event: 'shutdown', signal }));
+  config.decisionWake.stop();
   config.hub.closeAll();
   server.close();
   await pool.end().catch(() => undefined);

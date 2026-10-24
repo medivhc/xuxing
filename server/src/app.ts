@@ -15,6 +15,7 @@ import {
   type AuthConfig,
   type AuthService,
 } from './auth/auth.ts';
+import { createDecisionWakeService, type DecisionWakeService } from './decisions/wake.ts';
 
 export interface AppConfig {
   pool: Pool;
@@ -28,6 +29,8 @@ export interface AppConfig {
   defaultActorId: string;
   /** K1-C 访问控制服务（双令牌 + 会话）。 */
   auth: AuthService;
+  /** K1-A deferred 唤起/过期扫描服务（main 负责 start，测试直接 tick）。 */
+  decisionWake: DecisionWakeService;
 }
 
 export interface BuildOptions {
@@ -75,6 +78,8 @@ export async function buildApp(options: BuildOptions): Promise<{ app: ReturnType
     }),
   );
 
+  const decisionWake = createDecisionWakeService({ store, projection, clock });
+
   // 投影变化 → SSE 广播（写入路径在命令层 ingest 之后手动广播；这里兜住种子脚本等旁路写入）
   const config: AppConfig = {
     pool: options.pool,
@@ -87,6 +92,7 @@ export async function buildApp(options: BuildOptions): Promise<{ app: ReturnType
     defaultProjectId: options.defaultProjectId ?? DEFAULT_PROJECT_ID,
     defaultActorId: options.defaultActorId ?? DEFAULT_ACTOR_ID,
     auth,
+    decisionWake,
   };
 
   if (options.rebuild !== false) await projection.rebuild();

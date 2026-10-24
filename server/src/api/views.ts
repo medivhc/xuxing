@@ -177,9 +177,9 @@ function attentionCreatedAt(snapshot: ProjectionSnapshot, task: TaskRecord): str
  * 在服务端投影的落地（此前只有契约与前端 mock 实现，真实投影缺失导致整页白屏，
  * 见 WHITESCREEN-FIX-1024）。六类 kind 的出现/消失条件按 §2.2，映射到投影记录面：
  *
- * - decision_pending：DecisionCreated 且 pending。K0 服务端无独立 Decision 实体，
- *   待裁决面就是提议——ProposalRecord.status ∈ {proposed, needs_decision}；
- *   decision_id 取 proposal_id（resolve_decision 已下线，裁决走提议命令）。
+ * - decision_pending：DecisionCreated 且 status=pending（冻结 spec §2.2 正本
+ *   口径）。K0 曾以提议派生近似（无 Decision 实体）；K1-A 起投影落独立
+ *   DecisionRecord，本类与 My Actions 的 decision 条目同源同数（K1 §3.6）。
  * - acceptance_due：任务 awaiting_acceptance 且最新有效 Acceptance 不存在或
  *   verdict=partially_accepted（accepted/rejected 即消失；partially 保留「待补判据」）。
  * - run_indeterminate：RunRecord.state=indeterminate（结果不明且未对账到终态）。
@@ -202,19 +202,16 @@ export function attentionItems(snapshot: ProjectionSnapshot, actor: Actor): Atte
   const taskActions = (task: TaskRecord): string[] =>
     availableCommands(computeAvailableActions(task, snapshot, actor.actor_id));
 
-  for (const proposal of snapshot.proposals) {
-    if (proposal.status !== 'proposed' && proposal.status !== 'needs_decision') continue;
+  for (const decision of snapshot.decisions) {
+    if (decision.status !== 'pending') continue;
     raw.push({
-      attention_id: `attention:decision_pending:${proposal.proposal_id}`,
+      attention_id: `attention:decision_pending:${decision.decision_id}`,
       kind: 'decision_pending',
-      project_id: proposal.project_id,
-      ...(proposal.task_id ? { task_id: proposal.task_id } : {}),
-      decision_id: proposal.proposal_id,
-      available_actions:
-        proposal.status === 'proposed' && proposal.kind === 'capture_task'
-          ? ['proposal_accept', 'proposal_reject']
-          : [],
-      created_at: proposal.created_at,
+      project_id: decision.project_id,
+      ...(decision.subject_ref.kind === 'duplicate_suspect' ? { task_id: decision.subject_ref.id } : {}),
+      decision_id: decision.decision_id,
+      available_actions: ['resolve_decision'],
+      created_at: decision.created_at,
     });
   }
 
@@ -342,38 +339,98 @@ export function homeView(snapshot: ProjectionSnapshot, actor: Actor): HomeView {
   };
 }
 
+/**
+ * My Actions 条目（K1 §3.6）：封闭联合 kind ∈ {task, decision}，同列由 rank
+ * 统一排序。task 条目保持 K0 扁平字段（标题/项目名/下一步标签）；decision
+ * 条目按 §3.6 字段集（decision_id/subject_ref/question/recommendation/
+ * alternatives/evidence_refs/created_at/available_actions=["resolve_decision"]）。
+ * 排序口径：decision 条目优先（阻塞性待裁决），同类按 updated_global_seq 升序；
+ * rank 顺序编号 1..n，前端只渲染不自算。
+ */
 export interface ActionItem {
-  task_id: string;
+  kind: 'task' | 'decision';
+  item_id: string;
+  rank: number;
+  task_id: string | null;
   project_id: string;
   project_name: string;
-  title: string;
-  lifecycle: string;
-  wait_state: string;
+  title: string | null;
+  lifecycle: string | null;
+  wait_state: string | null;
   next_action: string;
   available_actions: CommandType[];
   updated_global_seq: number;
+  decision_id: string | null;
+  subject_ref: { kind: string; id: string } | null;
+  question: string | null;
+  recommendation: string | null;
+  alternatives: string[];
+  evidence_refs: string[];
+  created_at: string | null;
 }
 
 /** REQ-PJ-2：My Actions = actor=当前用户 ∧ (可执行[ready/active 且 wait_state=none] ∨ 待其决策的 Decision)。 */
 export function myActionItems(snapshot: ProjectionSnapshot, actor: Actor): ActionItem[] {
-  return snapshot.tasks
+  const projectName = (project_id: string): string =>
+    snapshot.projects.find((p) => p.project_id === project_id)?.name ?? project_id;
+
+  const taskItems: ActionItem[] = snapshot.tasks
     .filter((task) => isActionableFor(task, snapshot, actor.actor_id))
     .map((task) => {
       const actions = computeAvailableActions(task, snapshot, actor.actor_id);
       return {
+        kind: 'task' as const,
+        item_id: `task:${task.task_id}`,
+        rank: 0,
         task_id: task.task_id,
         project_id: task.project_id,
-        project_name: snapshot.projects.find((p) => p.project_id === task.project_id)?.name ?? task.project_id,
+        project_name: projectName(task.project_id),
         title: task.title,
         lifecycle: task.lifecycle,
         wait_state: task.wait_state,
         next_action: actions[0]?.label ?? '',
         available_actions: availableCommands(actions),
         updated_global_seq: task.updated_global_seq,
+        decision_id: null,
+        subject_ref: null,
+        question: null,
+        recommendation: null,
+        alternatives: [],
+        evidence_refs: [],
+        created_at: null,
       };
     })
-    .filter((item) => item.available_actions.length > 0)
-    .sort((a, b) => a.updated_global_seq - b.updated_global_seq);
+    .filter((item) => item.available_actions.length > 0);
+
+  const decisionItems: ActionItem[] = snapshot.decisions
+    .filter((decision) => decision.status === 'pending')
+    .map((decision) => ({
+      kind: 'decision' as const,
+      item_id: `decision:${decision.decision_id}`,
+      rank: 0,
+      task_id: null,
+      project_id: decision.project_id,
+      project_name: projectName(decision.project_id),
+      title: null,
+      lifecycle: null,
+      wait_state: null,
+      next_action: '裁决此决策',
+      available_actions: ['resolve_decision'] as CommandType[],
+      updated_global_seq: decision.updated_global_seq,
+      decision_id: decision.decision_id,
+      subject_ref: decision.subject_ref,
+      question: decision.question,
+      recommendation: decision.recommendation,
+      alternatives: decision.alternatives,
+      evidence_refs: decision.evidence_refs,
+      created_at: decision.created_at,
+    }));
+
+  const merged = [...decisionItems, ...taskItems].sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === 'decision' ? -1 : 1;
+    return a.updated_global_seq - b.updated_global_seq;
+  });
+  return merged.map((item, i) => ({ ...item, rank: i + 1 }));
 }
 
 export interface ActionsView extends ProjectionMeta {

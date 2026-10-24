@@ -6,7 +6,7 @@
 import { guardTransition, guardWaitStateChange, type GuardFacts } from '../../../src/kernel/transition-guard.ts';
 import type { ProjectionSnapshot, RunRecord, TaskRecord } from './projection.ts';
 
-/** 命令词表（FIX-ROUND-1 R-1 定版）：HTTP 与 available_actions 只说这 6 个 canonical 值。 */
+/** 命令词表（FIX-ROUND-1 R-1 定版；K1-A 增补 resolve_decision 为第 7 个 canonical 值）。 */
 export const COMMAND_TYPES = [
   'proposal_accept',
   'proposal_reject',
@@ -14,6 +14,7 @@ export const COMMAND_TYPES = [
   'feedback_submit',
   'acceptance_record',
   'task_cancel',
+  'resolve_decision',
 ] as const;
 
 export type CommandType = (typeof COMMAND_TYPES)[number];
@@ -128,6 +129,18 @@ export function computeAvailableActions(
     }
   }
 
+  // K1-B：agent 任务 active 且无在飞 Run（上一 Run 已终态，如对账 not_executed
+  // 后）→ 可重新派发。这不是生命周期迁移（active→active 不在矩阵内），
+  // 命令层只新建 executor Run、不发 TaskLifecycleChanged，故不走 guard 复核。
+  if (task.lifecycle === 'active' && task.wait_state === 'none' && task.assignee_kind === 'agent' && !live) {
+    actions.push({
+      id: 'next_lifecycle',
+      label: '重新派发 Run',
+      next: { type: 'task_lifecycle', from: 'active', to: 'active', guard: 'allowed', facts_needed: [] },
+      command_type: 'task_advance',
+    });
+  }
+
   if (canSubmitFeedback(task, snapshot, actorId)) {
     actions.push({ id: 'submit_feedback', label: '提交执行反馈', next: null, command_type: 'feedback_submit' });
   }
@@ -228,7 +241,11 @@ export function isActionableFor(task: TaskRecord, snapshot: ProjectionSnapshot, 
   if (task.wait_state !== 'none') return false;
   if (task.lifecycle === 'ready') return true;
   if (task.lifecycle === 'active') {
-    return activeHumanRun(snapshot, task.task_id, actorId) !== undefined || canSubmitFeedback(task, snapshot, actorId);
+    if (activeHumanRun(snapshot, task.task_id, actorId) !== undefined || canSubmitFeedback(task, snapshot, actorId)) {
+      return true;
+    }
+    // K1-B：agent 任务无在飞 Run 时，用户可重新派发（见 computeAvailableActions）。
+    return task.assignee_kind === 'agent' && !hasLiveRun(snapshot, task.task_id);
   }
   // 已定义但尚不就绪 / 捕获后未定义：仍是"当前用户"要推进的事（proposal 接受后即在此列）
   if (task.lifecycle === 'captured' || task.lifecycle === 'defined') return true;
