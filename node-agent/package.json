@@ -1,0 +1,1 @@
+{"description":"续行 K1-B 本地执行节点代理：出站长轮询领活、租约心跳、结果回报与 probe 对账。配置只来自环境变量（见 README）。","engines":{"node":">=20"},"name":"xuxing-node-agent","private":true,"scripts":{"start":"node src/agent.mjs"},"type":"module","version":"0.1.0"}

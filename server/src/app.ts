@@ -16,6 +16,12 @@ import {
   type AuthService,
 } from './auth/auth.ts';
 import { createDecisionWakeService, type DecisionWakeService } from './decisions/wake.ts';
+import {
+  NodeDispatcher,
+  dispatcherConfigFromEnv,
+  type DispatcherConfig,
+} from './nodes/dispatcher.ts';
+import { NodeStore, migrateNodeTables } from './nodes/store.ts';
 
 export interface AppConfig {
   pool: Pool;
@@ -31,6 +37,10 @@ export interface AppConfig {
   auth: AuthService;
   /** K1-A deferred 唤起/过期扫描服务（main 负责 start，测试直接 tick）。 */
   decisionWake: DecisionWakeService;
+  /** K1-B 节点注册/派发运维表存取。 */
+  nodeStore: NodeStore;
+  /** K1-B 执行节点派发服务（main 负责 start，测试直接 tick/调用）。 */
+  dispatcher: NodeDispatcher;
 }
 
 export interface BuildOptions {
@@ -47,6 +57,8 @@ export interface BuildOptions {
   rebuild?: boolean;
   /** K1-C：访问控制配置（缺省从 env 读；校验失败抛错拒启，fail-closed）。 */
   auth?: AuthConfig;
+  /** K1-B：派发服务配置覆盖（缺省从 env 读）。 */
+  dispatcherConfig?: Partial<DispatcherConfig>;
 }
 
 /** 默认演示项目 id（种子脚本写入；与 seed/demo.ts 同源常量）。 */
@@ -80,6 +92,14 @@ export async function buildApp(options: BuildOptions): Promise<{ app: ReturnType
 
   const decisionWake = createDecisionWakeService({ store, projection, clock });
 
+  // K1-B：节点/派发运维表（幂等建表）+ 派发服务装配。
+  await migrateNodeTables(options.pool);
+  const nodeStore = new NodeStore(options.pool);
+  const dispatcher = new NodeDispatcher(store, projection, proposer, nodeStore, {
+    ...dispatcherConfigFromEnv(),
+    ...(options.dispatcherConfig ?? {}),
+  });
+
   // 投影变化 → SSE 广播（写入路径在命令层 ingest 之后手动广播；这里兜住种子脚本等旁路写入）
   const config: AppConfig = {
     pool: options.pool,
@@ -93,6 +113,8 @@ export async function buildApp(options: BuildOptions): Promise<{ app: ReturnType
     defaultActorId: options.defaultActorId ?? DEFAULT_ACTOR_ID,
     auth,
     decisionWake,
+    nodeStore,
+    dispatcher,
   };
 
   if (options.rebuild !== false) await projection.rebuild();

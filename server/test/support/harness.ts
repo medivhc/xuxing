@@ -98,6 +98,9 @@ export async function bootApp(options: {
   proposer?: Proposer;
   seed?: boolean;
   sse?: SseOptions;
+  /** K1-C/K1-B 测试装配透传（缺省行为不变）。 */
+  auth?: Parameters<typeof buildApp>[0]['auth'];
+  dispatcherConfig?: Parameters<typeof buildApp>[0]['dispatcherConfig'];
 } = {}): Promise<BootedApp> {
   const harness = await createHarness();
   const { app, config } = await buildApp({
@@ -106,6 +109,8 @@ export async function bootApp(options: {
     proposer: options.proposer ?? stubProposer(),
     sse: options.sse ?? TEST_SSE,
     clock: () => harness.clock.now,
+    auth: options.auth,
+    dispatcherConfig: options.dispatcherConfig,
   });
   if (options.seed !== false) {
     await seedDemo({ store: harness.store, projection: config.projection });

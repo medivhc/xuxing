@@ -28,6 +28,8 @@ import {
   tokensEqual,
   type AuthService,
 } from '../auth/auth.ts';
+import { registerNodeRoutes } from './nodes-routes.ts';
+import type { NodeDispatcher } from '../nodes/dispatcher.ts';
 
 export interface AppContext {
   pool: Pool;
@@ -41,6 +43,8 @@ export interface AppContext {
   defaultActorId: string;
   /** K1-C 访问控制（双令牌 + 会话存储）。 */
   auth: AuthService;
+  /** K1-B 执行节点派发服务。 */
+  dispatcher: NodeDispatcher;
 }
 
 /**
@@ -184,6 +188,9 @@ export function createApp(ctx: AppContext): Hono {
     return c.json(ok({ logged_out: true }));
   });
 
+  // ---- K1-B 节点面 + 节点列表（§4.5；令牌面隔离在 auth 中间件）----
+  registerNodeRoutes(app, { dispatcher: ctx.dispatcher, auth: ctx.auth });
+
   // ---- GET /api/home ----
   app.get('/api/home', (c) => {
     const actor = actorOf(c.req.header('x-xuxing-actor'), ctx.defaultActorId);
@@ -191,10 +198,12 @@ export function createApp(ctx: AppContext): Hono {
   });
 
   // ---- GET /api/projects/:projectId ----
-  app.get('/api/projects/:projectId', (c) => {
+  app.get('/api/projects/:projectId', async (c) => {
     const actor = actorOf(c.req.header('x-xuxing-actor'), ctx.defaultActorId);
     const project_id = c.req.param('projectId');
-    const view = projectView(ctx.projection.snapshot(), project_id, actor);
+    // K1-B §4.4：Run 视图合成派发行 state_reason（只读映射）。
+    const reasons = await ctx.dispatcher.dispatchReasons();
+    const view = projectView(ctx.projection.snapshot(), project_id, actor, reasons);
     if (view === null) return c.json(fail('not_found', `项目 ${project_id} 不存在`), 404);
     return c.json(ok(view));
   });

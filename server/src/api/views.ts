@@ -446,6 +446,18 @@ export interface ProjectView extends ProjectionMeta {
   project: { project_id: string; name: string; policy_id: string; created_by: string };
   goal: { goal_id: string; statement: string; success_criteria: string; stop_conditions: string; status: string } | null;
   tasks: ReturnType<typeof taskSummary>[];
+  /** K1-B：项目内 Run 视图（state_reason 为派发行合成字段）。 */
+  runs: Array<{
+    run_id: string;
+    task_id: string;
+    run_kind: string;
+    state: string;
+    executor_kind: string | null;
+    side_effect_level: string;
+    side_effect_count: number;
+    state_reason: string | null;
+    updated_global_seq: number;
+  }>;
   acceptance_status: {
     accepted: number;
     awaiting: number;
@@ -460,7 +472,12 @@ export interface ProjectView extends ProjectionMeta {
   pending_proposals: Array<{ proposal_id: string; kind: string; status: string; degraded: boolean; rationale: string; created_at: string }>;
 }
 
-export function projectView(snapshot: ProjectionSnapshot, project_id: string, actor: Actor): ProjectView | null {
+export function projectView(
+  snapshot: ProjectionSnapshot,
+  project_id: string,
+  actor: Actor,
+  dispatchReasons?: Map<string, string | null>,
+): ProjectView | null {
   const project = snapshot.projects.find((p) => p.project_id === project_id);
   if (!project) return null;
   const tasks = snapshot.tasks.filter((t) => t.project_id === project_id);
@@ -489,6 +506,21 @@ export function projectView(snapshot: ProjectionSnapshot, project_id: string, ac
         status: goal.status,
       },
     tasks: tasks.map((task) => taskSummary(task, snapshot, actor)),
+    // K1-B §4.4：Run 视图（state 为投影事件派生；state_reason 为派发行
+    // 状态，由 routes 层合成传入——无可用节点挂起时固定 awaiting_node）。
+    runs: snapshot.runs
+      .filter((r) => tasks.some((t) => t.task_id === r.task_id))
+      .map((r) => ({
+        run_id: r.run_id,
+        task_id: r.task_id,
+        run_kind: r.run_kind,
+        state: r.state,
+        executor_kind: r.executor_kind,
+        side_effect_level: r.side_effect_level,
+        side_effect_count: r.side_effect_count,
+        state_reason: dispatchReasons?.get(r.run_id) ?? null,
+        updated_global_seq: r.updated_global_seq,
+      })),
     acceptance_status: {
       accepted: tasks.filter((t) => t.lifecycle === 'accepted').length,
       awaiting: tasks.filter((t) => t.lifecycle === 'awaiting_acceptance').length,
