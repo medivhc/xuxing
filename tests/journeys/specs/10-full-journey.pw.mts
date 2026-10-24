@@ -120,13 +120,12 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
         ['task_demo_contact', 'task_demo_contract', 'task_demo_quote'].sort(),
       );
       // 真服务口径（server/src/projection/actions.ts）：执行中的任务只要还有在跑的 Run，
-      // task_cancel 就受 allRunsTerminal 约束不出现在 available_actions 里。
+      // task_cancel 就受 allRunsTerminal 约束不出现在 available_actions 里；
+      // 且 Q15 取消意图前置：未落 TaskCancelRequested 的任务不展示 task_cancel
+      // （取消由 task_cancel 命令本身落意图，命令门口径见 server/src/commands/commands.ts）。
       expect(findAction(actions, 'task_demo_contact')?.available_actions).toEqual(['feedback_submit']);
-      expect(findAction(actions, 'task_demo_quote')?.available_actions).toEqual(['task_advance', 'task_cancel']);
-      expect(findAction(actions, 'task_demo_contract')?.available_actions).toEqual([
-        'task_advance',
-        'task_cancel',
-      ]);
+      expect(findAction(actions, 'task_demo_quote')?.available_actions).toEqual(['task_advance']);
+      expect(findAction(actions, 'task_demo_contract')?.available_actions).toEqual(['task_advance']);
       // accepted / canceled 不在 My Actions
       expect(findAction(actions, 'task_demo_kickoff')).toBeUndefined();
       expect(findAction(actions, DEMO.canceledTaskId)).toBeUndefined();
