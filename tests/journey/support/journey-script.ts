@@ -21,6 +21,7 @@ import {
   type PgEventStore,
 } from '../../../src/kernel/event-store-pg.js';
 import type { GuardFacts } from '../../../src/kernel/transition-guard.js';
+import { asProjectId } from '../../../src/kernel/events.js';
 import type { EventEnvelope, EventType } from '../../../src/kernel/events.js';
 import type { ActorKind } from '../../../src/kernel/events.js';
 import type { SideEffectLevel } from '../../../src/domain/types.js';
@@ -43,7 +44,7 @@ import {
 export const FIXED_NOW = new Date('2026-10-23T00:00:00.000Z');
 
 export const D8 = {
-  project: 'proj-d8',
+  project: asProjectId('proj-d8'), // F13：stream_id 品牌类型，定义处收口（与内核测试 asProjectId 口径一致）
   policy: 'policy-d8',
   goal: 'goal-d8',
   captureTask: 'task-d8-capture',
