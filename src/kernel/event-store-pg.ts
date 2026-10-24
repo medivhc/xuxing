@@ -1764,6 +1764,9 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     ): Promise<PgAppendBatchResult> {
       const stream_id = batchStreamId(entries);
 
+      // 先取全局追加顺序锁再读批次起点：否则并发事务可能在「读起点」与「拿锁」之间
+      // 提交事件，导致事后按 seq > 起点读回时把别人的事件算进本批结果。
+      await lockAppendOrder(conn);
       const head = await conn.query<{ last_seq: string }>(
         `SELECT last_seq FROM event_streams WHERE stream_id = $1`,
         [stream_id],
