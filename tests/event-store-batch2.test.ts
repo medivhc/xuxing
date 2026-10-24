@@ -555,17 +555,18 @@ describe('S4-① 事务内误用外层 store：立即 TransactionScopeError（�
     expect(await countEvents(ctx.pool)).toBe(before);
   });
 
-  it('不同 stream 的外层写入不被误伤（检查按 stream 粒度）', async () => {
+  it('事务作用域内的外层写入（即使不同 stream）同样立即拒绝：全局追加锁下也会死锁', async () => {
     await seedProject();
     const other = asProjectId('project-other-b2');
 
-    await store.withTransaction(async (tx) => {
-      await tx.append(input());
-      const wrote = await store.append(projectCreated({ stream_id: other }));
-      expect(wrote.stream_id).toBe(other);
-    });
+    await expect(
+      store.withTransaction(async (tx) => {
+        await tx.append(input());
+        await store.append(projectCreated({ stream_id: other }));
+      }),
+    ).rejects.toBeInstanceOf(TransactionScopeError);
 
-    expect((await store.readStream(other)).map((e) => e.type)).toEqual(['ProjectCreated']);
+    expect(await store.readStream(other)).toEqual([]);
   });
 
   it('appendStateTransition 走外层 store 写同 stream 同样立即报错', async () => {

@@ -439,7 +439,7 @@ describe('并发与 seq 原子分配', () => {
     expect((await store.verifyChain(STREAM)).ok).toBe(true);
   });
 
-  it('跨 stream 并发互不阻塞，global_seq 全库唯一', async () => {
+  it('跨 stream 并发：各流 seq 独立、global_seq 全库唯一（S5 起写路径全局串行，提交序=seq 序）', async () => {
     const results = await Promise.all([
       ...Array.from({ length: 5 }, (_, i) =>
         store.append(input({ stream_id: asProjectId('project-X'), payload: { i } }))),
