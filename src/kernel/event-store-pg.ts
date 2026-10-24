@@ -155,8 +155,7 @@ export class TransitionPayloadMismatchError extends Error {
   }
 }
 
-/** payload 形状无法承载 from/to（非 plain object）—— 拒绝写入。 */
-export class TransitionPayloadError extends Error {
+/** payload 形状无法承载 from/to（非 plain object）—— 拒绝写入。 */export class TransitionPayloadError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'TransitionPayloadError';
@@ -511,6 +510,12 @@ export interface PgEventStoreOptions {
   clock?: () => Date;
   /** 注入 id 工厂（默认 ULID），测试可固定 id。 */
   idFactory?: () => string;
+  /**
+   * S3-②（F13 残留）：默认要求流的首条事件是 ProjectCreated（spec §4 / INV-12：stream = Project）。
+   * 仅 store 机制测试（哈希链/幂等/并发）需要「无 ProjectCreated 的局部流」时显式关闭；
+   * 生产入口（server / seed / journeys）不得关闭。
+   */
+  requireProjectCreated?: boolean;
 }
 
 export type AppendStateTransitionInput = AppendEventInput & {
@@ -596,6 +601,24 @@ export class ProjectStreamRequiredError extends Error {
     );
     this.name = 'ProjectStreamRequiredError';
     this.stream_id = stream_id;
+  }
+}
+
+/**
+ * S3-②（F13 残留）：流内必须有 ProjectCreated 事实才能承载后续事件。
+ * 品牌类型与撞值校验只能保证「看起来像 project_id」，不能证明项目真的被创建过。
+ */
+export class ProjectCreatedRequiredError extends Error {
+  readonly stream_id: string;
+  readonly type: string;
+  constructor(stream_id: string, type: string) {
+    super(
+      `stream ${JSON.stringify(stream_id)} 尚无 ProjectCreated 事实：拒绝写入 ${type}。` +
+        `事件流按 Project 划分（spec §4 / INV-12），建流的第一条事件必须是 ProjectCreated`,
+    );
+    this.name = 'ProjectCreatedRequiredError';
+    this.stream_id = stream_id;
+    this.type = type;
   }
 }
 
@@ -1260,6 +1283,7 @@ async function appendWithin(
   prepared: PreparedAppend,
   idFactory: () => string,
   clock: () => Date,
+  requireProjectCreated: boolean,
 ): Promise<EventEnvelope> {
   const { input, payload_canonical } = prepared;
 
@@ -1282,6 +1306,11 @@ async function appendWithin(
   }
   const last_seq = toSafeNumber(head.rows[0].last_seq, 'event_streams.last_seq');
   const last_hash = head.rows[0].last_hash;
+
+  // S3-②：新流的首条事件必须是 ProjectCreated（其余事件不得凭空建项目流）。
+  if (requireProjectCreated && last_seq === 0 && input.type !== 'ProjectCreated') {
+    throw new ProjectCreatedRequiredError(input.stream_id, input.type);
+  }
 
   // 锁内快路径：同 key 已入账 → 返回首次结果（INV-13）
   if (input.idempotency_key !== null) {
@@ -1471,6 +1500,7 @@ function batchStreamId(entries: AppendBatchEntryInput[]): ProjectId {
 export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}): PgEventStore {
   const clock = options.clock ?? (() => new Date());
   const idFactory = options.idFactory ?? (() => ulid());
+  const requireProjectCreated = options.requireProjectCreated ?? true;
 
   /**
    * 构造一个 store 视图。client = null 时每次写各自开事务（pool 路径）；
@@ -1485,7 +1515,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       input: AppendEventInput,
       prepareOptions: PrepareAppendOptions = {},
     ): Promise<EventEnvelope> {
-      return appendWithin(conn, prepareAppend(input, prepareOptions), idFactory, clock);
+      return appendWithin(conn, prepareAppend(input, prepareOptions), idFactory, clock, requireProjectCreated);
     }
 
     async function append(
@@ -1771,7 +1801,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     }
 
     /** 同 stream 串行化入口：派生状态与写入必须在同一把行锁内完成（F1）。 */
-    async function ensureAndLockStream(conn: PoolClient, stream_id: string): Promise<void> {
+    async function ensureAndLockStream(conn: PoolClient, stream_id: string): Promise<number> {
       await conn.query(
         `INSERT INTO event_streams (stream_id, last_seq, last_hash)
          VALUES ($1, 0, $2)
@@ -1785,6 +1815,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       if (head.rows.length !== 1) {
         throw new StoreInvariantError(`event_streams 缺少 stream=${stream_id} 的链头行`);
       }
+      return toSafeNumber(head.rows[0].last_seq, 'event_streams.last_seq');
     }
 
     async function findByIdempotencyKey(
@@ -1988,7 +2019,10 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
 
       // 锁内：先做幂等重放检查（避免重放被 F1 的 from 校验误伤），再派生流状态。
       const payload_canonical = canonicalJson(payload);
-      await ensureAndLockStream(conn, input.stream_id);
+      const head_seq = await ensureAndLockStream(conn, input.stream_id);
+      if (requireProjectCreated && head_seq === 0 && input.type !== 'ProjectCreated') {
+        throw new ProjectCreatedRequiredError(input.stream_id, input.type);
+      }
 
       const existing = await findByIdempotencyKey(conn, input.stream_id, input.idempotency_key);
       if (existing !== null && input.idempotency_key !== null) {
@@ -2203,7 +2237,10 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     ): Promise<TaskCancellationResult> {
       // F13：stream 必须是 Project，不能复用 task_id。
       assertProjectStreamId(input.stream_id, { task_id: input.task_id });
-      await ensureAndLockStream(conn, input.stream_id);
+      const head_seq = await ensureAndLockStream(conn, input.stream_id);
+      if (requireProjectCreated && head_seq === 0) {
+        throw new ProjectCreatedRequiredError(input.stream_id, 'TaskCancelRequested');
+      }
 
       // 幂等：同 key 已记过取消意图 → 返回首次结果（INV-13）
       const existing = await findByIdempotencyKey(conn, input.stream_id, input.idempotency_key);

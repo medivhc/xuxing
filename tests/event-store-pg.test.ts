@@ -166,7 +166,9 @@ let store: PgEventStore;
 beforeAll(async () => {
   ctx = await createTestPg();
   await migrate(ctx.pool);
-  store = createPgEventStore(ctx.pool, { clock: () => FIXED_NOW });
+  // 本套用例验证 store 机制（链/幂等/并发），使用不含 ProjectCreated 的局部流；
+  // 项目流存在性由 tests/event-store-batch2.test.ts 的 S3-② 用例覆盖（生产默认强制）。
+  store = createPgEventStore(ctx.pool, { clock: () => FIXED_NOW, requireProjectCreated: false });
 });
 
 afterAll(async () => {
@@ -472,7 +474,7 @@ describe('读路径：含起点语义（A5）', () => {
 
 describe('接口一致性（接线第一层证据）', () => {
   it('createPgEventStore 可赋给 EventStore 接口并只经接口方法使用', async () => {
-    const asInterface: EventStore = createPgEventStore(ctx.pool, { clock: () => FIXED_NOW });
+    const asInterface: EventStore = createPgEventStore(ctx.pool, { clock: () => FIXED_NOW, requireProjectCreated: false });
     const envelope = await asInterface.append(input());
     expect(envelope.seq).toBe(1);
     expect(await asInterface.readStream(STREAM)).toHaveLength(1);

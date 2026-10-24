@@ -4,6 +4,7 @@ import { asProjectId, type EventEnvelope, type EventType, type ProjectId } from 
 import {
   AppendBatchError,
   EventEntityMismatchError,
+  ProjectCreatedRequiredError,
   TerminalClosureRequiredError,
   TransitionDeniedError,
   TransitionStateError,
@@ -67,8 +68,23 @@ async function typesOf(store: PgEventStore, stream: ProjectId): Promise<string[]
   return (await store.readStream(stream)).map((event) => event.type);
 }
 
+function projectCreated(overrides: Partial<AppendBatchEntryInput> = {}): AppendBatchEntryInput {
+  return input({
+    type: 'ProjectCreated',
+    payload: { name: 'Batch 2 项目', created_by: 'actor-human-1' },
+    ...overrides,
+  });
+}
+
+/** 建项目流（S3-②：流的首条事件必须是 ProjectCreated）。 */
+async function seedProject(): Promise<void> {
+  if ((await store.readStream(STREAM)).length > 0) return;
+  await store.append(projectCreated());
+}
+
 /** 用普通 append 播种生命周期（B1 语义：generic append 只做矩阵格校验）。 */
 async function seedTaskAt(target: 'captured' | 'defined' | 'ready' | 'active' | 'awaiting_acceptance'): Promise<void> {
+  await seedProject();
   await store.append(input());
   if (target === 'captured') return;
   const path: Array<[string, string]> = [
@@ -117,22 +133,26 @@ describe('环境证据：真 PostgreSQL 16', () => {
 describe('S1-① appendBatch：同 stream / 同事务 / 链内连续（Q4）', () => {
   it('golden：3 条事件一个 batch → seq 1..3 连续、verifyChain ok、global_seq 唯一', async () => {
     const result = await store.appendBatch([
+      projectCreated(),
       input({ payload: { task_id: TASK_ID, title: '第一条' } }),
       input({ type: 'GoalCreated', payload: { goal_id: 'goal-1', statement: '目标' } }),
       input({ type: 'TaskDefined', payload: { task_id: TASK_ID, title: '定义完成' } }),
     ]);
 
-    expect(result.events.map((e) => e.seq)).toEqual([1, 2, 3]);
-    expect(result.events.map((e) => e.type)).toEqual(['TaskCaptured', 'GoalCreated', 'TaskDefined']);
-    expect(new Set(result.events.map((e) => e.global_seq)).size).toBe(3);
+    expect(result.events.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
+    expect(result.events.map((e) => e.type)).toEqual([
+      'ProjectCreated', 'TaskCaptured', 'GoalCreated', 'TaskDefined',
+    ]);
+    expect(new Set(result.events.map((e) => e.global_seq)).size).toBe(4);
     expect(result.transitions).toEqual([]);
 
     const chain = await store.verifyChain(STREAM);
-    expect(chain).toMatchObject({ ok: true, length: 3, stream_exists: true });
+    expect(chain).toMatchObject({ ok: true, length: 4, stream_exists: true });
   });
 
   it('迁移条目在同一 batch 内按序累积事实（captured→defined→ready 一次提交）', async () => {
     const result = await store.appendBatch([
+      projectCreated(),
       input(),
       transitionEntry(),
       transitionEntry({
@@ -150,13 +170,14 @@ describe('S1-① appendBatch：同 stream / 同事务 / 链内连续（Q4）', (
     ]);
 
     expect(result.transitions.map((t) => t.guard.allowed)).toEqual([true, true]);
-    expect(result.events.map((e) => e.seq)).toEqual([1, 2, 3]);
+    expect(result.events.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
     expect((await store.verifyChain(STREAM)).ok).toBe(true);
   });
 
   it('中途 guard 拒绝 → 整批回滚，零事件落库（失败前已写入的条目也不留）', async () => {
     await expect(
       store.appendBatch([
+        projectCreated(),
         input(),
         // 形状合法（格 ✓），但缺 hasTitle/assigneeKind → 事务内 guard 拒绝
         transitionEntry({ facts: {} }),
@@ -246,8 +267,8 @@ describe('S1-① appendBatch：同 stream / 同事务 / 链内连续（Q4）', (
 
     await expect(
       store.appendBatch([
-        input(),
-        input({ stream_id: asProjectId('project-other') }),
+        projectCreated(),
+        projectCreated({ stream_id: asProjectId('project-other') }),
       ]),
     ).rejects.toBeInstanceOf(AppendBatchError);
 
@@ -263,6 +284,7 @@ describe('S1-① appendBatch：同 stream / 同事务 / 链内连续（Q4）', (
   it('entity 与事件家族不符在开事务前拒绝（零写入）', async () => {
     await expect(
       store.appendBatch([
+        projectCreated(),
         transitionEntry({ entity: 'task', type: 'RunStarted' }),
       ]),
     ).rejects.toBeInstanceOf(EventEntityMismatchError);
@@ -291,6 +313,7 @@ describe('S1-① appendBatch：同 stream / 同事务 / 链内连续（Q4）', (
 // ---------------------------------------------------------------------------
 describe('S1-② 原始 append：TaskLifecycleChanged 必须与流派生状态对账（R1）', () => {
   it('无 from/to 的裸 TaskLifecycleChanged → TransitionPayloadError，零写入', async () => {
+    await seedProject();
     const before = await countEvents(ctx.pool);
     await expect(
       store.append(input({
@@ -324,6 +347,7 @@ describe('S1-② 原始 append：TaskLifecycleChanged 必须与流派生状态�
   });
 
   it('流里没有该 Task → subject_not_found（不得凭空建生命周期）', async () => {
+    await seedProject();
     await store.append(input());
     const before = await countEvents(ctx.pool);
 
@@ -345,7 +369,64 @@ describe('S1-② 原始 append：TaskLifecycleChanged 必须与流派生状态�
 
   it('合法路径回归：按当前态逐条追加仍成功且链完整', async () => {
     await seedTaskAt('defined');
-    expect(await typesOf(store, STREAM)).toEqual(['TaskCaptured', 'TaskLifecycleChanged']);
+    expect(await typesOf(store, STREAM)).toEqual(['ProjectCreated', 'TaskCaptured', 'TaskLifecycleChanged']);
     expect((await store.verifyChain(STREAM)).ok).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S3-②（REVIEW-q15 MINOR-1 / F13 残留）：流内 ProjectCreated 存在性校验
+// ---------------------------------------------------------------------------
+describe('S3-② 无 ProjectCreated 事实的流不得写入（两路 + batch）', () => {
+  it('append：TaskCaptured 作为新流首条 → ProjectCreatedRequiredError，零写入', async () => {
+    await expect(store.append(input())).rejects.toSatisfy((error: unknown) => {
+      expect(error).toBeInstanceOf(ProjectCreatedRequiredError);
+      const denied = error as ProjectCreatedRequiredError;
+      expect(denied.stream_id).toBe(STREAM);
+      expect(denied.type).toBe('TaskCaptured');
+      return true;
+    });
+    expect(await countEvents(ctx.pool)).toBe(0);
+    expect(await store.readStream(STREAM)).toEqual([]);
+  });
+
+  it('appendStateTransition：新流上的迁移 → ProjectCreatedRequiredError', async () => {
+    await expect(
+      store.appendStateTransition({
+        ...transitionEntry(),
+        payload: { task_id: TASK_ID, trigger_event_id: 'trigger-1' },
+      } as never),
+    ).rejects.toBeInstanceOf(ProjectCreatedRequiredError);
+    expect(await countEvents(ctx.pool)).toBe(0);
+  });
+
+  it('appendBatch：首条不是 ProjectCreated → 整批拒绝，零写入', async () => {
+    await expect(
+      store.appendBatch([
+        input(),
+        projectCreated(),
+      ]),
+    ).rejects.toBeInstanceOf(ProjectCreatedRequiredError);
+    expect(await countEvents(ctx.pool)).toBe(0);
+  });
+
+  it('正常建项目流回归：ProjectCreated 先行后，普通事件与迁移都放行', async () => {
+    await seedProject();
+    await store.append(input());
+    const result = await store.appendStateTransition({
+      ...transitionEntry(),
+      payload: { task_id: TASK_ID, trigger_event_id: 'trigger-1' },
+    } as never);
+    expect(result.event.type).toBe('TaskLifecycleChanged');
+    expect((await store.verifyChain(STREAM)).ok).toBe(true);
+  });
+
+  it('requireProjectCreated:false 只服务于 store 机制夹具（显式关闭才允许局部流）', async () => {
+    const fixtureStore = createPgEventStore(ctx.pool, {
+      clock: () => FIXED_NOW,
+      requireProjectCreated: false,
+    });
+    const event = await fixtureStore.append(input({ stream_id: asProjectId('project-fixture') }));
+    expect(event.seq).toBe(1);
   });
 });
