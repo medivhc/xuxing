@@ -43,6 +43,13 @@ import {
   type GuardResult,
 } from './transition-guard.js';
 import type { RunState, TaskLifecycle, TaskWaitState } from '../domain/types.js';
+import {
+  ActorValidationError,
+  ToolOutputChannelError,
+  isEvidenceSourceKind,
+  validateActorIdentity,
+} from './actor-guard.js';
+
 
 export const GENESIS_HASH = '0'.repeat(64);
 
@@ -1096,6 +1103,14 @@ export interface PgEventStoreTx extends EventStore {
   requestTaskCancellation(input: RequestTaskCancellationInput): Promise<TaskCancellationResult>;
   /** 读全流、用 payload_canonical 重算链，返回首个断点（不在 append/replay 热路径）。 */
   verifyChain(stream_id: ProjectId): Promise<ChainVerification>;
+  /**
+   * Tool Gateway 专用写入口（INV-6）：唯一可写 source_kind='tool_output' Evidence 的路径。
+   * 凭据核验在 tool-gateway.ts 模块层完成；本入口只负责带网关标记的落盘，
+   * 并在 payload 注入 recorded_via/gateway_id 审计字段。普通 append 写 tool_output 一律被拒。
+   */
+  appendToolOutputEvidence(
+    input: Parameters<EventStore['append']>[0] & { gateway_id: string },
+  ): Promise<EventEnvelope>;
 }
 
 export interface PgEventStore extends PgEventStoreTx {
@@ -1124,6 +1139,10 @@ interface PreparedAppend {
 interface PrepareAppendOptions {
   /** 仅内核收尾路径可用：允许直接写 TaskLifecycleChanged→accepted/canceled。 */
   allowTerminalLifecycle?: boolean;
+  /** 仅 Tool Gateway 专用入口可用（INV-6）：允许写 source_kind='tool_output' 的 EvidenceAdded。 */
+  viaToolGateway?: boolean;
+  /** 网关标识（viaToolGateway 时必填），注入 payload 作审计字段。 */
+  gatewayId?: string;
 }
 
 /**
@@ -1138,6 +1157,9 @@ function prepareAppend(
   if (!(EVENT_TYPES as readonly string[]).includes(input.type)) {
     throw new UnknownEventTypeError(String(input.type));
   }
+
+  // Q12/C6：actor 身份形状校验——缺失/空/类型错/kind 非枚举一律拒绝（零落盘）。
+  validateActorIdentity(input.actor_id, input.actor_kind);
 
   // F8：通用 append 的 payload 一律要求 plain object（array/null/Date/Map 拒绝）。
   if (!isPlainObject(input.payload)) {
@@ -1217,8 +1239,51 @@ function prepareAppend(
     }
   }
 
-  const payload_canonical = canonicalJson(input.payload);
-  return { input, payload_canonical };
+  // Q12：AcceptanceRecorded 的验收人必须与事件信封 actor 一致（防 payload 伪造验收人）。
+  if (input.type === 'AcceptanceRecorded') {
+    const acceptorId = input.payload.acceptor_id;
+    const acceptorKind = input.payload.acceptor_kind;
+    if (typeof acceptorId !== 'string' || acceptorId.length === 0) {
+      throw new ActorValidationError('AcceptanceRecorded.payload 必须带非空 acceptor_id（REQ-ACC-2）', {
+        field: 'acceptor_id',
+        reason: 'acceptor_missing',
+      });
+    }
+    if (acceptorId !== input.actor_id || acceptorKind !== input.actor_kind) {
+      throw new ActorValidationError(
+        `AcceptanceRecorded.payload 的 acceptor 与事件信封不一致：` +
+          `payload=${acceptorId}/${String(acceptorKind)}，envelope=${input.actor_id}/${input.actor_kind}`,
+        { field: 'acceptor_id', reason: 'acceptor_envelope_mismatch' },
+      );
+    }
+  }
+
+  // Q12/INV-6：EvidenceAdded 的 source_kind 封闭集 + tool_output 通道封锁。
+  let effectiveInput = input;
+  if (input.type === 'EvidenceAdded') {
+    const sourceKind = input.payload.source_kind;
+    if (!isEvidenceSourceKind(sourceKind)) {
+      throw new ActorValidationError(
+        'EvidenceAdded.payload.source_kind 必须是 user_statement / agent_claim / tool_output / external_doc / device_log 之一（spec §2.5）',
+        { field: 'source_kind', reason: 'source_kind_invalid' },
+      );
+    }
+    if (sourceKind === 'tool_output') {
+      if (options.viaToolGateway !== true || typeof options.gatewayId !== 'string' || options.gatewayId.length === 0) {
+        throw new ToolOutputChannelError(
+          'source_kind=tool_output 的 Evidence 只能经 Tool Gateway 通道写入（INV-6），通用写路径拒绝',
+        );
+      }
+      // 审计字段由内核注入（调用方自带同名字段一律覆盖，防伪造审计来源）。
+      effectiveInput = {
+        ...input,
+        payload: { ...input.payload, recorded_via: 'tool_gateway', gateway_id: options.gatewayId },
+      };
+    }
+  }
+
+  const payload_canonical = canonicalJson(effectiveInput.payload);
+  return { input: effectiveInput, payload_canonical };
 }
 
 /**
@@ -2185,6 +2250,17 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       return withStoreTransaction((conn) => requestTaskCancellationOn(conn, input));
     }
 
+    async function appendToolOutputEvidence(
+      input: Parameters<EventStore['append']>[0] & { gateway_id: string },
+    ): Promise<EventEnvelope> {
+      const { gateway_id, ...appendInput } = input;
+      if (appendInput.type !== 'EvidenceAdded') {
+        throw new ToolOutputChannelError('Tool Gateway 专用入口只写 EvidenceAdded 事件（INV-6）');
+      }
+      const prepared = prepareAppend(appendInput, { viaToolGateway: true, gatewayId: gateway_id });
+      return withStoreTransaction((conn) => appendWithin(conn, prepared, idFactory, clock));
+    }
+
     return {
       append,
       readStream,
@@ -2192,6 +2268,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       appendStateTransition,
       requestTaskCancellation,
       verifyChain,
+      appendToolOutputEvidence,
     };
   }
 
