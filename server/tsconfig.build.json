@@ -1,0 +1,21 @@
+// 运行时构建配置（与 tsconfig.json 的类型检查配置分开）：
+// 类型检查允许 .ts 扩展名（noEmit），但 Node 24.4.1 的 --experimental-strip-types 只会剥类型、
+// 不会把 `./x.js` 改写成 `./x.ts`，内核源码 import 写的就是 .js —— 直接跑源码会 ERR_MODULE_NOT_FOUND。
+// 所以运行时一律"先编译、再跑编译产物"：
+//   ../src/kernel/*.ts  → dist/src/kernel/*.js
+//   src/**/*.ts         → dist/server/src/**/*.js（入口 dist/server/src/main.js）
+// 投影/内核/服务端三者在同一进程，编译产物之间的相对路径保持不变。
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "allowImportingTsExtensions": false,
+    "rewriteRelativeImportExtensions": true,
+    "outDir": "dist",
+    "rootDir": "..",
+    "declaration": false,
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts", "../src/**/*.ts"],
+  "exclude": ["dist", "test"]
+}
