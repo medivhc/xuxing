@@ -70,6 +70,8 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
     // mock 轮每次都从同一种子重建，基线是 R-7 契约值。
     let baselineAccepted = 1;
     let baselineTotal = 5;
+    // 单判据提议（fallback）没有"部分通过 → 补集"这一段，第 5 步即终态
+    let singleCriterion = false;
     const captureText = `把 nx-pipeline 最近一轮 run 导入续行，跑通双轨对照（旅程 ${randomUUID().slice(0, 8)}）`;
 
     await test.step('0. 健康检查 + 种子基线（R-7 种子契约）', async () => {
@@ -178,9 +180,18 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
       const proposal = await getProposal(request, proposalId);
       versions.push(proposal.projection_version);
       expect(proposal.capture_id).toBe(captureId);
+      // 降级分支取决于提议层是否连上了模型（R-7 / REQ-PC）：magpie 断开时真服务按设计
+      // 产出 fallback 提议（degraded=true、reason=not_configured），旅程照样要能走完全链路。
       expect(proposal.status).toBe('proposed');
-      expect(proposal.degraded).toBe(false);
-      expect(proposal.proposer.degraded).toBe(false);
+      if (proposal.proposer.degraded) {
+        expect(proposal.degraded).toBe(true);
+        expect(proposal.proposer.source).toBe('fallback');
+        expect(proposal.proposer.degraded_reason).toBeTruthy();
+      } else {
+        expect(proposal.degraded).toBe(false);
+        expect(proposal.proposer.source).toBe('model');
+        expect(proposal.proposer.degraded_reason).toBeNull();
+      }
       expect(proposal.available_actions).toEqual(['proposal_accept', 'proposal_reject']);
       // R-11：提议不预告 task_id，只带 draft（标题 + 判据）
       expect(proposal.task_id).toBeNull();
@@ -347,6 +358,8 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
 
     await test.step('5. 逐判据验收（第一次：一条不通过 → partially_accepted，任务退回 active 待再执行）', async () => {
       const failedRef = criteria[0].criterion_ref;
+      // 单判据提议（模型未配置时的 fallback 只给一条判据）没有"其余判据不通过"可点，
+      // 一次验收即终态：第 5 步末尾直接收口，不进入第 6 步的再执行。
       if (usingMock) {
         if (!page.url().endsWith('/actions')) await page.goto('/#/actions');
         await actionRow(page, taskId).getByTestId(TID.actionOpenAcceptance).click();
@@ -387,20 +400,38 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
                 verdict: index === 0 ? 'passed' : 'failed',
                 evidence_refs: [],
               })),
-              rationale: '部分判据未通过，退回再执行',
+              rationale: '首条判据已过，其余待补齐',
             },
             `acceptance-partial-${randomUUID()}`,
           ),
         );
         expect(acceptance.command_type).toBe('acceptance_record');
-        expect(acceptance.subject.verdict).toBe('partially_accepted');
+        // 降级提议（模型未配置）只给一条判据，这条过了就是 accepted；
+        // 有两条及以上判据时，只有首条通过 → partially_accepted（REQ-ACC-3 的逐判据口径）。
+        expect(acceptance.subject.verdict).toBe(criteria.length === 1 ? 'accepted' : 'partially_accepted');
         versions.push(acceptance.projection_version);
+      }
+
+      const expectedVerdict: 'accepted' | 'partially_accepted' =
+        criteria.length === 1 ? 'accepted' : 'partially_accepted';
+      if (expectedVerdict === 'accepted') {
+        // 单判据（降级提议）没有"退回再执行"这一段：这一次验收即终态。
+        const single = await waitForProjection(
+          () => getProject(request, DEMO.projectId),
+          (value) => findTask(value, taskId).lifecycle === 'accepted',
+          '单判据验收通过后任务 accepted',
+        );
+        versions.push(single.projection_version);
+        expect(findTask(single, taskId).available_actions).toEqual([]);
+        expect(single.acceptance_status.accepted).toBe(usingMock ? 2 : baselineAccepted + 1);
+        singleCriterion = true;
+        return;
       }
 
       const project = await waitForProjection(
         () => getProject(request, DEMO.projectId),
-        (value) => findTask(value, taskId).acceptance?.verdict === 'partially_accepted',
-        '逐判据验收落账 partially_accepted',
+        (value) => findTask(value, taskId).acceptance?.verdict === expectedVerdict,
+        `逐判据验收落账 ${expectedVerdict}`,
       );
       versions.push(project.projection_version);
       const task = findTask(project, taskId);
@@ -424,13 +455,14 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
     });
 
     await test.step('6. 补集后全部通过：任务 accepted（acceptance_status.accepted +1）', async () => {
+      if (singleCriterion) return;
       // partially_accepted 之后任务退回 active，但那次尝试的 Run 已经 succeeded
       // （REQ-HUM-2：Run 置 succeeded = 本次尝试结束）：真服务此刻没有在跑的 Run，
       // canSubmitFeedback 为假（available_actions 只剩 task_cancel），直接 feedback_submit 会 409；
       // 而矩阵 §3.1 里 active → ready / active → defined 都是「–」，也没有"再派发 Run"的命令。
-      // 所以唯一走得通的"再执行"是：取消这条任务 → 用同一份成功判据重新捕获一条 → 重新走链路。
-      // 这一步不是 UI 操作，mock 轮跳过（mock 的可用动作集里本就没有这条路径）。
-      if (!usingMock) {
+      // 所以唯一走得通的"再执行"是：取消这条任务 → 重新捕获一条 → 重新走 ready → active → 验收。
+      // mock 与真服务同口径（mock 的 active 无在跑 Run 时也只给 task_advance / task_cancel）。
+      {
         const canceledRetry = expectCreatedCommand(
           await postCommand(request, 'task_cancel', { task_id: taskId }, `retry-cancel-${randomUUID()}`),
         );
@@ -524,7 +556,7 @@ test.describe('D9 完整旅程（Web 车道 C）', () => {
       expect(task.acceptance?.verdict).toBe('accepted');
       expect(task.acceptance?.criterion_results.every((result) => result.verdict === 'passed')).toBe(true);
       expect(task.available_actions).toEqual([]);
-      // 真服务轮：再执行会新建 2 条任务（部分通过那条被取消、重新捕获那条验收通过），
+      // 再执行会新建 2 条任务（部分通过那条被取消、重新捕获那条验收通过），
       // acceptance_status.total 数的是项目里的任务行（含 canceled），accepted 比基线 +1。
       expect(project.acceptance_status.accepted).toBe(usingMock ? 2 : baselineAccepted + 1);
       if (!usingMock) expect(project.acceptance_status.total).toBe(baselineTotal + 2);
