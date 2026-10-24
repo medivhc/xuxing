@@ -27,7 +27,8 @@ let store: PgEventStore;
 beforeAll(async () => {
   ctx = await createTestPg();
   await migrate(ctx.pool);
-  store = createPgEventStore(ctx.pool, { clock: () => FIXED_NOW });
+  // 合入注记（Q12×Batch2）：本套件只测 actor 分离，不测 S3-② 建流规则（F13 由 event-store-pg 套件覆盖），故关 requireProjectCreated；生产默认恒 true 不变。
+  store = createPgEventStore(ctx.pool, { clock: () => FIXED_NOW, requireProjectCreated: false });
 });
 
 afterAll(async () => {
