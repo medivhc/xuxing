@@ -372,7 +372,7 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
   // ======================================================================
   // ② 生成计划：Planner 提议 PlanChange → REQ-PC-1 流水线 → 应用（+ 三类负例）
   // ======================================================================
-  await r.begin('②a 计划提议：结构错误类负例（schema/dag_cycle）', ['§2.7', 'REQ-PC-1①③', 'REQ-PC-3', 'INV-2']);
+  await r.begin('②a 计划提议：结构错误类负例（schema/illegal_edge）', ['§2.7', 'REQ-PC-1①③', 'REQ-PC-3', 'INV-2']);
 
   const badSchema: PlanChangeDraft = {
     change_id: 'pc-d8-bad-schema', client_proposal_id: 'prop-bad-1', proposer_id: PLANNER.id,
@@ -450,10 +450,30 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
   }
   await r.emit('PlanRevisionCreated', { rev: 1, change_id: mainPlan.change_id, applied_at: FIXED_NOW.toISOString(), diff_summary: '+2 Task, +3 Edge' }, KERNEL);
 
+  // 真成环负例（dag_cycle）：到这里两个 Task 与 import→report 的 depends_on 边都已
+  // 存在，再加 report→import 的反向边必成环。②a 的同形边因端点尚不存在只测得到
+  // illegal_edge，findCycle 的成环路径必须在这里才测得着（评审 m1）。
+  await r.sync();
+  const cyclePlan: PlanChangeDraft = {
+    change_id: 'pc-d8-cycle', client_proposal_id: 'prop-cycle-1', proposer_id: PLANNER.id,
+    base_plan_rev: 1, risk_level: 'L1', estimated_budget: 100, rationale: '把 report 设为 import 的上游，与既有 depends_on 边成环',
+    assumptions: [],
+    ops: [{ op: 'add_edge', edge_id: 'edge-cycle-back', from_task: D8.reportTask, to_task: D8.importTask, kind: 'depends_on' }],
+  };
+  const vCycle = validatePlanChange(projection, D8.project, cyclePlan, seenProposals);
+  r.note(`成环边负例 → stage=${vCycle.stage} code=${vCycle.reason_code}`);
+  if (vCycle.reason_code !== 'dag_cycle') {
+    throw new Error(`成环边理应 dag_cycle，实际 ${vCycle.reason_code}：${vCycle.detail}`);
+  }
+  await r.emit('PlanChangeProposed', planChangePayload(cyclePlan), PLANNER);
+  seenProposals.set(proposalKey(cyclePlan), cyclePlan.change_id);
+  await r.emit('PlanChangeRejected', { change_id: cyclePlan.change_id, reason_code: vCycle.reason_code, detail: vCycle.detail }, KERNEL);
+
   step = await r.end();
   assertTypes(step, [
     'PlanChangeProposed', 'PlanChangeApplied', 'TaskCaptured', 'TaskCaptured',
     'ContractUpdated', 'EdgeAdded', 'EdgeAdded', 'EdgeAdded', 'PlanRevisionCreated',
+    'PlanChangeProposed', 'PlanChangeRejected',
   ]);
 
   // ======================================================================

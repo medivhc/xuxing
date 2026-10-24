@@ -166,11 +166,20 @@ describe('②a 计划提议：结构错误类负例', () => {
 });
 
 describe('②b 主计划应用（rev 1）', () => {
-  it('事件流新增：提议→应用→2×TaskCaptured→ContractUpdated→3×EdgeAdded→PlanRevisionCreated', () => {
+  it('事件流新增：提议→应用→2×TaskCaptured→ContractUpdated→3×EdgeAdded→PlanRevisionCreated→成环负例提议→拒绝', () => {
     expect(step('②b').appendedTypes).toEqual([
       'PlanChangeProposed', 'PlanChangeApplied', 'TaskCaptured', 'TaskCaptured',
       'ContractUpdated', 'EdgeAdded', 'EdgeAdded', 'EdgeAdded', 'PlanRevisionCreated',
+      'PlanChangeProposed', 'PlanChangeRejected',
     ]);
+  });
+
+  it('dag_cycle 真成环负例：两 Task 与既有边都在时加反向 depends_on 边被拒（②a 的悬空边只测得到 illegal_edge）', () => {
+    const state = stateAt(3);
+    const cycle = state.changes.get('pc-d8-cycle');
+    expect(cycle?.status).toBe('rejected');
+    expect(cycle?.reason_code).toBe('dag_cycle');
+    expect(step('②b').notes.join(' | ')).toContain('code=dag_cycle');
   });
 
   it('REQ-PC-2 原子性：恰一个 PlanRevision，rev 单调到 1，ops 全落地', () => {
