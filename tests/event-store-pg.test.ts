@@ -1410,7 +1410,9 @@ describe('校验器嵌在写路径：非法迁移不产生事件（接线审计�
     expect(await countEvents(ctx.pool)).toBe(0);
   });
 
-  it('append 对 TaskLifecycleChanged 做格合法性纵深防御（绕过 appendStateTransition 也拦）', async () => {
+  it('append 对 TaskLifecycleChanged 做格合法性纵深防御 + R1 流状态对账（绕过 appendStateTransition 也拦）', async () => {
+    // R1：生命周期迁移必须有事件流事实（TaskCaptured 先行），否则就是凭空建状态。
+    await store.append(input());
     const before = await countEvents(ctx.pool);
 
     await expect(
@@ -1426,6 +1428,20 @@ describe('校验器嵌在写路径：非法迁移不产生事件（接线审计�
     ).rejects.toBeInstanceOf(TransitionDeniedError);
     expect(await countEvents(ctx.pool)).toBe(before);
 
+    // R1：格合法但 from 与流派生状态不符 → 同样拒绝（否则可写出互斥分支）。
+    await expect(
+      store.append(input({
+        type: 'TaskLifecycleChanged',
+        payload: {
+          task_id: TASK_ID,
+          from: 'ready',
+          to: 'active',
+          trigger_event_id: 'trigger-stale-from',
+        },
+      })),
+    ).rejects.toBeInstanceOf(TransitionStateError);
+    expect(await countEvents(ctx.pool)).toBe(before);
+
     const ok = await store.append(input({
       type: 'TaskLifecycleChanged',
       payload: {
@@ -1435,7 +1451,7 @@ describe('校验器嵌在写路径：非法迁移不产生事件（接线审计�
         trigger_event_id: 'trigger-ok',
       },
     }));
-    expect(ok.seq).toBe(1);
+    expect(ok.seq).toBe(2);
   });
 });
 

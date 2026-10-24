@@ -23,14 +23,27 @@
 //      覆盖调用方自述（F3/F4/F5）；
 //   ⑤ 迁入 accepted/canceled 时 INV-11 / REQ-RUN-6 收尾事件由内核在同一事务内自动落库，
 //      调用方无法忽略（F2/F4）；通用 append 路径禁止直写终态迁移，堵死绕过口。
-// - 跨事务批量（appendBatch）仍留给 batch 2（Q4）；withTransaction 提供显式同事务入口。
+// - 跨事务批量：appendBatch 在**同一事务**内按序写入同一 stream（Q4）；非法形状在开事务前
+//   拒绝，guard 拒绝则整批回滚；withTransaction 提供显式同事务入口。
+// - 增量消费：append 事务持全局追加锁（提交序 = global_seq 序），水位见 tailing.ts（Q5）。
 
 import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { ulid } from 'ulid';
 import type { EventEnvelope, EventType, ProjectId } from './events.js';
 import { EVENT_TYPES } from './events.js';
-import type { EventStore } from './event-store.js';
+import type {
+  AppendBatchEntryInput,
+  AppendBatchResult,
+  AppendEventInput,
+  EventStore,
+} from './event-store.js';
+
+export type {
+  AppendBatchEntryInput,
+  AppendBatchResult,
+  AppendEventInput,
+} from './event-store.js';
 import {
   RUN_STATES,
   TASK_STATES,
@@ -476,7 +489,7 @@ function idempotencyContentMismatch(
     causation_id: string | null;
     correlation_id: string;
   },
-  input: Parameters<EventStore['append']>[0],
+  input: AppendEventInput,
   payload_canonical: string,
 ): boolean {
   return (
@@ -500,7 +513,7 @@ export interface PgEventStoreOptions {
   idFactory?: () => string;
 }
 
-export type AppendStateTransitionInput = Parameters<EventStore['append']>[0] & {
+export type AppendStateTransitionInput = AppendEventInput & {
   entity?: 'task' | 'run';
   from: string;
   to: string;
@@ -508,6 +521,22 @@ export type AppendStateTransitionInput = Parameters<EventStore['append']>[0] & {
   /** F7：TaskLifecycleChanged 的触发事件 id；缺省时回落到信封 causation_id。 */
   trigger_event_id?: string;
 };
+
+/** appendBatch 的单条结果：迁移条目带 guard 与收尾证据；普通事件只在 events 里。 */
+export interface AppendBatchTransitionResult extends AppendStateTransitionResult {}
+
+export interface PgAppendBatchResult extends AppendBatchResult {
+  /** 按条目顺序记录的迁移结果（普通事件条目不占位）。 */
+  transitions: AppendBatchTransitionResult[];
+}
+
+/** appendBatch 的使用错误（空批次 / 跨 stream / from-to 只给一半）——编程错误，不静默。 */
+export class AppendBatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AppendBatchError';
+  }
+}
 
 /** F2/F4 收尾动作的落库证据（与 lifecycle 迁移同事务）。 */
 export interface TransitionClosure {
@@ -1086,6 +1115,7 @@ export interface TaskCancellationResult {
 
 /** 事务内的 store 视图：append / appendStateTransition 共享调用方开启的同一 client 与事务。 */
 export interface PgEventStoreTx extends EventStore {
+  appendBatch(entries: AppendBatchEntryInput[]): Promise<PgAppendBatchResult>;
   /**
    * 校验器嵌在写路径：先按事件流派生期望 from（F1），再 guardTransition，
    * 拒绝则抛 TransitionDeniedError / TransitionStateError 且不写任何行。
@@ -1117,7 +1147,7 @@ const INSERT_EVENT_SQL = `
   RETURNING global_seq, recorded_at`;
 
 interface PreparedAppend {
-  input: Parameters<EventStore['append']>[0];
+  input: AppendEventInput;
   payload_canonical: string;
 }
 
@@ -1132,7 +1162,7 @@ interface PrepareAppendOptions {
  * 形状（F7）与格级纵深防御、payload 可规范化。
  */
 function prepareAppend(
-  input: Parameters<EventStore['append']>[0],
+  input: AppendEventInput,
   options: PrepareAppendOptions = {},
 ): PreparedAppend {
   if (!(EVENT_TYPES as readonly string[]).includes(input.type)) {
@@ -1305,6 +1335,35 @@ async function appendWithin(
     if (!waitGuard.allowed) throw new TransitionDeniedError(waitGuard);
   }
 
+  // R1：原始 append 也不得绕行流派生状态写生命周期迁移——
+  // 形状已在 prepareAppend 校验（from/to/trigger 必填 + 格合法），这里补「from 必须等于
+  // 事件流当前状态」与「主体必须已存在」，否则同一条流可以写出两条互斥的生命周期分支。
+  if (input.type === 'TaskLifecycleChanged') {
+    const payload = input.payload as Record<string, unknown>;
+    const task_id = requirePayloadId(input.type, payload, 'task_id');
+    const facts = await deriveStreamFacts(client, input.stream_id);
+    const lifecycle = deriveTaskLifecycle(facts, task_id);
+    if (lifecycle === null) {
+      throw new TransitionStateError({
+        reason: 'subject_not_found',
+        entity: 'task',
+        subject_id: task_id,
+        provided_from: payload.from as string,
+        detail: 'stream 内没有 TaskCaptured / TaskLifecycleChanged（R1：原始 append 不得凭空建生命周期）',
+      });
+    }
+    if (payload.from !== lifecycle) {
+      throw new TransitionStateError({
+        reason: 'from_mismatch',
+        entity: 'task',
+        subject_id: task_id,
+        expected_from: lifecycle,
+        provided_from: payload.from as string,
+        detail: '原始 append 的 payload.from 与流派生 lifecycle 不一致（R1）',
+      });
+    }
+  }
+
   const seq = last_seq + 1;
   const hash = computeEventHash(last_hash, payload_canonical, seq);
   const id = idFactory();
@@ -1356,6 +1415,59 @@ async function appendWithin(
   };
 }
 
+// ---------------------------------------------------------------------------
+// 批量追加（Q4）：同 stream、同事务、哈希链内连续
+// ---------------------------------------------------------------------------
+
+function isTransitionEntry(entry: AppendBatchEntryInput): boolean {
+  return typeof entry.from === 'string' && typeof entry.to === 'string';
+}
+
+/**
+ * 批次形状预校验：在所有 DB 动作之前跑一遍，非法批次连事务都不开
+ * （「非法迁移先拒、不进事务」）。guard 的前置条件仍由事务内的
+ * appendStateTransitionOn 按流派生 fact 判定。
+ */
+function prevalidateBatchEntry(entry: AppendBatchEntryInput): void {
+  if (entry.from === undefined && entry.to === undefined) {
+    prepareAppend(entry);
+    return;
+  }
+  if (typeof entry.from !== 'string' || typeof entry.to !== 'string') {
+    throw new AppendBatchError(
+      `appendBatch 条目 from/to 必须成对提供：stream=${entry.stream_id} type=${entry.type}`,
+    );
+  }
+  const entity = entry.entity ?? 'task';
+  assertTransitionEventType(entity, entry.type);
+  const merged = mergeTransitionPayload(entry.payload, entry.from, entry.to);
+  assertProjectStreamId(entry.stream_id, merged);
+  // 与 appendStateTransitionOn 同口径：trigger_event_id 可由 causation_id 补齐
+  const withTrigger = withTransitionTrigger(
+    merged,
+    entry.type,
+    entry.causation_id,
+    entry.trigger_event_id,
+  );
+  // 批量入口本身就是「同事务收尾」的兑现方式，终态迁移在此合法。
+  prepareAppend({ ...entry, payload: withTrigger }, { allowTerminalLifecycle: true });
+}
+
+function batchStreamId(entries: AppendBatchEntryInput[]): ProjectId {
+  if (entries.length === 0) {
+    throw new AppendBatchError('appendBatch 至少需要一条事件（空批次不产生任何写入）');
+  }
+  const stream_id = entries[0].stream_id;
+  for (const entry of entries) {
+    if (entry.stream_id !== stream_id) {
+      throw new AppendBatchError(
+        `appendBatch 只允许同一 stream（同事务同链）：${stream_id} ≠ ${entry.stream_id}`,
+      );
+    }
+  }
+  return stream_id;
+}
+
 export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}): PgEventStore {
   const clock = options.clock ?? (() => new Date());
   const idFactory = options.idFactory ?? (() => ulid());
@@ -1370,14 +1482,14 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     /** 在指定连接上写一条事件（调用方负责事务边界）。 */
     async function appendOn(
       conn: PoolClient,
-      input: Parameters<EventStore['append']>[0],
+      input: AppendEventInput,
       prepareOptions: PrepareAppendOptions = {},
     ): Promise<EventEnvelope> {
       return appendWithin(conn, prepareAppend(input, prepareOptions), idFactory, clock);
     }
 
     async function append(
-      input: Parameters<EventStore['append']>[0],
+      input: AppendEventInput,
     ): Promise<EventEnvelope> {
       // 事务内：直接复用调用方连接，失败由 withTransaction 整体回滚
       if (client) return appendOn(client, input);
@@ -1421,6 +1533,54 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
       } finally {
         conn.release();
       }
+    }
+
+    /** 事务内执行一批：迁移条目走 appendStateTransitionOn（同一 guard 语义），其余走 appendOn。 */
+    async function appendBatchOn(
+      conn: PoolClient,
+      entries: AppendBatchEntryInput[],
+    ): Promise<PgAppendBatchResult> {
+      const stream_id = batchStreamId(entries);
+
+      const head = await conn.query<{ last_seq: string }>(
+        `SELECT last_seq FROM event_streams WHERE stream_id = $1`,
+        [stream_id],
+      );
+      const before_seq = head.rows.length === 0
+        ? 0
+        : toSafeNumber(head.rows[0].last_seq, 'event_streams.last_seq');
+
+      const transitions: AppendBatchTransitionResult[] = [];
+      for (const entry of entries) {
+        if (isTransitionEntry(entry)) {
+          transitions.push(
+            await appendStateTransitionOn(conn, {
+              ...(entry as AppendStateTransitionInput),
+              from: entry.from as string,
+              to: entry.to as string,
+            }),
+          );
+        } else {
+          await appendOn(conn, entry);
+        }
+      }
+
+      // 用同一连接读回本批真实写入（含内核自动收尾），uncommitted 行对本事务可见。
+      const { rows } = await conn.query<EventRow>(
+        `SELECT * FROM events
+         WHERE stream_id = $1 AND seq > $2
+         ORDER BY seq ASC`,
+        [stream_id, before_seq],
+      );
+      return { events: rows.map(rowToEnvelope), transitions };
+    }
+
+    async function appendBatch(entries: AppendBatchEntryInput[]): Promise<PgAppendBatchResult> {
+      // 形状预校验放在开事务之前：非法批次零 DB 动作。
+      batchStreamId(entries);
+      for (const entry of entries) prevalidateBatchEntry(entry);
+
+      return withStoreTransaction((conn) => appendBatchOn(conn, entries));
     }
 
     async function readStream(stream_id: ProjectId, from_seq = 1): Promise<EventEnvelope[]> {
@@ -1645,7 +1805,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
     // -----------------------------------------------------------------------
 
     type EmitBase = Pick<
-      Parameters<EventStore['append']>[0],
+      AppendEventInput,
       'stream_id' | 'actor_id' | 'actor_kind' | 'causation_id' | 'correlation_id'
     >;
 
@@ -2187,6 +2347,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
 
     return {
       append,
+      appendBatch,
       readStream,
       replay,
       appendStateTransition,
