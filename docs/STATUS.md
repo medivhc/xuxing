@@ -1,10 +1,10 @@
-based_on: 5bec6544e5cd34bc6b1e9ce658bbf52ee10f7a0b
+based_on: 9efe5308ef6384449f848892e2b922a540922986
 
 # 续行状态（STATUS）
 
 | 项 | 状态 |
 |---|---|
-| 基线 | develop/eventstore-batch1 @ fd0e347 |
+| 基线 | develop/eventstore-batch1 @ 80a09c1 |
 | Batch1 复审 fix 波次 | 两轮进行中 |
 | D9 交互契约 | 已评审，按 D10 裁决修订中 |
 | D9 旅程测试 | 开发中 |
