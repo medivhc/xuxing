@@ -64,7 +64,7 @@ __xuxMock.snapshot();                    // { seq: 15, events: 14, ... }
 | actor | 角色 |
 | --- | --- |
 | `human-user` | 当前人类用户：执行 human_light Run（start/complete）、接受提议 |
-| `human-reviewer` | 验收者：提交判据 verdict（`record_criterion_verdict`） |
+| `human-reviewer` | 验收者：提交判据 verdict（`acceptance_record`） |
 | `agent-exec-1` | agent 执行者：seed-2 的 Run 由它执行 |
 
 mock 对「验收 actor == 执行 actor」返回 409 `forbidden`；seed-2 的 `executed_by` 为
@@ -85,7 +85,13 @@ mock 对「验收 actor == 执行 actor」返回 409 `forbidden`；seed-2 的 `e
    mock 折中：逐条提交累积判论 → 覆盖完整时才落最终 `AcceptanceRecorded`（verdict
    一致性 + 迁移矩阵在 `mock/commands.ts` 实现）。
 2. **提议拒绝**：封闭事件目录无「提议被拒」事件类型，mock 不广播，界面拒绝后离开提议页。
-3. 命令 `type` 字符串为 web 车道草案，待服务端车道对齐（契约 §5 以服务端为准）。
+3. 命令 `type` 已对齐服务端 canonical 词表（FIX-ROUND-1 R-1，6 词：
+   `proposal_accept`/`proposal_reject`/`task_advance`/`feedback_submit`/`acceptance_record`/`task_cancel`）；
+   K0 界面入口 5 词（`feedback_submit` 无界面入口，捕获走 `/api/capture`）。
+   原 web 车道 7 动词映射：`accept_proposal→proposal_accept`、`reject_proposal→proposal_reject`、
+   `start_task`/`complete_task→task_advance`、`record_criterion_verdict→acceptance_record`、
+   `cancel_task→task_cancel`；原 `resolve_decision` 无服务端对应、已下线（契约缺口见
+   `web/README.md`「已知边界」）。`task_advance` 的开始/完成分派口径为 mock 模拟，待服务端车道确认。
 4. `[web 层补充]` 投影字段（`acceptance_criteria`/`criterion_results`/`acceptance`）：
    服务端未提供时页面须降级渲染（见任务书交卷要求）。
 
@@ -96,7 +102,7 @@ mock 对「验收 actor == 执行 actor」返回 409 `forbidden`；seed-2 的 `e
 | `types.ts` | mock 内部类型 + actor 常量 |
 | `seed.ts` | 种子项目/任务/提议/决策/事件 |
 | `store.ts` | 内存事件日志、幂等回执、投影构建、控制面状态 |
-| `commands.ts` | 7 类命令 + capture 处理（409 原因码、覆盖完整性、继承锁定、迁移矩阵） |
+| `commands.ts` | 命令处理（canonical 词表 5 个界面入口；`task_advance` 按生命周期分派开始/完成）+ capture 处理（409 原因码、覆盖完整性、继承锁定、迁移矩阵） |
 | `sse-stream.ts` | SSE 帧格式化、游标补发、心跳、abort 清理 |
 | `handlers.ts` | 8 端点路由、错误信封、模拟时延 |
 | `errors.ts` | `MockHttpError`（409/404/400 静态构造） |

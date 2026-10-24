@@ -257,7 +257,9 @@ export class MockStore {
         project_id: decision.project_id,
         decision_id: decision.decision_id,
         rank: (rank += 1),
-        available_actions: ['resolve_decision'],
+        // resolve_decision 无服务端对应、动作入口已下线（FIX-ROUND-1 R-1）：
+        // 决策仍作为 attention 呈现，但不再广告任何可执行动作。
+        available_actions: [],
         created_at: decision.created_at,
       });
     }
@@ -311,7 +313,9 @@ export class MockStore {
           expires_at: decision.expires_at,
         },
         rank: (rank += 1),
-        available_actions: expired ? [] : ['resolve_decision'],
+        // resolve_decision 已下线（FIX-ROUND-1 R-1：服务端命令词表无对应项），
+        // 无论是否过期都不再广告该动作；expired 仍以 blocked_reason 明示。
+        available_actions: [],
         blocked_reason: expired ? 'decision_expired' : null,
         updated_global_seq: decision.updated_global_seq,
       });
@@ -432,24 +436,26 @@ export class MockStore {
   }
 }
 
-/** 任务可用动作：只认内核 available_actions 语义（mock 按生命周期模拟）。 */
+/** 任务可用动作：只认内核 available_actions 语义（mock 按生命周期模拟）。
+ *  词表为服务端 canonical（FIX-ROUND-1 R-1）：task_advance 一词覆盖开始/完成，
+ *  界面按 task_lifecycle 分派渲染具体按钮。 */
 export function taskActions(task: MockTaskState): string[] {
   if (task.wait_state !== 'none') return [];
   switch (task.lifecycle) {
     case 'defined':
     case 'ready':
-      return ['start_task', 'cancel_task'];
+      return ['task_advance', 'task_cancel'];
     case 'active':
-      return ['complete_task', 'cancel_task'];
+      return ['task_advance', 'task_cancel'];
     case 'awaiting_acceptance':
-      return ['record_criterion_verdict'];
+      return ['acceptance_record'];
     default:
       return [];
   }
 }
 
 export function proposalActions(proposal: MockProposalState): string[] {
-  return proposal.status === 'pending' ? ['accept_proposal', 'reject_proposal'] : [];
+  return proposal.status === 'pending' ? ['proposal_accept', 'proposal_reject'] : [];
 }
 
 /** 供 commands.ts 复用：累积判论后的验收结论（覆盖完整时）。 */

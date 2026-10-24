@@ -29,7 +29,7 @@ export function ProposalPage() {
   });
 
   const accept = useCommand({
-    type: 'accept_proposal',
+    type: 'proposal_accept',
     onAccepted: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.actions });
       if (data) navigate(`/projects/${data.project_id}`);
@@ -38,7 +38,7 @@ export function ProposalPage() {
   });
 
   const reject = useCommand({
-    type: 'reject_proposal',
+    type: 'proposal_reject',
     onAccepted: () => {
       navigate('/capture');
     },
@@ -133,7 +133,7 @@ export function ProposalPage() {
 
       {isPending ? (
         <section className="flex flex-wrap items-center gap-3">
-          {data.available_actions.includes('accept_proposal') ? (
+          {data.available_actions.includes('proposal_accept') ? (
             confirmAccept ? (
               <div className="flex flex-wrap items-center gap-2 rounded-m border border-border bg-subtle p-3">
                 <span className="text-body-s text-text-secondary">
@@ -143,7 +143,7 @@ export function ProposalPage() {
                   pending={accept.isPending}
                   onClick={() =>
                     accept.mutate({
-                      idemKey: `cmd:accept_proposal:${data.proposal_id}`,
+                      idemKey: `cmd:proposal_accept:${data.proposal_id}`,
                       payload: { proposal_id: data.proposal_id },
                     })
                   }
@@ -168,13 +168,13 @@ export function ProposalPage() {
               </PendingButton>
             )
           ) : null}
-          {data.available_actions.includes('reject_proposal') ? (
+          {data.available_actions.includes('proposal_reject') ? (
             <PendingButton
               variant="secondary"
               pending={reject.isPending}
               onClick={() =>
                 reject.mutate({
-                  idemKey: `cmd:reject_proposal:${data.proposal_id}`,
+                  idemKey: `cmd:proposal_reject:${data.proposal_id}`,
                   payload: { proposal_id: data.proposal_id },
                 })
               }

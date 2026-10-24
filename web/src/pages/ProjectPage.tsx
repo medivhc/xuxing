@@ -25,9 +25,10 @@ import { formatAbsolute } from '../lib/time';
 
 function TaskCard({ task }: { task: ProjectTaskRow }) {
   const [expanded, setExpanded] = useState(task.lifecycle === 'awaiting_acceptance');
-  const start = useCommand({ type: 'start_task' });
-  const complete = useCommand({ type: 'complete_task' });
-  const cancel = useCommand({ type: 'cancel_task' });
+  // task_advance 一词覆盖开始/完成：按 task.lifecycle 分派渲染（FIX-ROUND-1 R-1）
+  const advance = useCommand({ type: 'task_advance' });
+  const cancel = useCommand({ type: 'task_cancel' });
+  const canStart = task.lifecycle === 'defined' || task.lifecycle === 'ready';
 
   return (
     <li
@@ -71,12 +72,12 @@ function TaskCard({ task }: { task: ProjectTaskRow }) {
 
       {task.available_actions.length > 0 ? (
         <div className="mt-3 flex flex-wrap gap-2">
-          {task.available_actions.includes('start_task') ? (
+          {task.available_actions.includes('task_advance') && canStart ? (
             <PendingButton
-              pending={start.isPending}
+              pending={advance.isPending}
               onClick={() =>
-                start.mutate({
-                  idemKey: `cmd:start_task:${task.task_id}`,
+                advance.mutate({
+                  idemKey: `cmd:task_advance:start:${task.task_id}`,
                   payload: { task_id: task.task_id },
                 })
               }
@@ -85,12 +86,12 @@ function TaskCard({ task }: { task: ProjectTaskRow }) {
               开始执行
             </PendingButton>
           ) : null}
-          {task.available_actions.includes('complete_task') ? (
+          {task.available_actions.includes('task_advance') && task.lifecycle === 'active' ? (
             <PendingButton
-              pending={complete.isPending}
+              pending={advance.isPending}
               onClick={() =>
-                complete.mutate({
-                  idemKey: `cmd:complete_task:${task.task_id}`,
+                advance.mutate({
+                  idemKey: `cmd:task_advance:complete:${task.task_id}`,
                   payload: { task_id: task.task_id },
                 })
               }
@@ -99,13 +100,13 @@ function TaskCard({ task }: { task: ProjectTaskRow }) {
               标记完成
             </PendingButton>
           ) : null}
-          {task.available_actions.includes('cancel_task') ? (
+          {task.available_actions.includes('task_cancel') ? (
             <PendingButton
               variant="secondary"
               pending={cancel.isPending}
               onClick={() =>
                 cancel.mutate({
-                  idemKey: `cmd:cancel_task:${task.task_id}`,
+                  idemKey: `cmd:task_cancel:${task.task_id}`,
                   payload: { task_id: task.task_id },
                 })
               }
@@ -126,8 +127,7 @@ function TaskCard({ task }: { task: ProjectTaskRow }) {
         </div>
       ) : null}
 
-      <ErrorBanner error={start.error} />
-      <ErrorBanner error={complete.error} />
+      <ErrorBanner error={advance.error} />
       <ErrorBanner error={cancel.error} />
 
       {expanded && task.lifecycle === 'awaiting_acceptance' ? (
