@@ -79,6 +79,7 @@ export interface DispatchEnvelope {
 
 export class NodeDispatcher {
   private timer: NodeJS.Timeout | null = null;
+  private ticking = false;
 
   constructor(
     private readonly events: PgEventStore,
@@ -166,11 +167,19 @@ export class NodeDispatcher {
   // ---------- 周期维护 ----------
 
   async tick(): Promise<void> {
-    await this.projections.refresh();
-    await this.syncFromProjection();
-    await this.expireDispatchesAndLeases();
-    await this.convergeOfflineNodes();
-    await this.computeStateReasons();
+    // m-07：重入守卫——上一轮未完时跳过本轮，避免并发 tick 对同一 Run
+    // 重复做租约过期处置（内核状态机是最后防线，不当常规路径用）。
+    if (this.ticking) return;
+    this.ticking = true;
+    try {
+      await this.projections.refresh();
+      await this.syncFromProjection();
+      await this.expireDispatchesAndLeases();
+      await this.convergeOfflineNodes();
+      await this.computeStateReasons();
+    } finally {
+      this.ticking = false;
+    }
   }
 
   private async expireDispatchesAndLeases(): Promise<void> {
@@ -215,8 +224,11 @@ export class NodeDispatcher {
           });
           await this.store.updateDispatch(row.run_id, { state: 'indeterminate' });
         } else {
-          await this.appendToRun(row, {
+          await this.transitionRun(row, {
             type: 'RunFailed',
+            from: 'running',
+            to: 'failed',
+            facts: { leaseExpired: true },
             payload: { run_id: row.run_id, reason: 'lease_expired' },
           });
           await this.store.updateDispatch(row.run_id, { state: 'done', state_reason: null });
@@ -236,6 +248,7 @@ export class NodeDispatcher {
         payload: {
           node_id: node.node_id,
           reason: 'heartbeat_timeout',
+          at: new Date(nowMs).toISOString(),
           last_heartbeat_at: node.last_heartbeat_at,
         },
       });
@@ -404,9 +417,11 @@ export class NodeDispatcher {
     const node = await this.requireNode(nodeId);
     void node;
     const rows = (await this.store.listDispatch()).filter((r) => r.node_id === nodeId && r.state !== 'done');
-    const busy = rows.filter((r) => r.state === 'running');
+    // busy 含 indeterminate：其 probe 只能由归属节点回报，注销后将永无
+    // 回报方（只能等人工裁决），与 running 同等阻注销（m-04）。
+    const busy = rows.filter((r) => r.state === 'running' || r.state === 'indeterminate');
     if (busy.length > 0) {
-      throw new NodeApiError(409, 'node_busy', '节点仍有 started 未终态 Run，先等待/处置后再注销', {
+      throw new NodeApiError(409, 'node_busy', '节点仍有 started 未终态 Run（含待对账），先等待/处置后再注销', {
         reason: 'node_busy',
         runs: busy.map((r) => r.run_id),
       });
@@ -431,7 +446,7 @@ export class NodeDispatcher {
     await this.store.updateNodeRegistration(nodeId, { deregistered_at: new Date().toISOString() });
     await this.appendSystem({
       type: 'NodeOffline',
-      payload: { node_id: nodeId, reason: 'deregister', last_heartbeat_at: node.last_heartbeat_at },
+      payload: { node_id: nodeId, reason: 'deregister', at: new Date().toISOString(), last_heartbeat_at: node.last_heartbeat_at },
     });
     await this.computeStateReasons();
     return { deregistered: true };
@@ -489,11 +504,11 @@ export class NodeDispatcher {
         if (row.node_id !== null) continue;
         if (!node.executor_kinds.includes(run.executor_kind ?? '')) continue;
         if (rank(run.side_effect_level) > rank(node.max_side_effect_level)) continue;
-        // 占用（claim）：写 dispatching 标记，ack 前不算租约。
-        await this.store.updateDispatch(row.run_id, {
-          node_id: node.node_id,
-          dispatching_at: new Date().toISOString(),
-        });
+        // 占用（claim）：原子条件更新（M-01）——并发 poll 下只有一方能
+        // 领得（rowCount=1），输家继续找下一条，不再覆写他人占用。
+        // ack 前不算租约，30s 未 ack 由 expireDispatchesAndLeases 释放。
+        const claimed = await this.store.claimDispatch(row.run_id, node.node_id, new Date().toISOString());
+        if (!claimed) continue;
         dispatch = await this.buildEnvelope(row);
         break;
       }
@@ -676,12 +691,14 @@ export class NodeDispatcher {
     if (typeof input.summary !== 'string') {
       throw new NodeApiError(400, 'schema_invalid', 'summary 必填', { field: 'summary' });
     }
-    const stored = await this.store.storedResult(runId, 'raw_result', input.client_result_id);
-    if (stored) return stored;
+    // m-06：归属校验前置于幂等回放——非归属节点不得凭 (run_id, client_key)
+    // 取回他人结果体（回放只对归属节点开放）。
     const row = await this.requireRow(runId);
     if (row.node_id !== nodeId) {
       throw new NodeApiError(409, 'precondition_unmet', 'Run 不归本节点回报', { reason: 'precondition_unmet', run_id: runId });
     }
+    const stored = await this.store.storedResult(runId, 'raw_result', input.client_result_id);
+    if (stored) return stored;
     const state = this.runStateOf(runId);
     if (state !== null && TERMINAL_RUN_STATES.has(state)) {
       throw new NodeApiError(409, 'terminal_state', `Run 已终态（${state}）`, { reason: 'terminal_state', run_id: runId, status: state });
@@ -791,12 +808,13 @@ export class NodeDispatcher {
     if (typeof input.client_note_id !== 'string' || input.client_note_id === '') {
       throw new NodeApiError(400, 'schema_invalid', 'client_note_id 必填', { field: 'client_note_id' });
     }
-    const stored = await this.store.storedResult(runId, 'side_effect', input.client_note_id);
-    if (stored) return stored;
+    // m-06：归属校验前置于幂等回放（同 rawResult 口径）。
     const row = await this.requireRow(runId);
     if (row.node_id !== nodeId) {
       throw new NodeApiError(409, 'precondition_unmet', 'Run 不归本节点', { reason: 'precondition_unmet', run_id: runId });
     }
+    const stored = await this.store.storedResult(runId, 'side_effect', input.client_note_id);
+    if (stored) return stored;
     await this.appendToRun(row, {
       type: 'RunSideEffectRecorded',
       payload: {
@@ -825,18 +843,35 @@ export class NodeDispatcher {
     if (input.result !== 'executed' && input.result !== 'not_executed' && input.result !== 'unknown') {
       throw new NodeApiError(400, 'schema_invalid', 'result 必须是 executed / not_executed / unknown', { field: 'result' });
     }
+    // m-06：归属校验前置于幂等回放（同 rawResult 口径）。
+    const row = await this.requireRow(runId);
+    if (row.node_id !== nodeId) {
+      throw new NodeApiError(409, 'precondition_unmet', 'Run 不归本节点对账', { reason: 'precondition_unmet', run_id: runId });
+    }
     const stored = await this.store.storedResult(runId, 'probe', input.idempotency_key);
     if (stored) return stored;
-    const row = await this.requireRow(runId);
     const state = this.runStateOf(runId);
     if (state !== null && TERMINAL_RUN_STATES.has(state)) {
       throw new NodeApiError(409, 'terminal_state', `Run 已终态（${state}）`, { reason: 'terminal_state', run_id: runId, status: state });
     }
-    if (row.node_id !== nodeId || row.state !== 'indeterminate' || state !== 'indeterminate' || row.probe_disposed) {
+    if (row.state !== 'indeterminate' || state !== 'indeterminate' || row.probe_disposed) {
       throw new NodeApiError(409, 'precondition_unmet', 'Run 不处于待本节点对账状态', { reason: 'precondition_unmet', run_id: runId });
     }
     let result: Record<string, unknown>;
     if (input.result === 'executed') {
+      // m-02：与裁决路径同形状——先补录 RawResult 再走 Outcome 流，审计链完整。
+      await this.appendToRun(row, {
+        type: 'RunRawResultReceived',
+        payload: {
+          run_id: runId,
+          node_id: nodeId,
+          client_result_id: input.idempotency_key,
+          raw_result_ref: input.raw_result_ref ?? null,
+          summary: input.summary ?? '节点对账确认：副作用已执行',
+          outcome_hint: 'succeeded',
+          via: 'probe_reconciliation',
+        },
+      });
       const outcomeId = await this.recordOutcome(row, input.summary ?? '节点对账确认：副作用已执行', `pc_probe_${runId}`);
       await this.transitionRun(row, {
         type: 'RunSucceeded',
@@ -853,7 +888,7 @@ export class NodeDispatcher {
         from: 'indeterminate',
         to: 'failed',
         facts: { reconciliation: 'not_executed' },
-        payload: { run_id: runId, reason: 'probe_not_executed' },
+        payload: { run_id: runId, reason: 'reconciled_not_executed' },
       });
       result = { result: 'not_executed', run_state: 'failed' };
     } else {

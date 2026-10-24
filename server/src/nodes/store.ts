@@ -162,6 +162,18 @@ export class NodeStore {
     await this.pool.query(`UPDATE run_dispatch SET ${sets.join(', ')} WHERE run_id=$${values.length}`, values);
   }
 
+  /** M-01 原子占用：单条条件 UPDATE——仅当行仍是未占用 queued 时才写占用，
+   * 以 rowCount 判定领得与否。并发 poll 下只有一个调用方能拿到 true，
+   * 占用排他由数据库保证，不再是 check-then-act。 */
+  async claimDispatch(runId: string, nodeId: string, dispatchingAt: string): Promise<boolean> {
+    const r = await this.pool.query(
+      `UPDATE run_dispatch SET node_id=$1, dispatching_at=$2
+       WHERE run_id=$3 AND state='queued' AND node_id IS NULL`,
+      [nodeId, dispatchingAt, runId],
+    );
+    return (r.rowCount ?? 0) === 1;
+  }
+
   async storedResult(runId: string, kind: string, clientKey: string): Promise<Record<string, unknown> | null> {
     const r = await this.pool.query<{ result: Record<string, unknown> }>(
       'SELECT result FROM dispatch_results WHERE run_id=$1 AND kind=$2 AND client_key=$3',
