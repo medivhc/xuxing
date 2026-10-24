@@ -2,7 +2,7 @@
 //
 // 语义：
 // - 「一次用户意图」对应一个幂等键（idemKey，由调用方按语义构造，如
-//   `capture` 或 `cmd:start_task:${taskId}`）；
+//   `capture` 或 `cmd:task_advance:start:${taskId}`）；
 // - 首次提交生成 ULID 并落 localStorage；网络失败/5xx（结果未知）时保留，
 //   下次提交复用同一值——服务端按 client_submit_id 去重，避免重复入账；
 // - 确定性失败（409 冲突、400 参数错误）后清除，允许用户修正 payload 后

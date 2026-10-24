@@ -11,8 +11,6 @@
 
 import type { MockDecisionState, MockProjectState, MockProposalState, MockTaskState, SeedEvent } from './types';
 
-const NOW = '2026-10-20T09:00:00.000Z';
-
 export const SEED_PROJECT_ID = 'proj-d8';
 
 export function seedProject(): MockProjectState {
@@ -25,8 +23,7 @@ export function seedProject(): MockProjectState {
       stop_conditions: '连续两次旅程验收失败即暂停收敛',
       status: 'active',
     },
-    plan_rev: 1,
-    plan_history: [{ rev: 1, applied_at: NOW, diff_summary: '初始计划' }],
+    // FIX-ROUND-1 R-8：plan_rev/plan_history 已从投影键集移除
   };
 }
 

@@ -14,6 +14,7 @@ import type {
   HomeProjection,
   LagState,
   MyActionsProjection,
+  ProjectAcceptanceStatus,
   ProjectProjection,
   ProjectTaskRow,
   ProposalProjection,
@@ -257,7 +258,9 @@ export class MockStore {
         project_id: decision.project_id,
         decision_id: decision.decision_id,
         rank: (rank += 1),
-        available_actions: ['resolve_decision'],
+        // resolve_decision 无服务端对应、动作入口已下线（FIX-ROUND-1 R-1）：
+        // 决策仍作为 attention 呈现，但不再广告任何可执行动作。
+        available_actions: [],
         created_at: decision.created_at,
       });
     }
@@ -311,7 +314,9 @@ export class MockStore {
           expires_at: decision.expires_at,
         },
         rank: (rank += 1),
-        available_actions: expired ? [] : ['resolve_decision'],
+        // resolve_decision 已下线（FIX-ROUND-1 R-1：服务端命令词表无对应项），
+        // 无论是否过期都不再广告该动作；expired 仍以 blocked_reason 明示。
+        available_actions: [],
         blocked_reason: expired ? 'decision_expired' : null,
         updated_global_seq: decision.updated_global_seq,
       });
@@ -339,18 +344,18 @@ export class MockStore {
 
   projectProjection(projectId: string): ProjectProjection | null {
     if (projectId !== this.project.project_id) return null;
+    const tasks = [...this.tasks.values()]
+      .sort((a, b) => a.updated_global_seq - b.updated_global_seq)
+      .map((task) => this.toTaskRow(task));
     return {
       projection_id: 'project',
       ...this.projectionMeta(),
-      project_id: this.project.project_id,
-      name: this.project.name,
+      // R-8 键集：{project, goal, tasks, acceptance_status, graph, pending_proposals}
+      project: { project_id: this.project.project_id, name: this.project.name },
       goal: this.project.goal,
-      plan_rev: this.project.plan_rev,
-      plan_history: this.project.plan_history,
-      tasks: [...this.tasks.values()]
-        .sort((a, b) => a.updated_global_seq - b.updated_global_seq)
-        .map((task) => this.toTaskRow(task)),
-      focused_subgraph: {
+      tasks,
+      acceptance_status: this.acceptanceStatus(tasks),
+      graph: {
         root_task_id: 'task-seed-1',
         nodes: [
           { task_id: 'task-seed-1', title: '整理发布检查清单', lifecycle: 'active' },
@@ -365,6 +370,37 @@ export class MockStore {
           },
         ],
       },
+      // 只列 pending 提议；task_id 在接受后由服务端新发（R-11），此处不携带
+      pending_proposals: [...this.proposals.values()]
+        .filter((p) => p.project_id === this.project.project_id && p.status === 'pending')
+        .map((p) => ({
+          proposal_id: p.proposal_id,
+          capture_id: p.capture_id,
+          summary: p.summary,
+          created_at: p.created_at,
+          available_actions: proposalActions(p),
+        })),
+    };
+  }
+
+  /** 项目级验收摘要（R-8）：口径为 mock 模拟内核计算，前端只呈现。 */
+  private acceptanceStatus(tasks: ProjectTaskRow[]): ProjectAcceptanceStatus {
+    return {
+      awaiting_task_ids: tasks
+        .filter((t) => t.lifecycle === 'awaiting_acceptance')
+        .map((t) => t.task_id),
+      recorded_count: tasks.filter((t) => t.acceptance_summary.verdict !== null).length,
+      outstanding: tasks
+        .filter(
+          (t) =>
+            t.acceptance_summary.verdict === 'partially_accepted' &&
+            t.acceptance_summary.pending_criteria.length > 0,
+        )
+        .map((t) => ({
+          task_id: t.task_id,
+          title: t.title,
+          pending_criteria: t.acceptance_summary.pending_criteria,
+        })),
     };
   }
 
@@ -432,24 +468,26 @@ export class MockStore {
   }
 }
 
-/** 任务可用动作：只认内核 available_actions 语义（mock 按生命周期模拟）。 */
+/** 任务可用动作：只认内核 available_actions 语义（mock 按生命周期模拟）。
+ *  词表为服务端 canonical（FIX-ROUND-1 R-1）：task_advance 一词覆盖开始/完成，
+ *  界面按 task_lifecycle 分派渲染具体按钮。 */
 export function taskActions(task: MockTaskState): string[] {
   if (task.wait_state !== 'none') return [];
   switch (task.lifecycle) {
     case 'defined':
     case 'ready':
-      return ['start_task', 'cancel_task'];
+      return ['task_advance', 'task_cancel'];
     case 'active':
-      return ['complete_task', 'cancel_task'];
+      return ['task_advance', 'task_cancel'];
     case 'awaiting_acceptance':
-      return ['record_criterion_verdict'];
+      return ['acceptance_record'];
     default:
       return [];
   }
 }
 
 export function proposalActions(proposal: MockProposalState): string[] {
-  return proposal.status === 'pending' ? ['accept_proposal', 'reject_proposal'] : [];
+  return proposal.status === 'pending' ? ['proposal_accept', 'proposal_reject'] : [];
 }
 
 /** 供 commands.ts 复用：累积判论后的验收结论（覆盖完整时）。 */

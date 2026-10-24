@@ -4,7 +4,10 @@
 // - 可用动作由投影 available_actions 驱动；409 原样呈现；
 // - 接受 → 跳项目页（新任务在 My Actions/Project 可见）；
 // - 拒绝 → 离开提议页（封闭事件目录无「提议拒绝」事件，mock 不广播，
-//   交卷登记项；界面回到 Capture）。
+//   交卷登记项；界面回到 Capture）；
+// - R-11：本页不展示、不预分配任何 task_id——提议只携带 draft（标题 +
+//   验收判据），task_id 在提议被接受后由服务端新发（本页与 mock 均无
+//   task_id 字段；登记见 web/README.md「已知边界」第 5 条）。
 
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
@@ -29,7 +32,7 @@ export function ProposalPage() {
   });
 
   const accept = useCommand({
-    type: 'accept_proposal',
+    type: 'proposal_accept',
     onAccepted: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.actions });
       if (data) navigate(`/projects/${data.project_id}`);
@@ -38,7 +41,7 @@ export function ProposalPage() {
   });
 
   const reject = useCommand({
-    type: 'reject_proposal',
+    type: 'proposal_reject',
     onAccepted: () => {
       navigate('/capture');
     },
@@ -133,7 +136,7 @@ export function ProposalPage() {
 
       {isPending ? (
         <section className="flex flex-wrap items-center gap-3">
-          {data.available_actions.includes('accept_proposal') ? (
+          {data.available_actions.includes('proposal_accept') ? (
             confirmAccept ? (
               <div className="flex flex-wrap items-center gap-2 rounded-m border border-border bg-subtle p-3">
                 <span className="text-body-s text-text-secondary">
@@ -143,7 +146,7 @@ export function ProposalPage() {
                   pending={accept.isPending}
                   onClick={() =>
                     accept.mutate({
-                      idemKey: `cmd:accept_proposal:${data.proposal_id}`,
+                      idemKey: `cmd:proposal_accept:${data.proposal_id}`,
                       payload: { proposal_id: data.proposal_id },
                     })
                   }
@@ -168,13 +171,13 @@ export function ProposalPage() {
               </PendingButton>
             )
           ) : null}
-          {data.available_actions.includes('reject_proposal') ? (
+          {data.available_actions.includes('proposal_reject') ? (
             <PendingButton
               variant="secondary"
               pending={reject.isPending}
               onClick={() =>
                 reject.mutate({
-                  idemKey: `cmd:reject_proposal:${data.proposal_id}`,
+                  idemKey: `cmd:proposal_reject:${data.proposal_id}`,
                   payload: { proposal_id: data.proposal_id },
                 })
               }

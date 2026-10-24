@@ -1,4 +1,8 @@
-// Mock 命令处理：7 类命令的校验、状态迁移、事件落账与幂等回执。
+// Mock 命令处理：命令词以服务端 canonical 词表为准（FIX-ROUND-1 R-1），
+// K0 界面入口 5 词（proposal_accept / proposal_reject / task_advance /
+// acceptance_record / task_cancel）；feedback_submit 在词表内但 K0 无界面
+// 入口（捕获走 /api/capture），mock 返回 command_not_implemented_in_mock。
+// 原 resolve_decision 无服务端对应，已整体移除（契约缺口登记见 web/README.md）。
 //
 // 与内核规约的对应（mock 只模拟可判定规则，不发明领域结论）：
 // - REQ-ACC-2 actor 分离：acceptor 固定 human-reviewer，与 task.executed_by 不等；
@@ -16,6 +20,7 @@
 // 供前端观察投影刷新；最终语义以服务端车道对齐结果为准。
 
 import type { CommandReceipt, CommandRequest, CaptureResponse, CriterionVerdict } from '../api/types';
+import { CANONICAL_COMMAND_TYPES } from '../api/types';
 import { MockHttpError } from './errors';
 import type { MockStore, CommandReceiptRecord } from './store';
 import { buildAcceptanceRecord, computeAcceptanceVerdict } from './store';
@@ -69,24 +74,25 @@ function withIdempotency(
 export function handleCommand(store: MockStore, request: CommandRequest): CommandReceiptRecord {
   const payload: Payload = (request.payload ?? {}) as Payload;
   switch (request.type) {
-    case 'accept_proposal':
+    case 'proposal_accept':
       return withIdempotency(store, request.client_submit_id, () => acceptProposal(store, payload));
-    case 'reject_proposal':
+    case 'proposal_reject':
       return withIdempotency(store, request.client_submit_id, () => rejectProposal(store, payload));
-    case 'start_task':
-      return withIdempotency(store, request.client_submit_id, () => startTask(store, payload));
-    case 'complete_task':
-      return withIdempotency(store, request.client_submit_id, () => completeTask(store, payload));
-    case 'record_criterion_verdict':
+    case 'task_advance':
+      return withIdempotency(store, request.client_submit_id, () => taskAdvance(store, payload));
+    case 'acceptance_record':
       return withIdempotency(store, request.client_submit_id, () =>
         recordCriterionVerdict(store, payload),
       );
-    case 'resolve_decision':
-      return withIdempotency(store, request.client_submit_id, () => resolveDecision(store, payload));
-    case 'cancel_task':
+    case 'task_cancel':
       return withIdempotency(store, request.client_submit_id, () => cancelTask(store, payload));
     default:
-      throw MockHttpError.badRequest('unknown_command_type', `未知命令类型：${String(request.type)}`);
+      // canonical 词表内但 mock 未实现的命令（当前仅 feedback_submit：
+      // K0 无界面入口，捕获走 /api/capture 专用端点）
+      throw MockHttpError.badRequest(
+        'command_not_implemented_in_mock',
+        `命令 ${String(request.type)} 在 mock 未实现（K0 无界面入口）`,
+      );
   }
 }
 
@@ -104,6 +110,7 @@ function acceptProposal(store: MockStore, payload: Payload): void {
   }
 
   // OQ-01=A 落点链：FeedbackReceived → FeedbackInterpreted → TaskCaptured（直接成 Task）
+  // R-11：task_id 只在接受此刻新发（此前提议投影/界面均无 task_id 字段）
   const taskId = store.newId('task');
   const criteria = proposal.proposed.acceptance_criteria.map((criterion, index) => ({
     criterion_ref: `${taskId}/c${index + 1}`,
@@ -177,8 +184,22 @@ function rejectProposal(store: MockStore, payload: Payload): void {
 
 // ---------- 任务执行 ----------
 
-function startTask(store: MockStore, payload: Payload): void {
+/**
+ * task_advance（canonical）：服务端以一个命令词覆盖「开始/完成」两个迁移，
+ * 按任务当前生命周期分派——ready/defined → 开始；active → 完成；
+ * 其余生命周期落到 startTask 的前置校验，按 409 task_not_ready 拒绝。
+ * 分派口径为 mock 对服务端词表的模拟（K1 契约议题，见 web/README.md 已知边界）。
+ */
+function taskAdvance(store: MockStore, payload: Payload): void {
   const task = taskOf(store, payload);
+  if (task.lifecycle === 'active') {
+    completeTask(store, task, payload);
+    return;
+  }
+  startTask(store, task);
+}
+
+function startTask(store: MockStore, task: MockTaskState): void {
   if (task.lifecycle !== 'ready' && task.lifecycle !== 'defined') {
     throw MockHttpError.conflict('task_not_ready', '任务不在可开始状态', {
       task_id: task.task_id,
@@ -222,8 +243,7 @@ function startTask(store: MockStore, payload: Payload): void {
   task.updated_global_seq = store.currentSeq();
 }
 
-function completeTask(store: MockStore, payload: Payload): void {
-  const task = taskOf(store, payload);
+function completeTask(store: MockStore, task: MockTaskState, payload: Payload): void {
   if (task.lifecycle !== 'active' || !task.active_run) {
     throw MockHttpError.conflict('task_not_active', '任务不在执行中', {
       task_id: task.task_id,
@@ -396,46 +416,10 @@ function recordCriterionVerdict(store: MockStore, payload: Payload): void {
 
 // ---------- 决策 ----------
 
-function resolveDecision(store: MockStore, payload: Payload): void {
-  const decisionId = str(payload.decision_id, 'decision_id');
-  const decision = store.decisions.get(decisionId);
-  if (!decision) throw MockHttpError.notFound('decision_not_found', `决策 ${decisionId} 不存在`);
-  if (decision.status !== 'pending') {
-    throw MockHttpError.conflict('decision_not_pending', '决策已被处理', {
-      decision_id: decisionId,
-      status: decision.status,
-    });
-  }
-  if (decision.expires_at && Date.parse(decision.expires_at) < Date.now()) {
-    decision.status = 'expired';
-    store.appendEvent({
-      kind: 'DecisionExpired',
-      project_id: decision.project_id,
-      decision_id: decisionId,
-      summary: `决策「${decision.question}」已过期`,
-    });
-    throw MockHttpError.conflict('decision_expired', '决策已过期，未执行（REQ-DC-1）', {
-      decision_id: decisionId,
-    });
-  }
-  const resolution = payload.resolution;
-  if (
-    resolution !== 'approved' &&
-    resolution !== 'approved_modified' &&
-    resolution !== 'rejected' &&
-    resolution !== 'deferred'
-  ) {
-    throw MockHttpError.badRequest('invalid_resolution', 'resolution 必须为 approved/approved_modified/rejected/deferred');
-  }
-  decision.status = resolution;
-  decision.updated_global_seq = store.currentSeq();
-  store.appendEvent({
-    kind: 'DecisionResolved',
-    project_id: decision.project_id,
-    decision_id: decisionId,
-    summary: `决策「${decision.question}」裁决为 ${resolution}`,
-  });
-}
+// resolve_decision 已整体移除（FIX-ROUND-1 R-1）：服务端命令词表无对应项，
+// 本轮下线动作入口，不许自造端点或本地假实现。决策领域状态（种子/事件历史）
+// 保留供投影呈现；契约缺口登记见 web/README.md「已知边界」，待协调者裁决
+// 后再恢复命令处理。
 
 // ---------- 取消 ----------
 
@@ -553,6 +537,13 @@ export function assertCommandShape(body: unknown): CommandRequest {
   const record = body as Record<string, unknown>;
   if (typeof record.type !== 'string') {
     throw MockHttpError.badRequest('invalid_command', '命令缺少 type');
+  }
+  // canonical 词表是唯一正本（FIX-ROUND-1 R-1）：词表外一律拒绝
+  if (!CANONICAL_COMMAND_TYPES.includes(record.type as CommandRequest['type'])) {
+    throw MockHttpError.badRequest(
+      'unknown_command_type',
+      `未知命令类型：${record.type}（canonical 词表之外）`,
+    );
   }
   if (typeof record.client_submit_id !== 'string' || record.client_submit_id.trim() === '') {
     throw MockHttpError.badRequest('invalid_command', '命令缺少 client_submit_id（幂等键）');

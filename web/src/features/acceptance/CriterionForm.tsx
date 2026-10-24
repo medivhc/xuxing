@@ -1,6 +1,7 @@
 // 逐判据验收表单（契约 §5.4 P-A5 / OQ-03=A；Spec §2.6 REQ-ACC-2）：
 // - 每条判据独立判定（passed/failed/not_applicable）+ 备注 + 证据；
-// - 逐条经命令入口提交（record_criterion_verdict），禁止「一次性全判」总开关；
+// - 逐条经命令入口提交（acceptance_record，canonical 词表；FIX-ROUND-1 R-1
+//   由 record_criterion_verdict 映射而来），禁止「一次性全判」总开关；
 // - 覆盖完整性：全部 criterion_ref 均有结果才落最终 verdict（服务端判定，
 //   前端只呈现剩余数量，不自行推断领域结论）；
 // - 继承锁定：已 passed 改判必须附新证据（服务端 409 criterion_locked，UI 预告）；
@@ -37,7 +38,7 @@ function CriterionRow({ taskId, criterion, existing }: CriterionRowProps) {
   const [evidence, setEvidence] = useState('');
 
   const command = useCommand({
-    type: 'record_criterion_verdict',
+    type: 'acceptance_record',
     onAccepted: () => {
       setVerdict(null);
       setNote('');
@@ -52,7 +53,7 @@ function CriterionRow({ taskId, criterion, existing }: CriterionRowProps) {
   const submit = () => {
     if (!verdict) return;
     command.mutate({
-      idemKey: `cmd:verdict:${taskId}:${criterion.criterion_ref}:${verdict}`,
+      idemKey: `cmd:acceptance_record:${taskId}:${criterion.criterion_ref}:${verdict}`,
       payload: {
         task_id: taskId,
         criterion_ref: criterion.criterion_ref,

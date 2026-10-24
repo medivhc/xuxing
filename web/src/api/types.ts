@@ -136,21 +136,47 @@ export interface ActionItem {
 
 // ---------- Project（GET /api/projects/:projectId） ----------
 
+/**
+ * 项目级验收摘要（FIX-ROUND-1 R-8 新增键）。
+ * 口径为内核计算，前端只呈现、不自行统计（与 rank/verdict 同纪律）。
+ */
+export interface ProjectAcceptanceStatus {
+  /** awaiting_acceptance 任务 id —— Project 是验收动作落点（OQ-02=A） */
+  awaiting_task_ids: string[];
+  /** 已落 AcceptanceRecorded 最终 verdict 的任务数 */
+  recorded_count: number;
+  /** partially_accepted 且仍有待补判据的任务（部分通过待续） */
+  outstanding: Array<{ task_id: string; title: string; pending_criteria: string[] }>;
+}
+
+/**
+ * 项目内待处理提议（FIX-ROUND-1 R-8 新增键）：从 Project 直达提议页。
+ * 提议只携带 draft（标题 + 验收判据）；task_id 在提议接受后由服务端新发（R-11）。
+ */
+export interface PendingProposal {
+  proposal_id: string;
+  capture_id: string;
+  summary: string;
+  created_at: string;
+  /** 服务端广告的动作（canonical 词表，R-1） */
+  available_actions: string[];
+}
+
 export interface ProjectProjection extends ProjectionMeta {
   projection_id: 'project';
-  project_id: string;
-  name: string;
+  /** 项目标识（R-8：原顶层 project_id/name 收入此子对象） */
+  project: { project_id: string; name: string };
   goal: {
     statement: string;
     success_criteria: string;
     stop_conditions: string;
     status: 'active' | 'achieved' | 'abandoned';
   } | null;
-  plan_rev: number;
-  plan_history: Array<{ rev: number; applied_at: string; diff_summary: string }>;
   tasks: ProjectTaskRow[];
-  /** 固定 1-hop depends_on + data_from，只读（OQ-09=A） */
-  focused_subgraph: FocusedSubgraph | null;
+  acceptance_status: ProjectAcceptanceStatus;
+  /** 聚焦子图（R-8：原 focused_subgraph 改名 graph），固定 1-hop depends_on + data_from，只读（OQ-09=A） */
+  graph: ProjectGraph | null;
+  pending_proposals: PendingProposal[];
 }
 
 export interface ProjectTaskRow {
@@ -200,7 +226,7 @@ export interface AcceptanceRecord {
   superseded?: boolean;
 }
 
-export interface FocusedSubgraph {
+export interface ProjectGraph {
   root_task_id: string;
   nodes: Array<{ task_id: string; title: string; lifecycle: TaskLifecycle }>;
   edges: Array<{
@@ -250,14 +276,39 @@ export interface CaptureResponse {
 
 // ---------- 命令（POST /api/commands） ----------
 
+/**
+ * 服务端命令词表（canonical，唯一正本；协调者 FIX-ROUND-1 R-1 定版，共 6 词）：
+ *   proposal_accept / proposal_reject / task_advance / feedback_submit /
+ *   acceptance_record / task_cancel
+ * 界面 available_actions 一律以服务端为准，不许自造动作。原 web 车道 7 动词
+ * 到本词表的映射（FIX-ROUND-1 R-1）：
+ *   accept_proposal          → proposal_accept
+ *   reject_proposal          → proposal_reject
+ *   start_task / complete_task → task_advance（按任务当前生命周期分派，见 mock/commands.ts）
+ *   record_criterion_verdict → acceptance_record
+ *   cancel_task              → task_cancel
+ * 原 resolve_decision 无服务端对应，本轮已下线动作入口（契约缺口登记见
+ * web/README.md「已知边界」，待协调者裁决后再恢复）。
+ * feedback_submit 在词表内但 K0 无界面入口（捕获走 /api/capture 专用端点，
+ * 不经命令入口）；mock 对其返回 command_not_implemented_in_mock。
+ */
 export type CommandType =
-  | 'accept_proposal'
-  | 'reject_proposal'
-  | 'start_task'
-  | 'complete_task'
-  | 'record_criterion_verdict'
-  | 'resolve_decision'
-  | 'cancel_task';
+  | 'proposal_accept'
+  | 'proposal_reject'
+  | 'task_advance'
+  | 'feedback_submit'
+  | 'acceptance_record'
+  | 'task_cancel';
+
+/** canonical 词表全量（单一来源：mock 校验命令体形状以此为准）。 */
+export const CANONICAL_COMMAND_TYPES: readonly CommandType[] = [
+  'proposal_accept',
+  'proposal_reject',
+  'task_advance',
+  'feedback_submit',
+  'acceptance_record',
+  'task_cancel',
+];
 
 export interface CommandRequest {
   type: CommandType;
@@ -284,6 +335,13 @@ export interface StreamEvent {
   [key: string]: unknown;
 }
 
+/**
+ * health 端点信封内的 data（FIX-ROUND-1 R-2：health 与其他端点同样统一信封，
+ * 响应为 {ok:true, data:{...}}；http 层解包后业务只拿下面的形状）。
+ */
 export interface HealthResponse {
-  ok: true;
+  ok: boolean;
+  /** 数据库连接态（如 'ok'）；K0 界面未消费，仅客户端保留端点封装。 */
+  db: string;
+  projection_version: number;
 }

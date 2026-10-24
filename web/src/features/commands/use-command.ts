@@ -15,7 +15,7 @@ import { clearSubmitId, reuseOrCreateSubmitId } from './submit-id';
 
 export interface SubmitVars {
   payload: Record<string, unknown>;
-  /** 幂等键：同一次用户意图保持不变（如 `cmd:start_task:${taskId}`）。 */
+  /** 幂等键：同一次用户意图保持不变（如 `cmd:task_advance:start:${taskId}`）。 */
   idemKey: string;
 }
 

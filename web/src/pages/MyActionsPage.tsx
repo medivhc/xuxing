@@ -2,15 +2,16 @@
 // 事项（REQ-PJ-2）。awaiting_acceptance 不在此列（OQ-02=A：验收在 Project 页，
 // 由 Home attention 跳转）。条目按投影 rank 排序（OQ-08=A：内核计算，UI 只排序）。
 //
-// 决策行：resolve_decision 四选项；approved_modified 置灰（OQ-04=B：K0 不做
-// PlanChange 提案表单，置灰并提示走 API）。
+// 命令词以服务端 canonical 词表为准（FIX-ROUND-1 R-1）：任务行动作
+// task_advance（开始/完成按 task_lifecycle 分派渲染）与 task_cancel。
+// 决策行：resolve_decision 无服务端对应、动作入口已下线（契约缺口登记见
+// web/README.md「已知边界」）——决策信息照常展示，仅不再提供裁决按钮。
 //
 // 注：ActionItem 是单一接口（kind 为联合字段而非可区分联合），组件按
 // kind 分流后直接访问可选字段（task_lifecycle/decision 等本身可空）。
 // ActionItem 投影不含 title（契约投影清单），任务行以 task_id 呈现，
 // 标题在 Project 页查看——不发明投影字段。
 
-import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api/client';
@@ -22,22 +23,15 @@ import { EmptyState, ErrorBanner, PendingButton, Skeleton } from '../components/
 import { SyncBadge } from '../components/Badge';
 import { formatRelative } from '../lib/time';
 
-type Resolution = 'approved' | 'approved_modified' | 'rejected' | 'deferred';
-
-const RESOLUTION_LABEL: Record<Resolution, string> = {
-  approved: '批准',
-  approved_modified: '批准并修改（置灰）',
-  rejected: '否决',
-  deferred: '暂缓',
-};
-
 function TaskActionRow({ item }: { item: ActionItem }) {
-  const start = useCommand({ type: 'start_task' });
-  const complete = useCommand({ type: 'complete_task' });
-  const cancel = useCommand({ type: 'cancel_task' });
+  // task_advance 一词覆盖开始/完成两个迁移：按投影 task_lifecycle 分派渲染
+  const advance = useCommand({ type: 'task_advance' });
+  const cancel = useCommand({ type: 'task_cancel' });
 
   const actions = item.available_actions;
-  const anyPending = start.isPending || complete.isPending || cancel.isPending;
+  const anyPending = advance.isPending || cancel.isPending;
+  const canStart =
+    item.task_lifecycle === 'defined' || item.task_lifecycle === 'ready';
 
   return (
     <li
@@ -72,13 +66,13 @@ function TaskActionRow({ item }: { item: ActionItem }) {
 
       {actions.length > 0 ? (
         <div className="mt-3 flex flex-wrap gap-2">
-          {actions.includes('start_task') ? (
+          {actions.includes('task_advance') && canStart ? (
             <PendingButton
-              pending={start.isPending}
+              pending={advance.isPending}
               disabled={anyPending}
               onClick={() =>
-                start.mutate({
-                  idemKey: `cmd:start_task:${item.task_id}`,
+                advance.mutate({
+                  idemKey: `cmd:task_advance:start:${item.task_id}`,
                   payload: { task_id: item.task_id },
                 })
               }
@@ -87,13 +81,13 @@ function TaskActionRow({ item }: { item: ActionItem }) {
               开始执行
             </PendingButton>
           ) : null}
-          {actions.includes('complete_task') ? (
+          {actions.includes('task_advance') && item.task_lifecycle === 'active' ? (
             <PendingButton
-              pending={complete.isPending}
+              pending={advance.isPending}
               disabled={anyPending}
               onClick={() =>
-                complete.mutate({
-                  idemKey: `cmd:complete_task:${item.task_id}`,
+                advance.mutate({
+                  idemKey: `cmd:task_advance:complete:${item.task_id}`,
                   payload: { task_id: item.task_id },
                 })
               }
@@ -102,14 +96,14 @@ function TaskActionRow({ item }: { item: ActionItem }) {
               标记完成
             </PendingButton>
           ) : null}
-          {actions.includes('cancel_task') ? (
+          {actions.includes('task_cancel') ? (
             <PendingButton
               variant="secondary"
               pending={cancel.isPending}
               disabled={anyPending}
               onClick={() =>
                 cancel.mutate({
-                  idemKey: `cmd:cancel_task:${item.task_id}`,
+                  idemKey: `cmd:task_cancel:${item.task_id}`,
                   payload: { task_id: item.task_id },
                 })
               }
@@ -125,26 +119,18 @@ function TaskActionRow({ item }: { item: ActionItem }) {
         </p>
       )}
 
-      <ErrorBanner error={start.error} />
-      <ErrorBanner error={complete.error} />
+      <ErrorBanner error={advance.error} />
       <ErrorBanner error={cancel.error} />
     </li>
   );
 }
 
 function DecisionActionRow({ item }: { item: ActionItem }) {
-  const [choice, setChoice] = useState<Resolution | null>(null);
-  const resolve = useCommand({ type: 'resolve_decision' });
   const decision = item.decision;
 
-  const submit = (resolution: Resolution) => {
-    if (!item.decision_id) return;
-    resolve.mutate({
-      idemKey: `cmd:resolve_decision:${item.decision_id}:${resolution}`,
-      payload: { decision_id: item.decision_id, resolution },
-    });
-  };
-
+  // resolve_decision 动作入口已下线（FIX-ROUND-1 R-1：服务端命令词表无对应项，
+  // 不许自造端点或本地假实现）。决策信息照常呈现；契约缺口登记见
+  // web/README.md「已知边界」，待协调者裁决后再恢复动作入口。
   return (
     <li
       data-testid="my-actions-row"
@@ -176,41 +162,9 @@ function DecisionActionRow({ item }: { item: ActionItem }) {
         <p className="mt-1 text-caption text-warning">阻塞原因：{item.blocked_reason}</p>
       ) : null}
 
-      {item.available_actions.includes('resolve_decision') ? (
-        <div className="mt-3 flex flex-wrap gap-2">
-          {(Object.keys(RESOLUTION_LABEL) as Resolution[]).map((resolution) => {
-            const disabled = resolution === 'approved_modified';
-            return (
-              <button
-                key={resolution}
-                type="button"
-                data-testid={`decision-resolve-${resolution}`}
-                disabled={disabled || resolve.isPending}
-                aria-pressed={choice === resolution}
-                onClick={() => {
-                  setChoice(resolution);
-                  submit(resolution);
-                }}
-                title={
-                  disabled ? 'K0 不支持在界面修改计划（OQ-04=B），请走 API 提交 PlanChange' : undefined
-                }
-                className={[
-                  'min-h-touch rounded-m border px-3 text-body-s transition-colors duration-[var(--motion-feedback)]',
-                  disabled
-                    ? 'cursor-not-allowed border-border bg-subtle text-text-disabled'
-                    : choice === resolution
-                      ? 'border-accent bg-accent-subtle font-medium text-accent'
-                      : 'border-border-strong bg-surface text-text-secondary hover:bg-subtle',
-                ].join(' ')}
-              >
-                {RESOLUTION_LABEL[resolution]}
-              </button>
-            );
-          })}
-        </div>
-      ) : null}
-
-      <ErrorBanner error={resolve.error} className="mt-2" />
+      <p data-testid="decision-action-offline" className="mt-2 text-caption text-text-tertiary">
+        决策裁决动作本轮已下线：服务端命令词表无对应项（契约缺口，见 web/README.md「已知边界」）。
+      </p>
     </li>
   );
 }
