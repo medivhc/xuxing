@@ -250,14 +250,39 @@ export interface CaptureResponse {
 
 // ---------- 命令（POST /api/commands） ----------
 
+/**
+ * 服务端命令词表（canonical，唯一正本；协调者 FIX-ROUND-1 R-1 定版，共 6 词）：
+ *   proposal_accept / proposal_reject / task_advance / feedback_submit /
+ *   acceptance_record / task_cancel
+ * 界面 available_actions 一律以服务端为准，不许自造动作。原 web 车道 7 动词
+ * 到本词表的映射（FIX-ROUND-1 R-1）：
+ *   accept_proposal          → proposal_accept
+ *   reject_proposal          → proposal_reject
+ *   start_task / complete_task → task_advance（按任务当前生命周期分派，见 mock/commands.ts）
+ *   record_criterion_verdict → acceptance_record
+ *   cancel_task              → task_cancel
+ * 原 resolve_decision 无服务端对应，本轮已下线动作入口（契约缺口登记见
+ * web/README.md「已知边界」，待协调者裁决后再恢复）。
+ * feedback_submit 在词表内但 K0 无界面入口（捕获走 /api/capture 专用端点，
+ * 不经命令入口）；mock 对其返回 command_not_implemented_in_mock。
+ */
 export type CommandType =
-  | 'accept_proposal'
-  | 'reject_proposal'
-  | 'start_task'
-  | 'complete_task'
-  | 'record_criterion_verdict'
-  | 'resolve_decision'
-  | 'cancel_task';
+  | 'proposal_accept'
+  | 'proposal_reject'
+  | 'task_advance'
+  | 'feedback_submit'
+  | 'acceptance_record'
+  | 'task_cancel';
+
+/** canonical 词表全量（单一来源：mock 校验命令体形状以此为准）。 */
+export const CANONICAL_COMMAND_TYPES: readonly CommandType[] = [
+  'proposal_accept',
+  'proposal_reject',
+  'task_advance',
+  'feedback_submit',
+  'acceptance_record',
+  'task_cancel',
+];
 
 export interface CommandRequest {
   type: CommandType;
