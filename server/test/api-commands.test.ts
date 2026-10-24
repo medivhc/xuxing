@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { api, bootApp, jsonOf, type BootedApp } from './support/harness.ts';
 import { DEFAULT_PROJECT_ID } from '../src/seed/demo.ts';
+import { asProjectId } from '../../src/kernel/events.ts';
+import { DEFAULT_ACTOR_ID } from '../src/app.ts';
 
 let booted: BootedApp;
 
@@ -236,5 +238,129 @@ describe('POST /api/commands：完整旅途（捕获 → 提议 → 接受 → M
     expect(acceptance.status, JSON.stringify(acceptance.body)).toBe(201);
     const after = await jsonOf(await api(booted, '/api/actions'));
     expect(after.data.items.some((i: any) => i.task_id === task_id)).toBe(false);
+  });
+});
+
+describe('POST /api/commands：task_cancel 负向与收尾口径（跨线复审 MAJOR-2）', () => {
+  async function countInStream(task_id: string, type: string): Promise<number> {
+    const events = await booted.harness.store.readStream(asProjectId(DEFAULT_PROJECT_ID), 1);
+    return events.filter(
+      (e) => e.type === type && (e.payload as Record<string, unknown>)['task_id'] === task_id,
+    ).length;
+  }
+
+  async function newTask(text: string, prefix: string): Promise<string> {
+    const captured = await capture(text, `${prefix}-cap`);
+    const accepted = await command({
+      type: 'proposal_accept',
+      payload: { proposal_id: captured.proposal_id },
+      client_submit_id: `${prefix}-accept`,
+    });
+    expect(accepted.status, JSON.stringify(accepted.body)).toBe(201);
+    return accepted.body.data.subject.task_id as string;
+  }
+
+  it('③ 取消后流内 TaskCanceled 恰 1 条（MAJOR-1 防线：内核收尾与命令层不得重复落）', async () => {
+    const task_id = await newTask('取消收尾计数用例', 'neg-count');
+    const canceled = await command({ type: 'task_cancel', payload: { task_id }, client_submit_id: 'neg-count-cancel' });
+    expect(canceled.status, JSON.stringify(canceled.body)).toBe(201);
+    expect(canceled.body.data.emitted.map((e: any) => e.kind)).toContain('TaskCanceled');
+    expect(await countInStream(task_id, 'TaskCanceled')).toBe(1);
+    expect((await taskOf(task_id)).lifecycle).toBe('canceled');
+  });
+
+  it('① 已终态再取消 → 409（canceled 与 accepted 各一）', async () => {
+    const task_id = await newTask('终态再取消用例', 'neg-terminal');
+    const first = await command({ type: 'task_cancel', payload: { task_id }, client_submit_id: 'neg-terminal-1' });
+    expect(first.status, JSON.stringify(first.body)).toBe(201);
+    const again = await command({ type: 'task_cancel', payload: { task_id }, client_submit_id: 'neg-terminal-2' });
+    expect(again.status, JSON.stringify(again.body)).toBe(409);
+    expect(again.body.error.detail.reason).toBe('not_in_available_actions');
+    expect(again.body.error.detail.lifecycle).toBe('canceled');
+
+    const acceptedSeed = await command({
+      type: 'task_cancel',
+      payload: { task_id: 'task_demo_kickoff' },
+      client_submit_id: 'neg-terminal-3',
+    });
+    expect(acceptedSeed.status, JSON.stringify(acceptedSeed.body)).toBe(409);
+    expect(acceptedSeed.body.error.detail.reason).toBe('not_in_available_actions');
+    expect(acceptedSeed.body.error.detail.lifecycle).toBe('accepted');
+  });
+
+  it('② 同 client_submit_id 重放 → 200 replayed 且零新事件', async () => {
+    const task_id = await newTask('取消重放用例', 'neg-replay');
+    const body = { type: 'task_cancel', payload: { task_id }, client_submit_id: 'neg-replay-cancel' };
+    const first = await command(body);
+    expect(first.status, JSON.stringify(first.body)).toBe(201);
+    const versionBefore = booted.config.projection.version();
+    const intentBefore = await countInStream(task_id, 'TaskCancelRequested');
+    const second = await command(body);
+    expect(second.status, JSON.stringify(second.body)).toBe(200);
+    expect(second.body.data.replayed).toBe(true);
+    expect(second.body.data.emitted).toEqual([]);
+    expect(booted.config.projection.version()).toBe(versionBefore);
+    expect(await countInStream(task_id, 'TaskCancelRequested')).toBe(intentBefore);
+  });
+
+  it('④ 有非 human_light 在跑 Run 时只落意图不直取消；重复发命令不重复落意图（MINOR-3）', async () => {
+    const task_id = await newTask('阻塞 Run 取消用例', 'neg-block');
+    await command({ type: 'task_advance', payload: { task_id }, client_submit_id: 'neg-block-ready' });
+    const active = await command({ type: 'task_advance', payload: { task_id }, client_submit_id: 'neg-block-active' });
+    expect(active.status, JSON.stringify(active.body)).toBe(201);
+
+    // Web 命令层只建 human_light Run；经 store 直接补一条 executor Run（口径同 seed 的 RunCreated）
+    const blockingRunId = `run_blocking_${task_id}`;
+    await booted.harness.store.withTransaction(async (tx) => {
+      const base = {
+        stream_id: asProjectId(DEFAULT_PROJECT_ID),
+        actor_id: DEFAULT_ACTOR_ID,
+        actor_kind: 'human' as const,
+        causation_id: null,
+        correlation_id: `test-blocking-${task_id}`,
+      };
+      await tx.append({
+        ...base,
+        type: 'RunCreated',
+        idempotency_key: `test:${task_id}:run-created`,
+        payload: {
+          run_id: blockingRunId,
+          task_id,
+          run_kind: 'executor',
+          assignment_id: `asg_blocking_${task_id}`,
+          actor_id: DEFAULT_ACTOR_ID,
+          actor_version: 'k0',
+          side_effect_level: 'L0',
+          task_rev: 1,
+          contract_rev: 1,
+          plan_rev: 1,
+          input_snapshot: { test: true },
+          policy_snapshot: { policy_id: 'policy_demo' },
+          idempotency_key: `test:${task_id}:run`,
+        },
+      });
+      await tx.append({
+        ...base,
+        type: 'RunStarted',
+        idempotency_key: `test:${task_id}:run-started`,
+        payload: { run_id: blockingRunId },
+      });
+    });
+    await booted.config.projection.refresh();
+
+    const first = await command({ type: 'task_cancel', payload: { task_id }, client_submit_id: 'neg-block-cancel-1' });
+    expect(first.status, JSON.stringify(first.body)).toBe(201);
+    expect(first.body.data.subject.lifecycle).toBe('active');
+    expect(first.body.data.subject.awaiting_run_termination).toContain(blockingRunId);
+    expect((await taskOf(task_id)).lifecycle).toBe('active');
+    expect(await countInStream(task_id, 'TaskCancelRequested')).toBe(1);
+    expect(await countInStream(task_id, 'TaskCanceled')).toBe(0);
+
+    // 新 submit id 再发：意图已在账，不重复落 TaskCancelRequested，仍只等待
+    const second = await command({ type: 'task_cancel', payload: { task_id }, client_submit_id: 'neg-block-cancel-2' });
+    expect(second.status, JSON.stringify(second.body)).toBe(201);
+    expect(second.body.data.subject.awaiting_run_termination).toContain(blockingRunId);
+    expect(await countInStream(task_id, 'TaskCancelRequested')).toBe(1);
+    expect((await taskOf(task_id)).lifecycle).toBe('active');
   });
 });
