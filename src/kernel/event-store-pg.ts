@@ -2812,7 +2812,7 @@ export function createPgEventStore(pool: Pool, options: PgEventStoreOptions = {}
         throw new ToolOutputChannelError('Tool Gateway 专用入口只写 EvidenceAdded 事件（INV-6）');
       }
       const prepared = prepareAppend(appendInput, { viaToolGateway: true, gatewayId: gateway_id });
-      return withStoreTransaction((conn) => appendWithin(conn, prepared, idFactory, clock));
+      return withStoreTransaction((conn) => appendWithin(conn, prepared, idFactory, clock, requireProjectCreated));
     }
 
     return {

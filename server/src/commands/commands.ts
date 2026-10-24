@@ -105,6 +105,8 @@ function describeShape(value: unknown): string {
   if (Array.isArray(value)) return 'array';
   if (value instanceof Date) return 'Date';
   return typeof value;
+}
+
 /** Q12：命令入口 actor 校验——缺失/空/类型错/kind 非法（含 external 通道冒充）一律 400、零落盘。 */
 function requireValidActor(actor: CommandActor): CommandActor {
   try {
