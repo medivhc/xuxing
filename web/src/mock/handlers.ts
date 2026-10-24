@@ -140,7 +140,7 @@ async function route(store: MockStore, url: URL, init?: RequestInit): Promise<Re
 
 export function createMockFetch(store: MockStore): typeof fetch {
   const originalFetch = globalThis.fetch.bind(globalThis);
-  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const rawUrl =
       typeof input === 'string'
         ? input

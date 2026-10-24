@@ -22,7 +22,6 @@ export type TaskWaitState =
   | 'waiting_on_person'
   | 'waiting_until'
   | 'waiting_on_dependency'
-  | 'waiting_until'
   | 'blocked'
   | 'on_hold';
 
