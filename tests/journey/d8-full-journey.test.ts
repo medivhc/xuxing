@@ -448,12 +448,13 @@ describe('⑥ 验收（Acceptance）', () => {
     expect(taskRow(13, D8.importTask).lifecycle).toBe('awaiting_acceptance');
   });
 
-  it('⑥b 四类入账负例 → 事件流零新增', () => {
+  it('⑥b 入账负例 → 事件流零新增；独立评审 agent 结论非 auto 判据为正例（只校验不落库）', () => {
     expect(step('⑥b').appendedTypes).toEqual([]);
     const notes = step('⑥b').notes.join(' | ');
-    for (const code of ['acceptor_is_run_actor', 'coverage_incomplete', 'verdict_inconsistent', 'manual_criterion_needs_human']) {
+    for (const code of ['acceptor_is_run_actor', 'coverage_incomplete', 'verdict_inconsistent', 'manual_criterion_needs_reviewer']) {
       expect(notes).toContain(code);
     }
+    expect(notes).toContain('非 auto 判据由独立评审 agent 结论 → ok=true');
     expect(notes).toMatch(/零写入拒绝\[Acceptance 由 Run actor 自验\].*事件数 (\d+)→\1/);
     expect(notes).toMatch(/零写入拒绝\[Acceptance 缺判据\].*事件数 (\d+)→\1/);
     expect(notes).toMatch(/零写入拒绝\[Acceptance verdict 不一致\].*事件数 (\d+)→\1/);

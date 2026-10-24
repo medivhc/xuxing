@@ -771,7 +771,7 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
     'WaitConditionCreated', 'TaskWaitStateChanged', 'PlanRevisionCreated',
   ]);
 
-  await r.begin('⑥b 入账负例：actor 分离 / 覆盖完整性 / verdict 一致性', ['REQ-ACC-2', '新 P1-1', 'C6']);
+  await r.begin('⑥b 入账校验：actor 分离 / 覆盖完整性 / verdict 一致性 / 非 auto 判据结论者', ['REQ-ACC-2', '新 P1-1', 'C6']);
 
   const accSelf: AcceptanceDraft = {
     acceptance_id: 'acc-d8-self', task_id: D8.importTask, contract_rev: 1,
@@ -809,12 +809,20 @@ export async function runD8Journey(store: PgEventStore): Promise<JourneyRun> {
     return r.emit('AcceptanceRecorded', acceptancePayload(accInconsistent), HUMAN);
   });
 
+  // REQ-ACC-2 正例：独立评审 agent（未执行 subject Run）可以结论非 auto 判据。
+  // 只校验不落库 —— 本 Task 的首份有效验收留给 ⑥c 的 partially 路径演示。
   const accByBot: AcceptanceDraft = { ...accMissing, acceptance_id: 'acc-d8-bot', acceptor_id: REVIEW_BOT.id, acceptor_kind: 'agent', criterion_results: [
     { criterion_ref: D8.criterionRoundtrip, verdict: 'passed', evidence_refs: [D8.evidenceAgentClaim] },
     { criterion_ref: D8.criterionUnmapped, verdict: 'passed', evidence_refs: [D8.evidenceAgentClaim] },
   ] };
   const vBot = validateAcceptance(projection, accByBot);
-  r.note(`非 auto 判据由 agent actor 结论 → ok=${vBot.ok} code=${vBot.code}（REQ-ACC-2：须人/独立评审）`);
+  r.note(`非 auto 判据由独立评审 agent 结论 → ok=${vBot.ok} code=${vBot.code}（REQ-ACC-2：人类或独立评审 actor 均可）`);
+  if (!vBot.ok) throw new Error(`独立评审 agent 理应可结论非 auto 判据：${vBot.detail}`);
+
+  // REQ-ACC-2 负例：system 类 actor 不得结论非 auto 判据（同样只校验、零写入）。
+  const accBySystem: AcceptanceDraft = { ...accByBot, acceptance_id: 'acc-d8-system', acceptor_id: KERNEL.id, acceptor_kind: 'system' };
+  const vSystem = validateAcceptance(projection, accBySystem);
+  r.note(`非 auto 判据由 system 结论 → ok=${vSystem.ok} code=${vSystem.code}（REQ-ACC-2：system 不得代判）`);
 
   step = await r.end();
   assertTypes(step, []);

@@ -477,17 +477,21 @@ export function validateAcceptance(state: JourneyProjection, draft: AcceptanceDr
     return reject('verdict_inconsistent', `逐项结论应得 ${expected}，顶层写 ${draft.verdict}（REQ-ACC-2 内核校验）`);
   }
 
-  // ③ actor 分离（REQ-ACC-2 / C6）：执行该 Run 的 actor 不得担任其 Acceptance 的 acceptor
-  const runActors = new Set(state.taskRuns(draft.task_id).map((r) => r.actor_id));
-  if (runActors.has(draft.acceptor_id)) {
-    return reject('acceptor_is_run_actor', `acceptor=${draft.acceptor_id} 亲自执行过本 Task 的 Run（REQ-ACC-2 拦截）`);
+  // ③ actor 分离（REQ-ACC-2 / C6）：被禁的只有 subject Outcome 所属 Run 的执行者。
+  //    spec 钉死的是「执行该 Run 的 actor」，「该 Run」= subject_outcome_id 所属 Run；
+  //    本 Task 其他 Run 的执行者不在禁止之列（多 Run 时不得按整 Task 误拒）。
+  const subjectRun = subject.run_id !== null ? state.runs.get(subject.run_id) : undefined;
+  if (subjectRun && subjectRun.actor_id === draft.acceptor_id) {
+    return reject('acceptor_is_run_actor', `acceptor=${draft.acceptor_id} 是 subject Outcome 所属 Run ${subjectRun.run_id} 的执行者（REQ-ACC-2 拦截）`);
   }
 
-  // ④ 非 auto 判据必须人类/独立评审 actor 给出（REQ-ACC-2）
+  // ④ 非 auto 判据必须由人类或独立评审 actor 给出（REQ-ACC-2）：「独立评审」指
+  //    不是 subject Run 执行者的评审者（human 恒可；agent 须已过 ③ 的分离校验，
+  //    走到这里即与 subject Run 无关）；system 类 actor 不得代判非 auto 判据。
   const autoRefs = new Set(contract.auto_criterion_refs);
   const manual = draft.criterion_results.filter((r) => !autoRefs.has(r.criterion_ref));
-  if (manual.length > 0 && draft.acceptor_kind !== 'human') {
-    return reject('manual_criterion_needs_human', `判据 ${manual.map((m) => m.criterion_ref)} 非 auto，须由 human/独立评审 actor 结论（REQ-ACC-2）`);
+  if (manual.length > 0 && draft.acceptor_kind === 'system') {
+    return reject('manual_criterion_needs_reviewer', `判据 ${manual.map((m) => m.criterion_ref)} 非 auto，须由人类或独立评审 actor 结论，system 不得代判（REQ-ACC-2）`);
   }
 
   // ⑤ 继承锁定校验（新 P1-1②）：先前已 passed 的判据被置 failed/not_applicable 时须 supersede 且附新证据
