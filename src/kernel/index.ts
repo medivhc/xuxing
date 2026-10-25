@@ -2,3 +2,10 @@
 // 行为唯一依据：spec/K0-SPEC.md（冻结 v1.0）。
 export * from "./events.js";
 export * from "./event-store.js";
+export * from "./transition-guard.js";
+export * from "./event-store-pg.js";
+export * from "./run-events.js";
+export * from "./scheduler.js";
+export * from "./acceptance.js";
+export * from "./actor-guard.js";
+export * from "./tool-gateway.js";

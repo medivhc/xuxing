@@ -1,0 +1,7 @@
+/* Tailwind 接线入口（FIX-ROUND-3）：此前全仓无 @tailwind 指令，PostCSS 的
+ * tailwindcss 插件无从展开，构建产物只有 tokens.css 的手写变量、工具类一条
+ * 都没生成（CLICK-AUDIT §3）。三指令必须在 tokens.css 之前引入：
+ * preflight 与 tokens 的 body 基础样式同题，tokens 后置覆盖为定版口径。 */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

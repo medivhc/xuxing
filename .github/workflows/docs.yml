@@ -1,0 +1,23 @@
+name: docs-check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  docs-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # 阻断模式：主线分支（master / develop/**）与所有 PR——STATUS 新鲜度门禁只在这里生效
+      - name: Run docs-check (blocking)
+        if: "github.event_name == 'pull_request' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/develop/')"
+        run: node tools/docs-check.mjs
+      # 告警模式：功能分支 push 只提示不阻断——纯代码分支攒够提交数后 based_on 领先上限必红，
+      # 那是门禁适用范围问题、不是代码问题（2026-10-24 web/frontend 连红 10 次的根因）
+      - name: Run docs-check (advisory on feature branches)
+        if: "github.event_name != 'pull_request' && github.ref != 'refs/heads/master' && !startsWith(github.ref, 'refs/heads/develop/')"
+        continue-on-error: true
+        run: node tools/docs-check.mjs
