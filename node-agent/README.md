@@ -69,9 +69,13 @@ git log/diff/branch → 写 `result.json`。成功回报
 | `XUXING_AGENT_AUTH_FILE` | `/home/<HANDS_USER>/.local/share/opencode/auth.json` | 容器内 opencode 凭据文件；启动时只抽 `opencode-go` 键注入 `OPENCODE_API_KEY`，不落配置、不打印 |
 | `XUXING_AGENT_OPENCODE_BIN` | `/home/<HANDS_USER>/.opencode/bin/opencode` | 容器内 opencode 可执行文件（安装脚本不改进 PATH，故用绝对路径） |
 
-并发口径：不做 executor 内串行化；每 Run 独立 tmux session + git worktree，
-并发 N 条即 N 个 worktree 与 N 个 opencode 进程，资源占用线性增长。worktree
-只留在 ah1 的 runs 目录，`xu-agent/*` 分支只在 ah1 clone 内，不 push。
+并发口径：工作区准备按仓库串行、执行并发。`prepareWorkspace` 的 `git fetch` /
+`git worktree add` 都写共享 clone 的 ref 与 worktree 元数据，故按 `repoPath`
+（`XUXING_AGENT_REPO_DIR`）加异步互斥、排队执行（`git fetch` 失败在临界区内
+重试一次）；排队只覆盖准备阶段，互斥外的 opencode 执行仍并发——每 Run 独立
+tmux session + git worktree，并发 N 条即 N 个 worktree 与 N 个 opencode 进程，
+资源占用线性增长。`workspace.repo=null` 的空目录准备不碰共享 clone，不进锁。
+worktree 只留在 ah1 的 runs 目录，`xu-agent/*` 分支只在 ah1 clone 内，不 push。
 
 ah1 一次性准备（opencode、模型配置、令牌最小化拷贝、runs 目录、冒烟）见
 `node-agent/provision-ah1.sh`；脚本幂等，令牌只做机对机搬运、不打印值。

@@ -11,8 +11,9 @@
 //   XUXING_AGENT_REPO_DIR   容器内 xuxing clone 路径（缺省 /home/dev/xuxing；与 provision-ah1.sh 同名）
 //   XUXING_HANDS_USER       容器内执行用户（缺省 dev）
 //
-// 并发口径：不做 executor 内串行化；每 Run 独立 tmux session + git worktree，
-// 资源占用随并发 Run 线性增长（见 README）。
+// 并发口径：工作区准备按 repoPath 串行（共享 clone 的 fetch / worktree add 都写
+// ref 与 worktree 元数据，并发必锁冲突）；opencode 执行保持并发，每 Run 独立
+// tmux session + git worktree，资源占用随并发 Run 线性增长（见 README）。
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -23,6 +24,7 @@ const DEFAULT_RUNS_DIR = '/home/dev/xuxing-runs';
 const DEFAULT_HANDS_USER = 'dev';
 const DEFAULT_BASE_REF = 'develop/eventstore-batch1';
 const DEFAULT_REPO_PATH = '/home/dev/xuxing';
+const FETCH_RETRY_DELAY_MS = 1_500;
 const KIND = 'agent_hands_agent';
 const SUPPORTED_REPOS = new Set(['medivhc/xuxing', 'xuxing']);
 const SUMMARY_LIMIT = 1800;
@@ -64,6 +66,12 @@ function trimTail(text, limit) {
   return text.slice(text.length - limit);
 }
 
+function delay(ms) {
+  // 不 unref：这是被 await 的短退避，需保证事件循环等它（unref 会让空转的
+  // 进程在等待中直接退出）。
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export function createAgentHandsAgentExecutor(options) {
   const transport = options.transport ?? 'docker';
   const container = options.container ?? 'ah1';
@@ -79,6 +87,24 @@ export function createAgentHandsAgentExecutor(options) {
   const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : DEFAULT_TIMEOUT_MS;
   const active = new Map(); // run_id -> { watcher, session, ws, recordDir, timedOut, canceled, finished }
   const cancelRequested = new Set(); // dispatch 尚未建会话时收到的取消
+
+  // 按 repoPath 的异步互斥：同一 clone 的 fetch / worktree add 必须串行，
+  // 否则并发写 ref 与 worktree 元数据会撞 git 锁（unable to update local ref）。
+  // 队列尾自动清理：链上最后一环完成后从 Map 摘除，不随 Run 数增长泄漏。
+  const workspaceQueues = new Map(); // repoPath -> 队尾 promise（永不 reject）
+  function withWorkspaceLock(key, fn) {
+    const previous = workspaceQueues.get(key) ?? Promise.resolve();
+    const run = previous.then(fn);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    workspaceQueues.set(key, tail);
+    tail.then(() => {
+      if (workspaceQueues.get(key) === tail) workspaceQueues.delete(key);
+    });
+    return run;
+  }
 
   /** 容器内 bash（local transport 时在本机执行，便于无容器开发）。 */
   function runShell(command, options = {}) {
@@ -183,6 +209,7 @@ export function createAgentHandsAgentExecutor(options) {
 
   async function prepareWorkspace({ ws, worktree, repo, baseRef, branch }) {
     if (repo === null) {
+      // 空目录准备不碰共享 clone 的任何元数据，故不进 repoPath 互斥。
       const made = await runShell(`mkdir -p ${shQuote(worktree)}`);
       return made.code === 0 ? null : `mkdir workspace failed: ${made.stderr.trim()}`;
     }
@@ -191,20 +218,37 @@ export function createAgentHandsAgentExecutor(options) {
     }
     const exists = await runShell(`test -e ${shQuote(join(worktree, '.git'))}`);
     if (exists.code === 0) return null; // 幂等重放：工作区已就绪
-    const fetched = await runShell(
-      `mkdir -p ${shQuote(ws)} && git -C ${shQuote(repoPath)} fetch origin ${shQuote(baseRef)}`,
-    );
-    if (fetched.code !== 0) return `git fetch origin ${baseRef} failed: ${fetched.stderr.trim() || fetched.stdout.trim()}`;
-    const added = await runShell(
-      `git -C ${shQuote(repoPath)} worktree add ${shQuote(worktree)} -b ${shQuote(branch)} ${shQuote(`origin/${baseRef}`)}`,
-    );
-    if (added.code === 0) return null;
-    // 分支可能已存在（上次 dispatch 中断）：改用已有分支重新挂 worktree。
-    const retry = await runShell(
-      `git -C ${shQuote(repoPath)} worktree add ${shQuote(worktree)} ${shQuote(branch)}`,
-    );
-    if (retry.code === 0) return null;
-    return `git worktree add failed: ${added.stderr.trim() || added.stdout.trim()}`;
+
+    // 临界区：fetch + worktree add（都写共享 clone 的 ref / worktree 元数据）。
+    return withWorkspaceLock(repoPath, async () => {
+      const fetchError = await fetchBaseRef({ ws, baseRef });
+      if (fetchError !== null) return fetchError;
+      const added = await runShell(
+        `git -C ${shQuote(repoPath)} worktree add ${shQuote(worktree)} -b ${shQuote(branch)} ${shQuote(`origin/${baseRef}`)}`,
+      );
+      if (added.code === 0) return null;
+      // 分支可能已存在（上次 dispatch 中断）：改用已有分支重新挂 worktree。
+      const retry = await runShell(
+        `git -C ${shQuote(repoPath)} worktree add ${shQuote(worktree)} ${shQuote(branch)}`,
+      );
+      if (retry.code === 0) return null;
+      return `git worktree add failed: ${added.stderr.trim() || added.stdout.trim()}`;
+    });
+  }
+
+  /**
+   * 互斥内 fetch，失败重试一次（间隔 ~1.5s）：兜底外部进程偶发持锁
+   * （如人工在 clone 里操作）。两次都失败才返回错误。
+   */
+  async function fetchBaseRef({ ws, baseRef }) {
+    const command = `mkdir -p ${shQuote(ws)} && git -C ${shQuote(repoPath)} fetch origin ${shQuote(baseRef)}`;
+    const first = await runShell(command);
+    if (first.code === 0) return null;
+    await delay(FETCH_RETRY_DELAY_MS);
+    const second = await runShell(command);
+    if (second.code === 0) return null;
+    const detail = second.stderr.trim() || second.stdout.trim() || first.stderr.trim() || first.stdout.trim();
+    return `git fetch origin ${baseRef} failed: ${detail}`;
   }
 
   async function collectArtifacts({ repo, baseRef, worktree }) {
