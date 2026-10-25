@@ -38,7 +38,7 @@ async function command(booted: BootedApp, type: string, payload: Record<string, 
 /** 真实命令链造一条 agent Task 并推进到 active（生成 executor Run）。 */
 async function makeAgentRun(
   booted: BootedApp,
-  opts: { level?: string; command?: string; note?: string } = {},
+  opts: { level?: string; command?: string; note?: string; extra?: Record<string, unknown> } = {},
 ): Promise<{ task_id: string; run_id: string }> {
   const cap = await jsonOf(
     await api(booted, '/api/capture', {
@@ -59,6 +59,7 @@ async function makeAgentRun(
       ...(opts.level ? { side_effect_level: opts.level } : {}),
       ...(opts.command ? { command: opts.command } : {}),
       ...(opts.note ? { note_side_effect: opts.note } : {}),
+      ...(opts.extra ?? {}),
     },
     'active',
   );
@@ -77,7 +78,7 @@ async function registerNode(booted: BootedApp, opts: { node_id?: string; kinds?:
   const res = await nodePost(booted, '/api/nodes/register', {
     ...(opts.node_id ? { node_id: opts.node_id } : {}),
     display_name: '测试节点',
-    executor_kinds: opts.kinds ?? ['agent_hands_shell'],
+    executor_kinds: opts.kinds ?? ['agent_hands_shell', 'agent_hands_agent'],
     max_side_effect_level: opts.level ?? 'L1',
     agent_version: 'test/1.0',
   });
@@ -110,6 +111,14 @@ async function projectRun(booted: BootedApp, run_id: string) {
   return body.data.runs.find((r: any) => r.run_id === run_id);
 }
 
+/** 读某 Run 的 RunCreated 事件体（路由/快照断言用）。 */
+async function runCreatedOf(booted: BootedApp, run_id: string): Promise<Record<string, any>> {
+  const events = await streamTypes(booted);
+  const created = events.find((e) => e.type === 'RunCreated' && (e.payload as any).run_id === run_id);
+  expect(created, `RunCreated ${run_id} 未落账`).toBeTruthy();
+  return created!.payload as Record<string, any>;
+}
+
 async function streamTypes(booted: BootedApp, stream = PROJECT) {
   const events = await booted.harness.store.readStream(asProjectId(stream), 1);
   return events;
@@ -132,7 +141,10 @@ describe('K1-B 节点生命周期与 $system 流（AC-01/02）', () => {
     const system = await streamTypes(booted, '$system');
     const registered = system.filter((e) => e.type === 'NodeRegistered');
     expect(registered).toHaveLength(1);
-    expect(registered[0]!.payload).toMatchObject({ node_id: 'node-ac01', executor_kinds: ['agent_hands_shell'] });
+    expect(registered[0]!.payload).toMatchObject({
+      node_id: 'node-ac01',
+      executor_kinds: ['agent_hands_shell', 'agent_hands_agent'],
+    });
 
     const list = await jsonOf(await api(booted, '/api/nodes'));
     const view = list.data.nodes.find((n: any) => n.node_id === 'node-ac01');
@@ -588,6 +600,60 @@ describe('K1-B 派发占用原子性与回报归属（M-01/m-06）', () => {
     });
     expect(replayByOwner.status).toBe(200);
     expect(replayByOwner.body.data).toEqual(raw.body.data);
+  });
+});
+
+describe('K0-Q25 executor_kind 缺省路由与 input_snapshot 增补', () => {
+  let booted: BootedApp;
+  beforeAll(async () => {
+    booted = await bootApp({ proposer: agentProposer() });
+  });
+  afterAll(async () => {
+    await booted.close();
+  });
+
+  it('无 command 的 agent 任务 → agent_hands_agent，快照含 instruction/project/workspace/timeout_ms', async () => {
+    const { run_id } = await makeAgentRun(booted, {
+      extra: {
+        workspace_repo: 'medivhc/xuxing',
+        workspace_base_ref: 'develop/eventstore-batch1',
+        timeout_ms: 15_000,
+      },
+    });
+    const created = await runCreatedOf(booted, run_id);
+    expect(created.executor_kind).toBe('agent_hands_agent');
+    const snapshot = created.input_snapshot;
+    expect(snapshot.command).toBeNull();
+    expect(snapshot.instruction).toBe('在节点上执行检查');
+    expect(snapshot.task).toMatchObject({ title: '代理任务：在节点上执行检查', description: '在节点上执行检查' });
+    expect(snapshot.project).toEqual({ project_id: PROJECT });
+    expect(snapshot.workspace).toEqual({ repo: 'medivhc/xuxing', base_ref: 'develop/eventstore-batch1' });
+    expect(snapshot.timeout_ms).toBe(15_000);
+    expect(snapshot.assembled_by).toBe('kernel_assembler');
+  });
+
+  it('带 command 的 agent 任务 → agent_hands_shell（回归），快照旧字段语义不变', async () => {
+    const { run_id } = await makeAgentRun(booted, { command: 'echo hello', note: '将调用 shell 工具' });
+    const created = await runCreatedOf(booted, run_id);
+    expect(created.executor_kind).toBe('agent_hands_shell');
+    const snapshot = created.input_snapshot;
+    expect(snapshot.command).toBe('echo hello');
+    expect(snapshot.note_side_effect).toBe('将调用 shell 工具');
+    expect(snapshot.contract).toMatchObject({ rev: 1 });
+    expect(snapshot.instruction).toBe('在节点上执行检查');
+    expect(snapshot.project).toEqual({ project_id: PROJECT });
+    expect(snapshot.workspace).toEqual({ repo: null, base_ref: null });
+    expect(snapshot.timeout_ms).toBeNull();
+  });
+
+  it('显式 executor_kind 优先；timeout_ms 越界/非数字 → null', async () => {
+    const { run_id } = await makeAgentRun(booted, {
+      extra: { executor_kind: 'agent_hands_shell', timeout_ms: 4_999 },
+    });
+    const created = await runCreatedOf(booted, run_id);
+    expect(created.executor_kind).toBe('agent_hands_shell');
+    expect(created.input_snapshot.timeout_ms).toBeNull();
+    expect(created.input_snapshot.workspace).toEqual({ repo: null, base_ref: null });
   });
 });
 

@@ -20,6 +20,8 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+const KIND = 'agent_hands_shell';
+
 function recordDirOf(recordsDir, idempotencyKey) {
   return join(recordsDir, idempotencyKey.replaceAll(/[^a-zA-Z0-9_.-]/g, '_'));
 }
@@ -38,7 +40,7 @@ export function createAgentHandsShellExecutor(options) {
   }
 
   return {
-    kind: 'agent_hands_shell',
+    kind: KIND,
 
     capabilities() {
       return { executor_kinds: ['agent_hands_shell'], max_side_effect_level: options.maxSideEffectLevel ?? 'L1' };
@@ -47,7 +49,10 @@ export function createAgentHandsShellExecutor(options) {
     async dispatch(envelope, hooks) {
       const dir = recordDirOf(recordsDir, envelope.idempotency_key);
       mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, 'started.json'), JSON.stringify({ run_id: envelope.run_id, started_at: new Date().toISOString() }));
+      writeFileSync(
+        join(dir, 'started.json'),
+        JSON.stringify({ run_id: envelope.run_id, executor_kind: KIND, started_at: new Date().toISOString() }),
+      );
 
       const snapshot = envelope.input_snapshot ?? {};
       if (typeof snapshot.note_side_effect === 'string' && snapshot.note_side_effect !== '') {
@@ -105,6 +110,29 @@ export function createAgentHandsShellExecutor(options) {
       if (!existsSync(join(dir, 'started.json'))) return 'not_executed';
       if (this.isAlive(runId)) return 'unknown'; // 仍在执行：未定，交由后续判定（保守）
       return 'unknown'; // 启动过、进程已死、无结果：无法判定（REQ-RUN-3 unknown）
+    },
+
+    /**
+     * records 口径判定：该 Run 是否在本执行器留下过 started/result。
+     * F1 标记法：started.json 带 executor_kind 时只认领同 kind；字段缺失（历史
+     * records）或 JSON 读不出时按存在处理，保证向后兼容、不因老记录报错。
+     */
+    hasRecord(idempotencyKey) {
+      const dir = recordDirOf(recordsDir, idempotencyKey);
+      if (!existsSync(dir)) return false;
+      const startedFile = join(dir, 'started.json');
+      const hasStarted = existsSync(startedFile);
+      if (hasStarted) {
+        let marker = null;
+        try {
+          marker = JSON.parse(readFileSync(startedFile, 'utf8'));
+        } catch {
+          marker = null;
+        }
+        const markedKind = marker?.executor_kind;
+        if (typeof markedKind === 'string' && markedKind !== '' && markedKind !== KIND) return false;
+      }
+      return hasStarted || existsSync(join(dir, 'result.json'));
     },
 
     readRecord(idempotencyKey) {

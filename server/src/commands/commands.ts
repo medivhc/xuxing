@@ -728,9 +728,34 @@ async function taskAdvance(
 }
 
 /**
+ * K0-Q25：executor_kind 缺省路由——payload.command 为非空字符串走 shell 执行器，
+ * 否则走 agent 执行器。显式 payload.executor_kind 永远优先。
+ */
+function defaultExecutorKind(payload: Record<string, unknown>): string {
+  const explicit = payload.executor_kind;
+  if (typeof explicit === 'string' && explicit.trim() !== '') return explicit;
+  return typeof payload.command === 'string' && payload.command !== '' ? 'agent_hands_shell' : 'agent_hands_agent';
+}
+
+/** 快照增补字段（K0-Q25）：只追加，不改既有字段语义。 */
+function executorSnapshotExtras(task: TaskRecord, payload: Record<string, unknown>): Record<string, unknown> {
+  const timeout = payload.timeout_ms;
+  return {
+    instruction: task.description,
+    project: { project_id: task.project_id },
+    workspace: {
+      repo: typeof payload.workspace_repo === 'string' ? payload.workspace_repo : null,
+      base_ref: typeof payload.workspace_base_ref === 'string' ? payload.workspace_base_ref : null,
+    },
+    timeout_ms: typeof timeout === 'number' && Number.isFinite(timeout) && timeout >= 5000 && timeout <= 3600000 ? timeout : null,
+  };
+}
+
+/**
  * K1-B：新建 executor Run（AssignmentCreated → RunCreated → RunQueued）。
- * executor_kind / side_effect_level 可由命令 payload 覆盖（缺省
- * agent_hands_shell / L1）；input_snapshot 携带任务书与可选 command，
+ * executor_kind / side_effect_level 可由命令 payload 覆盖（缺省按
+ * defaultExecutorKind：有 command → agent_hands_shell，无 command → agent_hands_agent；
+ * side_effect_level 缺省 L1）；input_snapshot 携带任务书与可选 command，
  * 节点据此执行（§4.1 信封由 dispatcher 从 RunCreated 事件组装）。
  */
 async function createExecutorRun(
@@ -745,10 +770,7 @@ async function createExecutorRun(
 ): Promise<string> {
   const run_id = `run_${ulid()}`;
   const assignment_id = `asg_${ulid()}`;
-  const executor_kind =
-    typeof payload.executor_kind === 'string' && payload.executor_kind.trim() !== ''
-      ? payload.executor_kind
-      : 'agent_hands_shell';
+  const executor_kind = defaultExecutorKind(payload);
   const side_effect_level =
     typeof payload.side_effect_level === 'string' && ['L0', 'L1', 'L2', 'L3'].includes(payload.side_effect_level)
       ? payload.side_effect_level
@@ -790,6 +812,7 @@ async function createExecutorRun(
         task: { task_id: task.task_id, title: task.title, description: task.description },
         command: typeof payload.command === 'string' ? payload.command : null,
         note_side_effect: typeof payload.note_side_effect === 'string' ? payload.note_side_effect : null,
+        ...executorSnapshotExtras(task, payload),
         assembled_by: 'kernel_assembler',
       },
       policy_snapshot: { policy_id: snapshot.projects.find((p) => p.project_id === task.project_id)?.policy_id ?? null },
