@@ -107,6 +107,12 @@ export function createAgentHandsShellExecutor(options) {
       return 'unknown'; // 启动过、进程已死、无结果：无法判定（REQ-RUN-3 unknown）
     },
 
+    /** records 口径判定：该 Run 是否在本执行器留下过 started/result。 */
+    hasRecord(idempotencyKey) {
+      const dir = recordDirOf(recordsDir, idempotencyKey);
+      return existsSync(join(dir, 'started.json')) || existsSync(join(dir, 'result.json'));
+    },
+
     readRecord(idempotencyKey) {
       const file = join(recordDirOf(recordsDir, idempotencyKey), 'result.json');
       if (!existsSync(file)) return null;
