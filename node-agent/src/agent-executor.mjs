@@ -8,6 +8,7 @@
 //   XUXING_AGENT_MODEL      模型（缺省 opencode-go/deepseek-v4.1-flash）
 //   XUXING_AGENT_TIMEOUT_MS 单 Run 超时（缺省 1800000）
 //   XUXING_AGENT_RUNS_DIR   容器内每 Run 工作区根目录（缺省 /home/dev/xuxing-runs）
+//   XUXING_AGENT_REPO_DIR   容器内 xuxing clone 路径（缺省 /home/dev/xuxing；与 provision-ah1.sh 同名）
 //   XUXING_HANDS_USER       容器内执行用户（缺省 dev）
 //
 // 并发口径：不做 executor 内串行化；每 Run 独立 tmux session + git worktree，
@@ -22,6 +23,7 @@ const DEFAULT_RUNS_DIR = '/home/dev/xuxing-runs';
 const DEFAULT_HANDS_USER = 'dev';
 const DEFAULT_BASE_REF = 'develop/eventstore-batch1';
 const DEFAULT_REPO_PATH = '/home/dev/xuxing';
+const KIND = 'agent_hands_agent';
 const SUPPORTED_REPOS = new Set(['medivhc/xuxing', 'xuxing']);
 const SUMMARY_LIMIT = 1800;
 const OUTPUT_TAIL_BYTES = 8000;
@@ -72,6 +74,7 @@ export function createAgentHandsAgentExecutor(options) {
   const opencodeBin =
     options.opencodeBin ?? process.env.XUXING_AGENT_OPENCODE_BIN ?? `/home/${handsUser}/.opencode/bin/opencode`;
   const model = options.model ?? process.env.XUXING_AGENT_MODEL ?? DEFAULT_MODEL;
+  const repoPath = options.repoPath ?? process.env.XUXING_AGENT_REPO_DIR ?? DEFAULT_REPO_PATH;
   const configuredTimeout = Number(options.timeoutMs ?? process.env.XUXING_AGENT_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS);
   const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : DEFAULT_TIMEOUT_MS;
   const active = new Map(); // run_id -> { watcher, session, ws, recordDir, timedOut, canceled, finished }
@@ -189,16 +192,16 @@ export function createAgentHandsAgentExecutor(options) {
     const exists = await runShell(`test -e ${shQuote(join(worktree, '.git'))}`);
     if (exists.code === 0) return null; // 幂等重放：工作区已就绪
     const fetched = await runShell(
-      `mkdir -p ${shQuote(ws)} && git -C ${shQuote(DEFAULT_REPO_PATH)} fetch origin ${shQuote(baseRef)}`,
+      `mkdir -p ${shQuote(ws)} && git -C ${shQuote(repoPath)} fetch origin ${shQuote(baseRef)}`,
     );
     if (fetched.code !== 0) return `git fetch origin ${baseRef} failed: ${fetched.stderr.trim() || fetched.stdout.trim()}`;
     const added = await runShell(
-      `git -C ${shQuote(DEFAULT_REPO_PATH)} worktree add ${shQuote(worktree)} -b ${shQuote(branch)} ${shQuote(`origin/${baseRef}`)}`,
+      `git -C ${shQuote(repoPath)} worktree add ${shQuote(worktree)} -b ${shQuote(branch)} ${shQuote(`origin/${baseRef}`)}`,
     );
     if (added.code === 0) return null;
     // 分支可能已存在（上次 dispatch 中断）：改用已有分支重新挂 worktree。
     const retry = await runShell(
-      `git -C ${shQuote(DEFAULT_REPO_PATH)} worktree add ${shQuote(worktree)} ${shQuote(branch)}`,
+      `git -C ${shQuote(repoPath)} worktree add ${shQuote(worktree)} ${shQuote(branch)}`,
     );
     if (retry.code === 0) return null;
     return `git worktree add failed: ${added.stderr.trim() || added.stdout.trim()}`;
@@ -224,7 +227,7 @@ export function createAgentHandsAgentExecutor(options) {
   }
 
   return {
-    kind: 'agent_hands_agent',
+    kind: KIND,
 
     capabilities() {
       return { executor_kinds: ['agent_hands_agent'], max_side_effect_level: options.maxSideEffectLevel ?? 'L1' };
@@ -234,7 +237,10 @@ export function createAgentHandsAgentExecutor(options) {
       const dir = recordDirOf(recordsDir, envelope.idempotency_key);
       mkdirSync(dir, { recursive: true });
       const startedAt = new Date().toISOString();
-      writeFileSync(join(dir, 'started.json'), JSON.stringify({ run_id: envelope.run_id, started_at: startedAt }));
+      writeFileSync(
+        join(dir, 'started.json'),
+        JSON.stringify({ run_id: envelope.run_id, executor_kind: KIND, started_at: startedAt }),
+      );
 
       const snapshot = envelope.input_snapshot ?? {};
       const workspace = snapshot.workspace ?? {};
@@ -391,10 +397,27 @@ export function createAgentHandsAgentExecutor(options) {
       return 'unknown'; // 启动过、进程已死、无结果：无法判定（REQ-RUN-3 unknown）
     },
 
-    /** records 口径判定：该 Run 是否在本执行器留下过 started/result。 */
+    /**
+     * records 口径判定：该 Run 是否在本执行器留下过 started/result。
+     * F1 标记法：started.json 带 executor_kind 时只认领同 kind；字段缺失（历史
+     * records）或 JSON 读不出时按存在处理，保证向后兼容、不因老记录报错。
+     */
     hasRecord(idempotencyKey) {
       const dir = recordDirOf(recordsDir, idempotencyKey);
-      return existsSync(join(dir, 'started.json')) || existsSync(join(dir, 'result.json'));
+      if (!existsSync(dir)) return false;
+      const startedFile = join(dir, 'started.json');
+      const hasStarted = existsSync(startedFile);
+      if (hasStarted) {
+        let marker = null;
+        try {
+          marker = JSON.parse(readFileSync(startedFile, 'utf8'));
+        } catch {
+          marker = null;
+        }
+        const markedKind = marker?.executor_kind;
+        if (typeof markedKind === 'string' && markedKind !== '' && markedKind !== KIND) return false;
+      }
+      return hasStarted || existsSync(join(dir, 'result.json'));
     },
 
     readRecord(idempotencyKey) {

@@ -32,7 +32,9 @@ dispatch / cancel / probe / readRecord）。节点注册的 `executor_kinds` 是
 `src/agent.mjs` 按 `envelope.executor_kind` 路由；未知 kind → POST nack
 （`reason=executor_kind_not_supported`）后结束，不 ack。`isAlive` / `cancel`
 按 run_id → executor 映射路由；probe 无映射时先查 agent records、再查
-shell records（节点重启后的对账路径）。
+shell records（节点重启后的对账路径）。records 的 `started.json` 带
+`executor_kind` 标记，`hasRecord` 只认领同 kind 的记录（历史无标记记录按存在
+处理），因此两类执行器共用同一 records 目录也不会互相误判归属。
 
 ### `agent_hands_shell`
 
@@ -48,7 +50,7 @@ shell records（节点重启后的对账路径）。
 
 流程：登记 `opencode` 副作用事实 → 组装 `PROMPT.md`（base64 传入容器）→
 按 `input_snapshot.workspace` 准备 git worktree（`medivhc/xuxing` / `xuxing`
-从 `/home/dev/xuxing` fetch 后 `git worktree add`；`null` 用空目录；其他 repo
+从 `XUXING_AGENT_REPO_DIR`（缺省 `/home/dev/xuxing`）fetch 后 `git worktree add`；`null` 用空目录；其他 repo
 直接 failed）→ `tmux new-session` 跑 `opencode run` → node 侧 watcher 等
 tmux 会话结束（`isAlive` 绑定 watcher）→ 采集 `output.log` 尾部与
 git log/diff/branch → 写 `result.json`。成功回报
@@ -62,6 +64,7 @@ git log/diff/branch → 写 `result.json`。成功回报
 | `XUXING_AGENT_MODEL` | `opencode-go/deepseek-v4.1-flash` | opencode 模型路由（禁止 magpie workbuddy-ai） |
 | `XUXING_AGENT_TIMEOUT_MS` | `1800000` | 单 Run 超时（`snapshot.timeout_ms` 优先，服务端限定 5s–1h） |
 | `XUXING_AGENT_RUNS_DIR` | `/home/dev/xuxing-runs` | 容器内每 Run 工作区根目录 |
+| `XUXING_AGENT_REPO_DIR` | `/home/dev/xuxing` | 容器内 xuxing clone 路径（`git fetch` / `worktree add` 的仓库；与 `provision-ah1.sh` 同名变量） |
 | `XUXING_HANDS_USER` | `dev` | 容器内执行用户（worktree/records 属主） |
 | `XUXING_AGENT_AUTH_FILE` | `/home/<HANDS_USER>/.local/share/opencode/auth.json` | 容器内 opencode 凭据文件；启动时只抽 `opencode-go` 键注入 `OPENCODE_API_KEY`，不落配置、不打印 |
 | `XUXING_AGENT_OPENCODE_BIN` | `/home/<HANDS_USER>/.opencode/bin/opencode` | 容器内 opencode 可执行文件（安装脚本不改进 PATH，故用绝对路径） |

@@ -17,7 +17,9 @@
 // 多执行器（K0-Q25）：注册 kinds = shell ∪ agent；executeRun 按
 // envelope.executor_kind 选执行器，未知 kind → nack 后结束（不 ack）。
 // isAlive / cancel / probe 优先按 run_id → executor 映射路由；probe 无映射时
-// 先查 agent records、再查 shell records（节点重启后的对账路径）。
+// 先查 agent records、再查 shell records（节点重启后的对账路径）。records 的
+// started.json 带 executor_kind 标记，hasRecord 只认领同 kind 的记录，跨执行器
+// 不误归属；无标记的历史记录按存在处理（向后兼容）。
 //
 // 401 行为（K1C-AC-09，写死）：记一条含 401 的日志（带时间戳）→ 暂停轮询、
 // 指数退避（5s 起、倍增、上限 60s）→ 令牌更新后自动恢复，进程不退出。
@@ -184,29 +186,33 @@ async function main() {
       }).catch((e) => log('nack_failed', { run_id: runId, message: String(e) }));
       return;
     }
-    await api(`/api/nodes/${nodeId}/runs/${runId}/ack`, { method: 'POST', body: {} });
-    runExecutors.set(runId, executor);
-    const dispatchPromise = executor.dispatch(envelope, {
-      sideEffectNote: (note) => api(`/api/nodes/${nodeId}/runs/${runId}/side-effect-note`, { method: 'POST', body: note }),
-    });
-    await api(`/api/nodes/${nodeId}/runs/${runId}/started`, { method: 'POST', body: {} });
-    log('run_started', { run_id: runId, executor_kind: executor.kind });
-
-    // S6：Run 心跳与执行进程存活探针绑定——进程退出即刻停发。
-    const heartbeatTimer2 = setInterval(() => {
-      if (!executor.isAlive(runId)) {
-        clearInterval(heartbeatTimer2);
-        return;
-      }
-      void api(`/api/nodes/${nodeId}/runs/${runId}/heartbeat`, { method: 'POST', body: {} }).catch((e) =>
-        log('run_heartbeat_failed', { run_id: runId, message: String(e) }),
-      );
-    }, RUN_HEARTBEAT_MS);
-    heartbeatTimer2.unref?.();
-
+    // F3 修复：try/finally 覆盖从 ack 起的全流程（含 ack/started 阶段与 runExecutors.set），
+    // 任何异常路径都回收 runExecutors / running / canceling 与心跳计时器。
+    let acked = false;
+    let heartbeatTimer2 = null;
     try {
+      await api(`/api/nodes/${nodeId}/runs/${runId}/ack`, { method: 'POST', body: {} });
+      acked = true;
+      runExecutors.set(runId, executor);
+      const dispatchPromise = executor.dispatch(envelope, {
+        sideEffectNote: (note) => api(`/api/nodes/${nodeId}/runs/${runId}/side-effect-note`, { method: 'POST', body: note }),
+      });
+      await api(`/api/nodes/${nodeId}/runs/${runId}/started`, { method: 'POST', body: {} });
+      log('run_started', { run_id: runId, executor_kind: executor.kind });
+
+      // S6：Run 心跳与执行进程存活探针绑定——进程退出即刻停发。
+      heartbeatTimer2 = setInterval(() => {
+        if (!executor.isAlive(runId)) {
+          clearInterval(heartbeatTimer2);
+          return;
+        }
+        void api(`/api/nodes/${nodeId}/runs/${runId}/heartbeat`, { method: 'POST', body: {} }).catch((e) =>
+          log('run_heartbeat_failed', { run_id: runId, message: String(e) }),
+        );
+      }, RUN_HEARTBEAT_MS);
+      heartbeatTimer2.unref?.();
+
       const result = await dispatchPromise;
-      clearInterval(heartbeatTimer2);
       if (canceling.has(runId)) {
         // 取消路径由 cancel-confirmed 落终态；这里不再 raw-result（避免 RunFailed
         // 抢先于 RunCanceled 的竞态）。
@@ -224,14 +230,17 @@ async function main() {
       });
       log('run_result_reported', { run_id: runId, run_state: receipt.run_state });
     } catch (error) {
-      clearInterval(heartbeatTimer2);
       log('run_execution_error', { run_id: runId, message: String(error) });
       // 执行框架自身出错（非命令失败）：以 failed 回报，避免 Run 悬挂到租约过期。
-      await api(`/api/nodes/${nodeId}/runs/${runId}/raw-result`, {
-        method: 'POST',
-        body: { client_result_id: `res:${envelope.idempotency_key}`, outcome_hint: 'failed', summary: `agent error: ${String(error)}` },
-      }).catch(() => undefined);
+      // ack 未成功时不回报（该 Run 尚未被本节点认领，交给租约过期重派）。
+      if (acked) {
+        await api(`/api/nodes/${nodeId}/runs/${runId}/raw-result`, {
+          method: 'POST',
+          body: { client_result_id: `res:${envelope.idempotency_key}`, outcome_hint: 'failed', summary: `agent error: ${String(error)}` },
+        }).catch(() => undefined);
+      }
     } finally {
+      if (heartbeatTimer2 !== null) clearInterval(heartbeatTimer2);
       canceling.delete(runId);
       runExecutors.delete(runId);
       running.delete(runId);
@@ -260,6 +269,11 @@ async function main() {
         await api(`/api/nodes/${nodeId}/runs/${runId}/cancel-confirmed`, { method: 'POST', body: {} }).catch((e) =>
           log('cancel_confirm_failed', { run_id: runId, message: String(e) }),
         );
+        // F2 修复：非运行中的 Run 不会被 executeRun 的 finally 清理，取消处理完毕
+        // （已确认）后自行摘除 canceling 标记，避免 Set 残留。
+        // 仍在 running 里（如 ack 阶段、runExecutors 尚未写入）时不摘除，等 executeRun
+        // 的 finally 处理，避免丢掉抢先到达的取消意图。
+        if (!runExecutors.has(runId) && !running.has(runId)) canceling.delete(runId);
       }
       for (const probe of poll.probe_requests ?? []) {
         // records 以信封幂等键 `run:<run_id>` 落盘（不是服务端 probe 幂等键）。
