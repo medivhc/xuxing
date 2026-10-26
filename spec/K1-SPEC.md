@@ -12,6 +12,7 @@ producer: Muse（协调者侧 spec 作者会话）+ 依据文件见 §0
 ## 0. 元信息与依据
 
 - 状态：v0.4，2026-10-24，**已通过异构 contract-review（APPROVED）+ 协调者裁决登记（见修订记录 v0.4 条）**，为 K1 develop 执行基线。本文件是 K1 的唯一 spec 正本；实现与验收只认本文件 + 下列依据，冲突时以冻结 K0 spec 的领域语义为准、本文件只在其上增量。
+- 修订记录：v0.5 —— m-04 / m-05 落字（2026-10-26，只改文档、不改代码、无语义扩展）：m-04 于 §4.2 补「节点注销视为生命周期闭合；同一 node_id 注销后再次注册属新生命周期、应再发 `NodeRegistered`（与注销时 `NodeOffline` 对称）」的口径，并限定「重注册不重复发事件」仅适用于活跃（未注销）态下的重复注册 / 恢复；m-05 于 §5.3 补 `GET /api/health` 响应口径附注（实现可为 `{ ok, auth_enabled }` 字面口径的超集，可含 `db` / `projection_version` / `limits` 等非业务字段，但不得含任何业务数据），使字面口径与实现现状一致、不改变安全意图。
 - 修订记录：v0.4 —— 协调者裁决登记（2026-10-24，K1 develop 开工前，经协调者指令落盘）：① **OQ-K1-1 维持**——`approved_modified` 前端不提供改 ops 表单（§1.2 / §3.4 口径不变，K1 只要求 API 可达 + 事件正确）。② **OQ-K1-2 维持**——裁决审计只用冻结目录既有 `DecisionResolved` 事件，不新增 `DecisionRecorded` 平行事件（§3.3 口径不变）。③ **OQ-K1-3 采纳分离**——节点令牌与用户令牌分离：新增环境变量 `XUXING_NODE_TOKEN`（节点令牌），用户令牌 `XUXING_ACCESS_TOKEN` 只护用户面、节点令牌只护节点面（注册 / 心跳 / 注销 / 长轮询与全部 Run 回报端点），**双令牌互不通用**（用户令牌调节点面 → 401、节点令牌调用户面 → 401）；落点 §5.1 / §5.2 / §5.3 / §4.2 / §4.5 / §4.6 / K1C-AC-09 同步修订。④ **OQ-K1-4 维持 spec 明示口径**——deferred 唤起条件 `at_time` 为必备、`on_event` 为可填（§3.2 / §3.7 口径不变，不静默缺失）。§7 四条开放问题自本版起全部关闭。
 - 修订记录：v0.3 —— 第二轮复审 APPROVED 后按其 3 条新 MINOR 做收敛修订（无语义扩展，均为评审员建议原文）：N-01 §2 错误码清单交叉引用笔误（§3.6/§5.4 → §3.5/§5.3）；N-02 §4.7 终态迟到回报行合并覆盖 probe-result；N-03 side-effect-note 请求体加 `client_note_id` 幂等键。因本修订在 APPROVED 之后，最终正文 sha 与复审所验 sha（72930b40…）不同，差异即本条所列三处，协调者可按图复核。
 - 修订记录：v0.1 初稿 → v0.2 按第一轮异构 contract-review（`K1-SPEC-REVIEW.md`，gemini-3.8-flash，CHANGES_REQUESTED，BLOCKER 2 / MAJOR 4 / MINOR 4）逐条修订：R-01 补 probe 对账通道（poll 下发 `probe_requests` + probe-result 端点，§4.3 第 6 步 / §4.5）；R-02 中间件豁免补 `POST /api/auth/session`（§5.3）；R-03 删除 `kind:"proposal"` 平行通道，待决提案收敛为关联 Decision（§3.6 / K1A-AC-12）；R-04 写死 `Run.state_reason="awaiting_node"` 与节点 401 退避行为（§4.4 / K1C-AC-09）；R-05 `disposition` 入 §3.2 schema 与 §3.5 失败表；R-06 节点事件入 `$system` 流 + payload 写死、side-effect-note 定为 `RunSideEffectRecorded` 事件（§4.2 / §4.4）；R-07 交叉引用笔误修正（§3.2）；R-08 §4.7 补迟到 ack / 终态迟到 raw-result / 注销在跑 Run 三分支；R-09 poll 顶层响应统一对象（§4.3）；R-10 信封改 `lease_duration_sec`、绝对到期时间经 ack 响应下发（§4.3）。
@@ -163,6 +164,7 @@ D1 定版形态：内核在云端做事实来源，执行节点在用户侧机�
 - 心跳：节点每 **10s**（配置项 `XUXING_NODE_HEARTBEAT_SEC`，默认 10）`POST /api/nodes/:node_id/heartbeat` `{}`。心跳**不入事件流**（§2 通用约定），只更新 `last_heartbeat_at`。
 - 存活判定（服务端计算，投影暴露）：`now - last_heartbeat_at ≤ 30s` → online；`≤ 90s` → stale；`> 90s` → offline。阈值是配置项（`XUXING_NODE_STALE_SEC/ OFFLINE_SEC`），默认值写死如上，验收按默认值判定。
 - 节点注销：优雅退出时 `POST /api/nodes/:node_id/deregister` → 立即置 offline 并发 `NodeOffline`（reason=deregister）；非优雅消失由存活判定收敛到 offline 并补发 `NodeOffline`（reason=heartbeat_timeout，见上）。注销时在跑 Run 的处理见 §4.7（leased 未 started 的释放回 queued；已有 started 的拒绝注销）。节点从 offline/stale 恢复心跳 → 自动回 online（无需重注册）。
+- **注销后重注册口径（与注销对称）**：节点注销视为该节点生命周期的闭合。同一 `node_id` 在注销之后再次注册，视为新的生命周期，应当再次发出 `NodeRegistered` 事件（与注销时发出的 `NodeOffline` 相对称）。本节上文「重注册不重复发事件」的口径仅适用于节点处于活跃（未注销）状态下的重复注册 / 恢复，不适用于注销后的重注册。
 
 ### 4.3 Run 派发协议（内核 → 节点 → 内核）
 
@@ -263,6 +265,7 @@ D1 定版形态：内核在云端做事实来源，执行节点在用户侧机�
 ### 5.3 服务端中间件口径
 
 - 覆盖面：全部 `/api/*` 路由，豁免仅两条：`GET /api/health`（只返回 `{ ok, auth_enabled }`，不泄露版本 / 数据）与 `POST /api/auth/session`（会话交换端点——浏览器尚无凭据时以请求体提交**用户令牌**换 cookie，若不豁免将自锁；该端点自身即校验点，令牌错误回 401 且不下发 cookie，见下；节点令牌提交到本端点同样 401、不下发 cookie）。其余路由必须校验对应面的令牌：**用户面**（除节点面外的全部 `/api/*`，含 `GET /api/nodes` 读面）认用户令牌 Bearer 或用户会话 cookie；**节点面**（`POST /api/nodes/register`、`/api/nodes/:id/heartbeat`、`/api/nodes/:id/deregister`、`/api/nodes/:id/dispatch-poll`、`/api/nodes/:id/runs/*`）只认节点令牌 Bearer（不认 cookie）。**互不通用**：用户令牌调节点面 → 401；节点令牌调用户面 → 401（响应同形，不给区分提示）。
+- 附注：health 响应的实现允许为上述字面口径的超集，可包含 `db`、`projection_version`、`limits` 等非业务字段（现行实现现状，经评审接受）；health 不得包含任何业务数据。此附注使字面口径与实现现状一致，不改变安全意图。
 - 凭据承载（二选一，同一请求任一成立即放行）：
   1. `Authorization: Bearer <token>`（API 客户端 / 节点 agent 用此路）；
   2. 会话 cookie：`POST /api/auth/session { token }` 校验通过后下发 `xuxing_session` cookie（HttpOnly、SameSite=Lax、Path=/；HTTPS 部署下加 Secure），cookie 值为服务端签发的**不透明会话凭证**（不得是令牌原文或其简单哈希），有效期 7 天（配置项）。前端浏览器走此路——理由：SSE 的 EventSource 不能带 Authorization 头，cookie 是唯一能同时覆盖普通请求与 `/api/stream` 的承载。
